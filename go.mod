@@ -34,4 +34,4 @@ require (
 	golang.org/x/sync v0.19.0 // indirect
 )
 
-replace booking/shared/ai_api => ../shared/ai_api
+replace booking/shared/ai_api => ./shared/ai_api
