@@ -159,6 +159,19 @@ func TestLoadRejectsInvalidClientPublicBaseURL(t *testing.T) {
 	}
 }
 
+func TestLoadReadsAuthCookieDomain(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("AUTH_COOKIE_DOMAIN", "tellbook.app")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.AuthCookieDomain != "tellbook.app" {
+		t.Fatalf("AuthCookieDomain = %q", cfg.AuthCookieDomain)
+	}
+}
+
 func TestLoadRejectsPartialFinancialSecurityConfig(t *testing.T) {
 	setRequiredConfig(t)
 	t.Setenv("FINANCIAL_DATA_ACTIVE_KEY_VERSION", "v1")

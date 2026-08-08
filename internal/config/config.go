@@ -34,6 +34,7 @@ type Config struct {
 	AuthAccessTokenTTL                    time.Duration
 	AuthAccessCookieName                  string
 	AuthRefreshCookieName                 string
+	AuthCookieDomain                      string
 	AuthCookieSecure                      bool
 	AuthRefreshTokenTTL                   time.Duration
 	AuthBcryptCost                        int
@@ -122,6 +123,7 @@ func Load() (Config, error) {
 		AuthAccessTokenTTL:                    getEnvDuration("AUTH_ACCESS_TOKEN_TTL", 15*time.Minute),
 		AuthAccessCookieName:                  getEnv("AUTH_ACCESS_COOKIE_NAME", "booking_access"),
 		AuthRefreshCookieName:                 getEnv("AUTH_REFRESH_COOKIE_NAME", "booking_refresh"),
+		AuthCookieDomain:                      strings.TrimSpace(os.Getenv("AUTH_COOKIE_DOMAIN")),
 		AuthCookieSecure:                      getEnvBool("AUTH_COOKIE_SECURE", false),
 		AuthRefreshTokenTTL:                   getEnvDuration("AUTH_REFRESH_TOKEN_TTL", 24*30*time.Hour),
 		AuthBcryptCost:                        getEnvInt("AUTH_BCRYPT_COST", 12),
