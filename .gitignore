@@ -1,0 +1,42 @@
+# Env
+.env
+.env.*
+server.env
+!.env.example
+!.env.test
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs / temp
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Go build / test artifacts
+/api
+bin/
+vendor/
+coverage.out
+*.test
+*.prof
+*.pprof
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Local uploads / generated files
+uploads/
