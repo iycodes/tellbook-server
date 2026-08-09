@@ -250,7 +250,7 @@ func (h *Handler) setAuthCookie(w http.ResponseWriter, name, token string, ttl t
 		Path:     "/",
 		Domain:   h.cfg.AuthCookieDomain,
 		HttpOnly: true,
-		SameSite: http.SameSiteNoneMode,
+		SameSite: http.SameSiteLaxMode,
 		Secure:   h.cfg.AuthCookieSecure,
 		MaxAge:   int(ttl.Seconds()),
 		Expires:  time.Now().UTC().Add(ttl),

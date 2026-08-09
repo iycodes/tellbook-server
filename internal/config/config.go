@@ -196,6 +196,14 @@ func Load() (Config, error) {
 	if cfg.AuthAccessTokenSecret == "" {
 		return Config{}, fmt.Errorf("AUTH_ACCESS_TOKEN_SECRET is required")
 	}
+	if strings.EqualFold(cfg.AppEnv, "production") {
+		if cfg.AuthCookieDomain == "" {
+			return Config{}, fmt.Errorf("AUTH_COOKIE_DOMAIN is required in production")
+		}
+		if !cfg.AuthCookieSecure {
+			return Config{}, fmt.Errorf("AUTH_COOKIE_SECURE must be true in production")
+		}
+	}
 	if err := validatePublicBaseURL(cfg.ClientPublicBaseURL); err != nil {
 		return Config{}, fmt.Errorf("CLIENT_PUBLIC_BASE_URL: %w", err)
 	}

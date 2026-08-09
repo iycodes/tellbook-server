@@ -4,6 +4,7 @@ import "testing"
 
 func setRequiredConfig(t *testing.T) {
 	t.Helper()
+	t.Setenv("APP_ENV", "development")
 	t.Setenv("DATABASE_URL", "postgres://example.invalid/database")
 	t.Setenv("AUTH_ACCESS_TOKEN_SECRET", "test-secret")
 	t.Setenv("PAYMENTS_ENVIRONMENT", "")
@@ -170,6 +171,30 @@ func TestLoadReadsAuthCookieDomain(t *testing.T) {
 	if cfg.AuthCookieDomain != "tellbook.app" {
 		t.Fatalf("AuthCookieDomain = %q", cfg.AuthCookieDomain)
 	}
+}
+
+func TestLoadRequiresSecureSharedCookiesInProduction(t *testing.T) {
+	t.Run("domain", func(t *testing.T) {
+		setRequiredConfig(t)
+		t.Setenv("APP_ENV", "production")
+		t.Setenv("AUTH_COOKIE_DOMAIN", "")
+		t.Setenv("AUTH_COOKIE_SECURE", "true")
+
+		if _, err := Load(); err == nil {
+			t.Fatal("Load() accepted production config without AUTH_COOKIE_DOMAIN")
+		}
+	})
+
+	t.Run("secure", func(t *testing.T) {
+		setRequiredConfig(t)
+		t.Setenv("APP_ENV", "production")
+		t.Setenv("AUTH_COOKIE_DOMAIN", "tellbook.app")
+		t.Setenv("AUTH_COOKIE_SECURE", "false")
+
+		if _, err := Load(); err == nil {
+			t.Fatal("Load() accepted insecure production auth cookies")
+		}
+	})
 }
 
 func TestLoadRejectsPartialFinancialSecurityConfig(t *testing.T) {
