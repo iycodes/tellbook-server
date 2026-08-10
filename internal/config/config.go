@@ -17,9 +17,30 @@ type Config struct {
 	AppEnv                                string
 	HTTPAddr                              string
 	ClientPublicBaseURL                   string
-	AIServiceBaseURL                      string
-	AIServiceTimeout                      time.Duration
-	AIRouteTimeout                        time.Duration
+	DefaultAIProvider                     string
+	AgreementAIProvider                   string
+	InboxAIProvider                       string
+	HostedAIProvider                      string
+	LLMBaseURL                            string
+	LLMChatCompletions                    string
+	LLMModel                              string
+	LLMAPIKey                             string
+	LLMTimeout                            time.Duration
+	LLMMaxOutputTokens                    int
+	LLMTemperature                        float64
+	LLMTopP                               float64
+	LLMTopK                               int
+	LLMMinP                               float64
+	LLMPresencePenalty                    float64
+	LLMRepetitionPenalty                  float64
+	SelfHostedThinking                    bool
+	OpenAIBaseURL                         string
+	OpenAIModel                           string
+	OpenAIAPIKey                          string
+	OpenAIReasoningEffort                 string
+	OpenAITimeout                         time.Duration
+	OpenAIMaxOutputTokens                 int64
+	OpenAIResponseLogFile                 string
 	HTTPRateLimitPerMinute                int
 	HTTPRateLimitBurst                    int
 	AIRateLimitPerMinute                  int
@@ -101,14 +122,41 @@ type Config struct {
 	IdleTimeout                           time.Duration
 }
 
+const (
+	AIProviderSelfHosted = "self_hosted"
+	AIProviderHosted     = "hosted"
+	HostedProviderOpenAI = "openai"
+)
+
 func Load() (Config, error) {
 	cfg := Config{
 		AppEnv:                                getEnv("APP_ENV", "development"),
 		HTTPAddr:                              getEnv("HTTP_ADDR", ":8000"),
 		ClientPublicBaseURL:                   strings.TrimRight(getEnv("CLIENT_PUBLIC_BASE_URL", "http://localhost:5275"), "/"),
-		AIServiceBaseURL:                      strings.TrimRight(getEnv("AI_SERVICE_BASE_URL", "http://127.0.0.1:8090"), "/"),
-		AIServiceTimeout:                      getEnvDuration("AI_SERVICE_TIMEOUT", 20*time.Second),
-		AIRouteTimeout:                        getEnvDuration("AI_ROUTE_TIMEOUT", 120*time.Second),
+		DefaultAIProvider:                     normalizeAIProvider(getEnv("DEFAULT_AI_PROVIDER", AIProviderSelfHosted)),
+		AgreementAIProvider:                   normalizeAIProvider(getEnv("AGREEMENT_AI_PROVIDER", AIProviderHosted)),
+		InboxAIProvider:                       normalizeAIProvider(getEnv("INBOX_AI_PROVIDER", AIProviderSelfHosted)),
+		HostedAIProvider:                      strings.ToLower(strings.TrimSpace(getEnv("HOSTED_AI_PROVIDER", HostedProviderOpenAI))),
+		LLMBaseURL:                            strings.TrimRight(strings.TrimSpace(os.Getenv("LLM_BASE_URL")), "/"),
+		LLMChatCompletions:                    getEnv("LLM_CHAT_COMPLETIONS_PATH", "/v1/chat/completions"),
+		LLMModel:                              getEnv("LLM_MODEL", "local-model"),
+		LLMAPIKey:                             strings.TrimSpace(os.Getenv("LLM_API_KEY")),
+		LLMTimeout:                            getEnvDuration("LLM_TIMEOUT", 30*time.Second),
+		LLMMaxOutputTokens:                    getEnvInt("LLM_MAX_OUTPUT_TOKENS", 1200),
+		LLMTemperature:                        getEnvFloat("LLM_TEMPERATURE", 0.2),
+		LLMTopP:                               getEnvFloat("TOP_P", 0.9),
+		LLMTopK:                               getEnvInt("TOP_K", 40),
+		LLMMinP:                               getEnvFloat("MIN_P", 0.1),
+		LLMPresencePenalty:                    getEnvFloat("PRESENCE_PENALTY", 0),
+		LLMRepetitionPenalty:                  getEnvFloat("REPETITION_PENALTY", 1),
+		SelfHostedThinking:                    getEnvBool("SELF_HOSTED_THINKING", false),
+		OpenAIBaseURL:                         strings.TrimRight(strings.TrimSpace(getEnv("OPENAI_BASE_URL", "https://api.openai.com/v1")), "/"),
+		OpenAIModel:                           strings.TrimSpace(getEnv("OPENAI_MODEL", "gpt-5.6-luna")),
+		OpenAIAPIKey:                          strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		OpenAIReasoningEffort:                 strings.ToLower(strings.TrimSpace(getEnv("OPENAI_REASONING_EFFORT", "none"))),
+		OpenAITimeout:                         getEnvDuration("OPENAI_TIMEOUT", 120*time.Second),
+		OpenAIMaxOutputTokens:                 getEnvInt64("OPENAI_MAX_OUTPUT_TOKENS", 16000),
+		OpenAIResponseLogFile:                 strings.TrimSpace(os.Getenv("OPENAI_RESPONSE_LOG_FILE")),
 		HTTPRateLimitPerMinute:                getEnvInt("HTTP_RATE_LIMIT_PER_MINUTE", 300),
 		HTTPRateLimitBurst:                    getEnvInt("HTTP_RATE_LIMIT_BURST", 100),
 		AIRateLimitPerMinute:                  getEnvInt("AI_RATE_LIMIT_PER_MINUTE", 12),
@@ -195,6 +243,65 @@ func Load() (Config, error) {
 	}
 	if cfg.AuthAccessTokenSecret == "" {
 		return Config{}, fmt.Errorf("AUTH_ACCESS_TOKEN_SECRET is required")
+	}
+	for _, setting := range []struct {
+		name  string
+		value string
+	}{
+		{name: "DEFAULT_AI_PROVIDER", value: cfg.DefaultAIProvider},
+		{name: "AGREEMENT_AI_PROVIDER", value: cfg.AgreementAIProvider},
+		{name: "INBOX_AI_PROVIDER", value: cfg.InboxAIProvider},
+	} {
+		if err := validateAIProvider(setting.name, setting.value); err != nil {
+			return Config{}, err
+		}
+	}
+	if cfg.HostedAIProvider != HostedProviderOpenAI {
+		return Config{}, fmt.Errorf("HOSTED_AI_PROVIDER must be openai")
+	}
+	if cfg.NeedsSelfHosted() && cfg.LLMBaseURL == "" {
+		return Config{}, fmt.Errorf("LLM_BASE_URL is required when a task uses self-hosted AI")
+	}
+	if cfg.NeedsSelfHosted() && cfg.LLMMaxOutputTokens <= 0 {
+		return Config{}, fmt.Errorf("LLM_MAX_OUTPUT_TOKENS must be greater than zero")
+	}
+	if cfg.NeedsHosted() {
+		if cfg.OpenAIAPIKey == "" {
+			return Config{}, fmt.Errorf("OPENAI_API_KEY is required when a task uses hosted AI")
+		}
+		if cfg.OpenAIModel == "" {
+			return Config{}, fmt.Errorf("OPENAI_MODEL is required when a task uses hosted AI")
+		}
+		if !validReasoningEffort(cfg.OpenAIReasoningEffort) {
+			return Config{}, fmt.Errorf("OPENAI_REASONING_EFFORT must be one of none, low, medium, high, xhigh, or max")
+		}
+		if cfg.OpenAIMaxOutputTokens <= 0 {
+			return Config{}, fmt.Errorf("OPENAI_MAX_OUTPUT_TOKENS must be greater than zero")
+		}
+	}
+	if !strings.HasPrefix(cfg.LLMChatCompletions, "/") {
+		cfg.LLMChatCompletions = "/" + cfg.LLMChatCompletions
+	}
+	if cfg.LLMTimeout <= 0 {
+		return Config{}, fmt.Errorf("LLM_TIMEOUT must be greater than zero")
+	}
+	if cfg.LLMTemperature < 0 || cfg.LLMTemperature > 2 {
+		return Config{}, fmt.Errorf("LLM_TEMPERATURE must be between 0 and 2")
+	}
+	if cfg.LLMTopP < 0 || cfg.LLMTopP > 1 {
+		return Config{}, fmt.Errorf("TOP_P must be between 0 and 1")
+	}
+	if cfg.LLMTopK < 0 {
+		return Config{}, fmt.Errorf("TOP_K must be zero or greater")
+	}
+	if cfg.LLMMinP < 0 || cfg.LLMMinP > 1 {
+		return Config{}, fmt.Errorf("MIN_P must be between 0 and 1")
+	}
+	if cfg.LLMPresencePenalty < -2 || cfg.LLMPresencePenalty > 2 {
+		return Config{}, fmt.Errorf("PRESENCE_PENALTY must be between -2 and 2")
+	}
+	if cfg.LLMRepetitionPenalty <= 0 {
+		return Config{}, fmt.Errorf("REPETITION_PENALTY must be greater than zero")
 	}
 	if strings.EqualFold(cfg.AppEnv, "production") {
 		if cfg.AuthCookieDomain == "" {
@@ -306,6 +413,57 @@ func (c Config) AnyPaymentCapabilityEnabled() bool {
 		c.PaystackPayoutSandboxVerified || c.PaystackPayoutProductionEnabled
 }
 
+func (c Config) NeedsSelfHosted() bool {
+	return c.DefaultAIProvider == AIProviderSelfHosted ||
+		c.AgreementAIProvider == AIProviderSelfHosted ||
+		c.InboxAIProvider == AIProviderSelfHosted
+}
+
+func (c Config) NeedsHosted() bool {
+	return c.DefaultAIProvider == AIProviderHosted ||
+		c.AgreementAIProvider == AIProviderHosted ||
+		c.InboxAIProvider == AIProviderHosted
+}
+
+func (c Config) SynchronousAIRouteTimeout() time.Duration {
+	timeout := time.Duration(0)
+	for _, provider := range []string{c.DefaultAIProvider, c.InboxAIProvider} {
+		providerTimeout := c.LLMTimeout
+		if provider == AIProviderHosted {
+			providerTimeout = c.OpenAITimeout
+		}
+		if providerTimeout > timeout {
+			timeout = providerTimeout
+		}
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	return timeout + 5*time.Second
+}
+
+func normalizeAIProvider(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func validateAIProvider(name, value string) error {
+	switch value {
+	case AIProviderSelfHosted, AIProviderHosted:
+		return nil
+	default:
+		return fmt.Errorf("%s must be one of self_hosted or hosted", name)
+	}
+}
+
+func validReasoningEffort(value string) bool {
+	switch value {
+	case "none", "low", "medium", "high", "xhigh", "max":
+		return true
+	default:
+		return false
+	}
+}
+
 func validatePublicBaseURL(value string) error {
 	parsed, err := url.Parse(strings.TrimSpace(value))
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
@@ -407,6 +565,34 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	}
 
 	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return fallback
+	}
+
+	return parsed
+}
+
+func getEnvFloat(key string, fallback float64) float64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return fallback
+	}
+
+	return parsed
+}
+
+func getEnvInt64(key string, fallback int64) int64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return fallback
 	}

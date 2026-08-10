@@ -19,7 +19,6 @@ var ErrServiceWizardDraftConflict = errors.New("service wizard draft revision co
 const maxServiceWizardDraftPayloadBytes = 256 << 10
 
 var validServiceWizardSteps = map[string]struct{}{
-	"preset":             {},
 	"choose-section":     {},
 	"info":               {},
 	"pricing":            {},
@@ -32,12 +31,13 @@ var validServiceWizardSteps = map[string]struct{}{
 }
 
 type ServiceWizardDraft struct {
-	ID          string          `json:"id"`
-	ServiceID   string          `json:"service_id,omitempty"`
-	Payload     json.RawMessage `json:"payload"`
-	CurrentStep string          `json:"current_step"`
-	Revision    int64           `json:"revision"`
-	UpdatedAt   time.Time       `json:"updated_at"`
+	ID              string          `json:"id"`
+	ServiceID       string          `json:"service_id,omitempty"`
+	Payload         json.RawMessage `json:"payload"`
+	ImagePreviewURL string          `json:"image_preview_url,omitempty"`
+	CurrentStep     string          `json:"current_step"`
+	Revision        int64           `json:"revision"`
+	UpdatedAt       time.Time       `json:"updated_at"`
 }
 
 type CreateServiceWizardDraftInput struct {
@@ -76,26 +76,53 @@ func (r *Repository) CreateServiceWizardDraft(ctx context.Context, clientID uuid
 
 	id := uuid.New()
 	if serviceID == nil {
-		_, err = r.db.Exec(ctx, `
+		draft, createErr := scanServiceWizardDraft(r.db.QueryRow(ctx, `
 			INSERT INTO service_wizard_drafts (id, client_id, payload, current_step)
 			VALUES ($1, $2, $3, $4)
-			ON CONFLICT (client_id) WHERE service_id IS NULL DO NOTHING
-		`, id, clientID, payload, step)
-	} else {
-		_, err = r.db.Exec(ctx, `
+			RETURNING id, service_id, payload, current_step, revision, updated_at
+		`, id, clientID, payload, step))
+		if createErr != nil {
+			return ServiceWizardDraft{}, fmt.Errorf("create service wizard draft: %w", createErr)
+		}
+		return draft, nil
+	}
+
+	_, err = r.db.Exec(ctx, `
 			INSERT INTO service_wizard_drafts (id, client_id, service_id, payload, current_step)
 			VALUES ($1, $2, $3, $4, $5)
 			ON CONFLICT (client_id, service_id) WHERE service_id IS NOT NULL DO NOTHING
 		`, id, clientID, *serviceID, payload, step)
-	}
 	if err != nil {
 		return ServiceWizardDraft{}, fmt.Errorf("create service wizard draft: %w", err)
 	}
 
-	if serviceID == nil {
-		return r.getServiceWizardDraftByScope(ctx, clientID, nil)
+	return r.getServiceWizardDraftByService(ctx, clientID, *serviceID)
+}
+
+func (r *Repository) ListNewServiceWizardDrafts(ctx context.Context, clientID uuid.UUID) ([]ServiceWizardDraft, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT id, service_id, payload, current_step, revision, updated_at
+		FROM service_wizard_drafts
+		WHERE client_id = $1 AND service_id IS NULL
+		ORDER BY updated_at DESC, id DESC
+	`, clientID)
+	if err != nil {
+		return nil, fmt.Errorf("list service wizard drafts: %w", err)
 	}
-	return r.getServiceWizardDraftByScope(ctx, clientID, serviceID)
+	defer rows.Close()
+
+	drafts := make([]ServiceWizardDraft, 0)
+	for rows.Next() {
+		draft, scanErr := scanServiceWizardDraft(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		drafts = append(drafts, draft)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list service wizard drafts: %w", err)
+	}
+	return drafts, nil
 }
 
 func (r *Repository) GetServiceWizardDraft(ctx context.Context, clientID, draftID uuid.UUID) (ServiceWizardDraft, error) {
@@ -144,19 +171,12 @@ func (r *Repository) DeleteServiceWizardDraft(ctx context.Context, clientID, dra
 	return nil
 }
 
-func (r *Repository) getServiceWizardDraftByScope(ctx context.Context, clientID uuid.UUID, serviceID *uuid.UUID) (ServiceWizardDraft, error) {
-	if serviceID == nil {
-		return scanServiceWizardDraft(r.db.QueryRow(ctx, `
-			SELECT id, service_id, payload, current_step, revision, updated_at
-			FROM service_wizard_drafts
-			WHERE client_id = $1 AND service_id IS NULL
-		`, clientID))
-	}
+func (r *Repository) getServiceWizardDraftByService(ctx context.Context, clientID, serviceID uuid.UUID) (ServiceWizardDraft, error) {
 	return scanServiceWizardDraft(r.db.QueryRow(ctx, `
 		SELECT id, service_id, payload, current_step, revision, updated_at
 		FROM service_wizard_drafts
 		WHERE client_id = $1 AND service_id = $2
-	`, clientID, *serviceID))
+	`, clientID, serviceID))
 }
 
 func scanServiceWizardDraft(row pgx.Row) (ServiceWizardDraft, error) {

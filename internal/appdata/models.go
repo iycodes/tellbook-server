@@ -254,6 +254,20 @@ type UpdateClientMarketInput struct {
 	Locale       string `json:"locale"`
 }
 
+type BusinessHoursWindow struct {
+	DayOfWeek int    `json:"day_of_week"`
+	StartTime string `json:"start_time"`
+	EndTime   string `json:"end_time"`
+}
+
+type BusinessHoursResponse struct {
+	Items []BusinessHoursWindow `json:"items"`
+}
+
+type UpdateBusinessHoursInput struct {
+	Items []BusinessHoursWindow `json:"items"`
+}
+
 type UpdateAutomationSettingInput struct {
 	Enabled bool `json:"enabled"`
 }

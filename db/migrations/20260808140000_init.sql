@@ -1285,7 +1285,7 @@ CREATE TABLE public.service_wizard_drafts (
     revision bigint DEFAULT 1 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT service_wizard_drafts_current_step_check CHECK ((current_step = ANY (ARRAY['preset'::text, 'choose-section'::text, 'info'::text, 'pricing'::text, 'duration'::text, 'availability'::text, 'location'::text, 'policy'::text, 'agreement-settings'::text, 'preview'::text]))),
+    CONSTRAINT service_wizard_drafts_current_step_check CHECK ((current_step = ANY (ARRAY['choose-section'::text, 'info'::text, 'pricing'::text, 'duration'::text, 'availability'::text, 'location'::text, 'policy'::text, 'agreement-settings'::text, 'preview'::text]))),
     CONSTRAINT service_wizard_drafts_payload_object_check CHECK ((jsonb_typeof(payload) = 'object'::text)),
     CONSTRAINT service_wizard_drafts_revision_check CHECK ((revision > 0))
 );
@@ -2544,12 +2544,6 @@ CREATE INDEX service_wizard_drafts_client_updated_idx ON public.service_wizard_d
 
 
 --
--- Name: service_wizard_drafts_one_new_per_client_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX service_wizard_drafts_one_new_per_client_idx ON public.service_wizard_drafts USING btree (client_id) WHERE (service_id IS NULL);
-
-
 --
 -- Name: service_wizard_drafts_one_per_service_idx; Type: INDEX; Schema: public; Owner: -
 --

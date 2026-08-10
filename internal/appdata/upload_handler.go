@@ -25,6 +25,11 @@ type uploadDocumentResponse struct {
 	Key string `json:"key"`
 }
 
+type uploadImageResponse struct {
+	URL        string `json:"url"`
+	BrowserURL string `json:"browser_url"`
+}
+
 type decodedImagePayload struct {
 	ContentType string
 	Data        []byte
@@ -81,7 +86,26 @@ func (h *Handler) uploadImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]string{"url": objectURL})
+	browserURL, err := h.storage.ResolveBrowserURL(r.Context(), objectURL, signedMediaURLTTL)
+	if err != nil {
+		slog.Error(
+			"image preview URL signing failed",
+			"error", err,
+			"client_id", authedClient.ID.String(),
+			"bucket", bucketName,
+			"object_key", objectKey,
+		)
+		if deleteErr := h.storage.Delete(r.Context(), objectKey, bucketName); deleteErr != nil {
+			slog.Warn("uploaded image cleanup failed", "error", deleteErr, "object_key", objectKey)
+		}
+		writeError(w, http.StatusInternalServerError, "upload_failed", "Could not prepare image preview.")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, uploadImageResponse{
+		URL:        objectURL,
+		BrowserURL: browserURL,
+	})
 }
 
 func (h *Handler) uploadDocument(w http.ResponseWriter, r *http.Request) {

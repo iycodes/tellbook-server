@@ -9,7 +9,7 @@ import (
 	"unicode"
 
 	"booking/go-server/internal/agreements/domain"
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 )
 
 type UploadPreparation struct {
@@ -58,6 +58,7 @@ func (b *StoredGenerationRequestBuilder) Build(
 		request.IncludeCancellationPolicy = input.IncludeCancellationPolicy
 		request.IncludeLatenessPolicy = input.IncludeLatenessPolicy
 		request.IncludePaymentTerms = input.IncludePaymentTerms
+		request.Context = append([]aiapi.NamedValue(nil), input.Context...)
 	case domain.GenerationInputUpload:
 		if b.uploadPreparer == nil {
 			return PreparedGenerationRequest{}, permanentGenerationError("upload_storage_unavailable", "private agreement storage is not configured")
@@ -80,6 +81,7 @@ func (b *StoredGenerationRequestBuilder) Build(
 		request.BusinessCategory = strings.TrimSpace(input.BusinessCategory)
 		request.ServiceName = strings.TrimSpace(input.ServiceName)
 		request.CustomInstructions = strings.TrimSpace(input.CustomInstructions)
+		request.Context = append([]aiapi.NamedValue(nil), input.Context...)
 		guard = NewUploadOutputGuard(prepared.RedactedDocumentText, prepared.ProhibitedLiterals)
 	default:
 		return PreparedGenerationRequest{}, permanentGenerationError("invalid_generation_input", fmt.Sprintf("unsupported input kind %q", job.InputKind))

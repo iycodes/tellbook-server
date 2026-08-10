@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 )
 
 type templateHashPayload struct {

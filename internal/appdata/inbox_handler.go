@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"booking/go-server/internal/auth"
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 
 	"github.com/gorilla/websocket"
 )

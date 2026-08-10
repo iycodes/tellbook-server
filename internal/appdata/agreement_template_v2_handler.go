@@ -12,7 +12,7 @@ import (
 	"booking/go-server/internal/agreements/domain"
 	agreementrepo "booking/go-server/internal/agreements/repository"
 	"booking/go-server/internal/auth"
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -95,24 +95,26 @@ type startAgreementGenerationRequest struct {
 }
 
 type agreementFieldsInput struct {
-	BusinessCategory          string `json:"business_category"`
-	ServiceName               string `json:"service_name"`
-	CustomInstructions        string `json:"custom_instructions"`
-	AgreementStyle            string `json:"agreement_style"`
-	TypicalServiceLocation    string `json:"typical_service_location"`
-	Tone                      string `json:"tone"`
-	IncludeCancellationPolicy bool   `json:"include_cancellation_policy"`
-	IncludeLatenessPolicy     bool   `json:"include_lateness_policy"`
-	IncludePaymentTerms       bool   `json:"include_payment_terms"`
+	BusinessCategory          string             `json:"business_category"`
+	ServiceName               string             `json:"service_name"`
+	CustomInstructions        string             `json:"custom_instructions"`
+	AgreementStyle            string             `json:"agreement_style"`
+	TypicalServiceLocation    string             `json:"typical_service_location"`
+	Tone                      string             `json:"tone"`
+	IncludeCancellationPolicy bool               `json:"include_cancellation_policy"`
+	IncludeLatenessPolicy     bool               `json:"include_lateness_policy"`
+	IncludePaymentTerms       bool               `json:"include_payment_terms"`
+	Context                   []aiapi.NamedValue `json:"context"`
 }
 
 type agreementUploadInput struct {
-	SourcePDFR2Key     string `json:"source_pdf_r2_key"`
-	SourcePDFFileName  string `json:"source_pdf_file_name"`
-	SourceTitle        string `json:"source_title"`
-	BusinessCategory   string `json:"business_category"`
-	ServiceName        string `json:"service_name"`
-	CustomInstructions string `json:"custom_instructions"`
+	SourcePDFR2Key     string             `json:"source_pdf_r2_key"`
+	SourcePDFFileName  string             `json:"source_pdf_file_name"`
+	SourceTitle        string             `json:"source_title"`
+	BusinessCategory   string             `json:"business_category"`
+	ServiceName        string             `json:"service_name"`
+	CustomInstructions string             `json:"custom_instructions"`
+	Context            []aiapi.NamedValue `json:"context"`
 }
 
 type agreementGenerationJobView struct {
@@ -365,6 +367,11 @@ func (h *Handler) startAgreementTemplateGeneration(w http.ResponseWriter, r *htt
 		writeError(w, http.StatusBadRequest, "invalid_generation_input", "Choose either AI fields or one uploaded agreement.")
 		return
 	}
+	profile, err := h.repo.GetClientProfile(r.Context(), client.ID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "profile_required", "Complete your business profile before creating an agreement.")
+		return
+	}
 	kind := domain.GenerationInputFields
 	var generationInput any
 	if input.Fields != nil {
@@ -375,19 +382,15 @@ func (h *Handler) startAgreementTemplateGeneration(w http.ResponseWriter, r *htt
 			IncludeCancellationPolicy: input.Fields.IncludeCancellationPolicy,
 			IncludeLatenessPolicy:     input.Fields.IncludeLatenessPolicy,
 			IncludePaymentTerms:       input.Fields.IncludePaymentTerms,
+			Context:                   agreementGenerationContext(profile, input.Fields.Context),
 		}
 	} else {
-		profile, err := h.repo.GetClientProfile(r.Context(), client.ID)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "profile_required", "Complete your business profile before uploading an agreement.")
-			return
-		}
 		kind = domain.GenerationInputUpload
 		generationInput = domain.UploadGenerationInput{
 			SourcePDFR2Key: input.Upload.SourcePDFR2Key, SourcePDFFileName: input.Upload.SourcePDFFileName,
 			SourceTitle: input.Upload.SourceTitle, BusinessCategory: input.Upload.BusinessCategory,
 			ServiceName: input.Upload.ServiceName, CustomInstructions: input.Upload.CustomInstructions,
-			Context: agreementGenerationContext(profile),
+			Context: agreementGenerationContext(profile, input.Upload.Context),
 		}
 	}
 	created, err := h.agreements.CreateGenerationDraft(r.Context(), agreementrepo.CreateGenerationDraftParams{
@@ -518,12 +521,12 @@ func agreementGenerationJobResponse(job domain.TemplateGenerationJob) agreementG
 	}
 }
 
-func agreementGenerationContext(profile ClientProfileResponse) []aiapi.NamedValue {
+func agreementGenerationContext(profile ClientProfileResponse, serviceContext []aiapi.NamedValue) []aiapi.NamedValue {
 	values := []aiapi.NamedValue{
-		{Key: "business_name", Value: profile.BusinessName},
-		{Key: "business_email", Value: profile.Email},
-		{Key: "business_location", Value: profile.Location},
+		{Key: "country_code", Value: profile.CountryCode},
+		{Key: "currency_code", Value: profile.CurrencyCode},
 	}
+	values = append(values, serviceContext...)
 	result := values[:0]
 	for _, value := range values {
 		value.Value = strings.TrimSpace(value.Value)

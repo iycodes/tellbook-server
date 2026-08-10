@@ -16,7 +16,7 @@ import (
 	"booking/go-server/internal/money"
 	"booking/go-server/internal/publictoken"
 
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )

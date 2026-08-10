@@ -7,19 +7,20 @@ import (
 	"io"
 	"strings"
 
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 )
 
 type FieldsGenerationInput struct {
-	BusinessCategory          string `json:"business_category"`
-	ServiceName               string `json:"service_name"`
-	CustomInstructions        string `json:"custom_instructions"`
-	AgreementStyle            string `json:"agreement_style"`
-	TypicalServiceLocation    string `json:"typical_service_location"`
-	Tone                      string `json:"tone"`
-	IncludeCancellationPolicy bool   `json:"include_cancellation_policy"`
-	IncludeLatenessPolicy     bool   `json:"include_lateness_policy"`
-	IncludePaymentTerms       bool   `json:"include_payment_terms"`
+	BusinessCategory          string             `json:"business_category"`
+	ServiceName               string             `json:"service_name"`
+	CustomInstructions        string             `json:"custom_instructions"`
+	AgreementStyle            string             `json:"agreement_style"`
+	TypicalServiceLocation    string             `json:"typical_service_location"`
+	Tone                      string             `json:"tone"`
+	IncludeCancellationPolicy bool               `json:"include_cancellation_policy"`
+	IncludeLatenessPolicy     bool               `json:"include_lateness_policy"`
+	IncludePaymentTerms       bool               `json:"include_payment_terms"`
+	Context                   []aiapi.NamedValue `json:"context"`
 }
 
 type UploadGenerationInput struct {

@@ -109,6 +109,41 @@ func TestManagedServiceAggregateRoundTrip(t *testing.T) {
 		t.Fatalf("expected revision conflict, got %v", err)
 	}
 
+	firstNewDraft, err := repo.CreateServiceWizardDraft(ctx, clientID, CreateServiceWizardDraftInput{
+		Payload:     json.RawMessage(`{"serviceName":"First new service"}`),
+		CurrentStep: "info",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondNewDraft, err := repo.CreateServiceWizardDraft(ctx, clientID, CreateServiceWizardDraftInput{
+		Payload:     json.RawMessage(`{"serviceName":"Second new service"}`),
+		CurrentStep: "pricing",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM service_wizard_drafts WHERE id = ANY($1)`, []uuid.UUID{
+			uuid.MustParse(firstNewDraft.ID),
+			uuid.MustParse(secondNewDraft.ID),
+		})
+	})
+	if firstNewDraft.ID == secondNewDraft.ID {
+		t.Fatal("new-service wizard drafts must be distinct")
+	}
+	newDrafts, err := repo.ListNewServiceWizardDrafts(ctx, clientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundNewDrafts := map[string]bool{}
+	for _, draft := range newDrafts {
+		foundNewDrafts[draft.ID] = true
+	}
+	if !foundNewDrafts[firstNewDraft.ID] || !foundNewDrafts[secondNewDraft.ID] {
+		t.Fatalf("new-service drafts were not both returned: %#v", foundNewDrafts)
+	}
+
 	distance := 25000
 	updated, err := repo.UpdateManagedService(ctx, clientID, serviceID, CreateManagedServiceInput{
 		ServiceName:     "Integration mobile consultation",

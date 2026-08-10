@@ -11,7 +11,7 @@ import (
 
 	"booking/go-server/internal/agreements/domain"
 	agreementrender "booking/go-server/internal/agreements/render"
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"

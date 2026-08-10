@@ -79,13 +79,31 @@ func TestGeneratedDocumentSchemaUsesDiscriminatedJSONSchema(t *testing.T) {
 	}
 	properties := decoded["properties"].(map[string]any)
 	blocks := properties["blocks"].(map[string]any)
+	if blocks["minItems"] != float64(2) || blocks["maxItems"] != float64(20) {
+		t.Fatalf("block bounds = min %#v, max %#v", blocks["minItems"], blocks["maxItems"])
+	}
 	items := blocks["items"].(map[string]any)
 	anyOf, ok := items["anyOf"].([]any)
-	if !ok || len(anyOf) != 6 {
+	if !ok || len(anyOf) != 4 {
 		t.Fatalf("block schema anyOf = %#v", items["anyOf"])
 	}
 	if strings.Contains(string(payload), `"id"`) {
 		t.Fatalf("generated document schema contains block IDs: %s", payload)
+	}
+	if strings.Contains(string(payload), `"divider"`) || strings.Contains(string(payload), `"acceptance"`) {
+		t.Fatalf("generated document schema contains server-owned blocks: %s", payload)
+	}
+	paragraph := anyOf[1].(map[string]any)
+	paragraphProperties := paragraph["properties"].(map[string]any)
+	content := paragraphProperties["content"].(map[string]any)
+	if content["minItems"] != float64(1) || content["maxItems"] != float64(32) {
+		t.Fatalf("inline bounds = min %#v, max %#v", content["minItems"], content["maxItems"])
+	}
+	list := anyOf[2].(map[string]any)
+	listProperties := list["properties"].(map[string]any)
+	listItems := listProperties["items"].(map[string]any)
+	if listItems["minItems"] != float64(1) || listItems["maxItems"] != float64(12) {
+		t.Fatalf("list bounds = min %#v, max %#v", listItems["minItems"], listItems["maxItems"])
 	}
 }
 

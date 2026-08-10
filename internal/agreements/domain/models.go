@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 
 	"github.com/google/uuid"
 )

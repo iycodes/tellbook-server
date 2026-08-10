@@ -100,7 +100,8 @@ func GenerateAgreementDocumentResponseJSONSchema() map[string]any {
 				"anyOf": []any{documentSchema, map[string]any{"type": "null"}},
 			},
 			"warnings": map[string]any{
-				"type": "array",
+				"type":     "array",
+				"maxItems": 10,
 				"items": map[string]any{
 					"type": "object",
 					"properties": map[string]any{

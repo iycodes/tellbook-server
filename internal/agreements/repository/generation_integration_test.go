@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"booking/go-server/internal/agreements/domain"
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"

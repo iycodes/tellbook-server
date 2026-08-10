@@ -17,6 +17,7 @@ import (
 	"booking/go-server/internal/auth"
 	"booking/go-server/internal/config"
 	"booking/go-server/internal/database"
+	"booking/go-server/internal/llm"
 	"booking/go-server/internal/mailer"
 	"booking/go-server/internal/payments"
 	"booking/go-server/internal/payments/capabilities"
@@ -94,7 +95,18 @@ func main() {
 		agreementTokens = configuredAgreementTokens
 		appdataRepo.ConfigureAgreementTokens(agreementTokens)
 	}
-	aiClient := aisvc.NewClient(cfg.AIServiceBaseURL, &http.Client{Timeout: cfg.AIServiceTimeout})
+	aiServices := make(map[string]*aisvc.Service, 2)
+	if cfg.NeedsSelfHosted() {
+		aiServices[config.AIProviderSelfHosted] = aisvc.NewService(llm.NewClient(cfg))
+	}
+	if cfg.NeedsHosted() {
+		aiServices[config.AIProviderHosted] = aisvc.NewService(llm.NewOpenAIClient(cfg))
+	}
+	aiClient := aisvc.NewClient(
+		aiServices[cfg.DefaultAIProvider],
+		aiServices[cfg.AgreementAIProvider],
+		aiServices[cfg.InboxAIProvider],
+	)
 	agreementRepository := agreementrepo.New(dbPool)
 	if err := agreementRepository.SyncSystemTemplates(ctx); err != nil {
 		logger.Error("sync system agreement templates", "error", err)
@@ -124,11 +136,7 @@ func main() {
 		logger.Error("configure agreement generation worker", "error", err)
 		os.Exit(1)
 	}
-	if aiClient.Available() {
-		go agreementGenerationWorker.Start(ctx)
-	} else {
-		logger.Info("agreement generation worker disabled", "reason", "missing AI_SERVICE_BASE_URL")
-	}
+	go agreementGenerationWorker.Start(ctx)
 	if agreementTokens != nil {
 		var agreementStorage agreementworker.CompletedAgreementStore
 		if r2Service != nil {
@@ -371,7 +379,15 @@ func main() {
 
 	serverErrCh := make(chan error, 1)
 	go func() {
-		logger.Info("starting server", "addr", cfg.HTTPAddr)
+		logger.Info(
+			"starting server",
+			"addr", cfg.HTTPAddr,
+			"default_ai_provider", cfg.DefaultAIProvider,
+			"agreement_ai_provider", cfg.AgreementAIProvider,
+			"inbox_ai_provider", cfg.InboxAIProvider,
+			"self_hosted_model", cfg.LLMModel,
+			"openai_model", cfg.OpenAIModel,
+		)
 		serverErrCh <- httpServer.ListenAndServe()
 	}()
 

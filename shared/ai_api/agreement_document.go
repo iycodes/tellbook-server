@@ -444,6 +444,12 @@ func sortedAgreementVariableKeys(keys map[string]struct{}) []string {
 }
 
 func GeneratedDocumentJSONSchema() map[string]any {
+	const (
+		maxGeneratedBlocks      = 20
+		maxGeneratedListItems   = 12
+		maxGeneratedInlineNodes = 32
+	)
+
 	inlineSchema := func() map[string]any {
 		return map[string]any{
 			"anyOf": []any{
@@ -462,14 +468,18 @@ func GeneratedDocumentJSONSchema() map[string]any {
 	}
 	contentSchema := func() map[string]any {
 		return map[string]any{
-			"type":  "array",
-			"items": inlineSchema(),
+			"type":     "array",
+			"items":    inlineSchema(),
+			"minItems": 1,
+			"maxItems": maxGeneratedInlineNodes,
 		}
 	}
 	listItemsSchema := func() map[string]any {
 		return map[string]any{
-			"type":  "array",
-			"items": contentSchema(),
+			"type":     "array",
+			"items":    contentSchema(),
+			"minItems": 1,
+			"maxItems": maxGeneratedListItems,
 		}
 	}
 	blockSchema := map[string]any{
@@ -491,20 +501,15 @@ func GeneratedDocumentJSONSchema() map[string]any {
 				"type":  map[string]any{"type": "string", "enum": []any{"unordered_list"}},
 				"items": listItemsSchema(),
 			}, "type", "items"),
-			strictObjectSchema(map[string]any{
-				"type": map[string]any{"type": "string", "enum": []any{"divider"}},
-			}, "type"),
-			strictObjectSchema(map[string]any{
-				"type":   map[string]any{"type": "string", "enum": []any{"acceptance"}},
-				"method": map[string]any{"type": "string", "enum": []any{"confirmation", "signature"}},
-			}, "type", "method"),
 		},
 	}
 	return strictObjectSchema(map[string]any{
 		"schema_version": map[string]any{"type": "integer", "enum": []any{AgreementDocumentSchemaVersion}},
 		"blocks": map[string]any{
-			"type":  "array",
-			"items": blockSchema,
+			"type":     "array",
+			"items":    blockSchema,
+			"minItems": 2,
+			"maxItems": maxGeneratedBlocks,
 		},
 	}, "schema_version", "blocks")
 }

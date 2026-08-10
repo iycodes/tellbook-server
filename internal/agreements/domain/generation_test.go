@@ -2,10 +2,16 @@ package domain
 
 import (
 	"testing"
+
+	aiapi "booking/go-server/shared/ai_api"
 )
 
 func TestGenerationInputsRoundTripStrictly(t *testing.T) {
-	input := FieldsGenerationInput{BusinessCategory: "Beauty", ServiceName: "Lash extensions"}
+	input := FieldsGenerationInput{
+		BusinessCategory: "Beauty",
+		ServiceName:      "Lash extensions",
+		Context:          []aiapi.NamedValue{{Key: "service_duration", Value: "90 minutes"}},
+	}
 	payload, err := EncodeGenerationInput(GenerationInputFields, input)
 	if err != nil {
 		t.Fatalf("EncodeGenerationInput() error = %v", err)
@@ -14,7 +20,7 @@ func TestGenerationInputsRoundTripStrictly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeFieldsGenerationInput() error = %v", err)
 	}
-	if decoded.ServiceName != input.ServiceName {
+	if decoded.ServiceName != input.ServiceName || len(decoded.Context) != 1 || decoded.Context[0].Value != "90 minutes" {
 		t.Fatalf("decoded = %+v", decoded)
 	}
 	if _, err := DecodeFieldsGenerationInput(append(payload[:len(payload)-1], []byte(`,"unknown":true}`)...)); err == nil {

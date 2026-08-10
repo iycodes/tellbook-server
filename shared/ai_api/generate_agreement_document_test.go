@@ -25,14 +25,20 @@ func TestGenerateAgreementDocumentRequestValidation(t *testing.T) {
 }
 
 func TestGenerateAgreementDocumentResponseSchemaIsStrict(t *testing.T) {
-	payload, err := json.Marshal(GenerateAgreementDocumentResponseJSONSchema())
+	schema := GenerateAgreementDocumentResponseJSONSchema()
+	payload, err := json.Marshal(schema)
 	if err != nil {
 		t.Fatalf("json.Marshal() error = %v", err)
 	}
 	text := string(payload)
-	for _, expected := range []string{`"document_schema"`, `"additionalProperties":false`, `"acceptance"`, `"variable"`} {
+	for _, expected := range []string{`"document_schema"`, `"additionalProperties":false`, `"paragraph"`, `"variable"`} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("response schema missing %s: %s", expected, text)
 		}
+	}
+	properties := schema["properties"].(map[string]any)
+	warnings := properties["warnings"].(map[string]any)
+	if warnings["maxItems"] != 10 {
+		t.Fatalf("warning maxItems = %#v", warnings["maxItems"])
 	}
 }

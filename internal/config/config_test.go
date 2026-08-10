@@ -1,12 +1,23 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func setRequiredConfig(t *testing.T) {
 	t.Helper()
 	t.Setenv("APP_ENV", "development")
 	t.Setenv("DATABASE_URL", "postgres://example.invalid/database")
 	t.Setenv("AUTH_ACCESS_TOKEN_SECRET", "test-secret")
+	t.Setenv("DEFAULT_AI_PROVIDER", AIProviderSelfHosted)
+	t.Setenv("AGREEMENT_AI_PROVIDER", AIProviderSelfHosted)
+	t.Setenv("INBOX_AI_PROVIDER", AIProviderSelfHosted)
+	t.Setenv("HOSTED_AI_PROVIDER", HostedProviderOpenAI)
+	t.Setenv("LLM_BASE_URL", "http://127.0.0.1:8080")
+	t.Setenv("LLM_TIMEOUT", "30s")
+	t.Setenv("LLM_MAX_OUTPUT_TOKENS", "1200")
+	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("PAYMENTS_ENVIRONMENT", "")
 	t.Setenv("FINANCIAL_DATA_ENCRYPTION_KEYS", "")
 	t.Setenv("FINANCIAL_DATA_ACTIVE_KEY_VERSION", "")
@@ -39,6 +50,50 @@ func setRequiredConfig(t *testing.T) {
 		"PAYSTACK_PAYOUT_SANDBOX_VERIFIED", "PAYSTACK_PAYOUT_PRODUCTION_ENABLED",
 	} {
 		t.Setenv(key, "false")
+	}
+}
+
+func TestLoadSelectsAIProvidersByTask(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("AGREEMENT_AI_PROVIDER", AIProviderHosted)
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DefaultAIProvider != AIProviderSelfHosted || cfg.AgreementAIProvider != AIProviderHosted || cfg.InboxAIProvider != AIProviderSelfHosted {
+		t.Fatalf("unexpected AI provider routing: %+v", cfg)
+	}
+}
+
+func TestLoadRequiresSelectedAIProviderCredentials(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("AGREEMENT_AI_PROVIDER", AIProviderHosted)
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted hosted AI without an OpenAI API key")
+	}
+}
+
+func TestSynchronousAIRouteTimeoutUsesSelectedProviderTimeout(t *testing.T) {
+	cfg := Config{
+		DefaultAIProvider: AIProviderSelfHosted,
+		InboxAIProvider:   AIProviderHosted,
+		LLMTimeout:        30 * time.Second,
+		OpenAITimeout:     45 * time.Second,
+	}
+	if got := cfg.SynchronousAIRouteTimeout(); got != 50*time.Second {
+		t.Fatalf("SynchronousAIRouteTimeout() = %v", got)
+	}
+}
+
+func TestLoadRejectsInvalidLocalSamplingConfig(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("MIN_P", "1.5")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() accepted MIN_P above one")
 	}
 }
 

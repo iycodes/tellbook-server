@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"booking/go-server/internal/agreements/domain"
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 )
 
 type uploadPreparerFake struct {
@@ -51,6 +51,7 @@ func TestStoredGenerationRequestBuilderAllowsFieldsWithoutUploadStorage(t *testi
 	payload, err := domain.EncodeGenerationInput(domain.GenerationInputFields, domain.FieldsGenerationInput{
 		BusinessCategory: "Beauty",
 		ServiceName:      "Lash extensions",
+		Context:          []aiapi.NamedValue{{Key: "service_duration", Value: "90 minutes"}},
 	})
 	if err != nil {
 		t.Fatalf("EncodeGenerationInput() error = %v", err)
@@ -59,12 +60,16 @@ func TestStoredGenerationRequestBuilderAllowsFieldsWithoutUploadStorage(t *testi
 	if err != nil {
 		t.Fatalf("NewStoredGenerationRequestBuilder() error = %v", err)
 	}
-	if _, err := builder.Build(context.Background(), domain.TemplateGenerationJob{
+	prepared, err := builder.Build(context.Background(), domain.TemplateGenerationJob{
 		ConfirmationMethod: domain.ConfirmationMethodConfirmation,
 		InputKind:          domain.GenerationInputFields,
 		InputJSON:          payload,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("Build() error = %v", err)
+	}
+	if len(prepared.Request.Context) != 1 || prepared.Request.Context[0].Value != "90 minutes" {
+		t.Fatalf("prepared context = %#v", prepared.Request.Context)
 	}
 }
 

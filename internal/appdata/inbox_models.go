@@ -3,7 +3,7 @@ package appdata
 import (
 	"time"
 
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 )
 
 type InboxConversationItem struct {

@@ -18,6 +18,7 @@ Thumbs.db
 
 # Logs / temp
 *.log
+openai-response-output.jsonl
 logs/
 tmp/
 temp/

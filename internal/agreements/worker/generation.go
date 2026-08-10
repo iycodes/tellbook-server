@@ -10,7 +10,7 @@ import (
 
 	"booking/go-server/internal/agreements/domain"
 	"booking/go-server/internal/agreements/repository"
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 
 	"github.com/google/uuid"
 )

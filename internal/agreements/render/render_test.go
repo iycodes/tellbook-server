@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"booking/go-server/internal/agreements/domain"
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 
 	"github.com/google/uuid"
 )

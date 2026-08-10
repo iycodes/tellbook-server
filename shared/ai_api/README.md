@@ -1,15 +1,6 @@
-# AI API Contracts
+# AI Contracts
 
-Shared request and response structs for the Booking main API and AI server.
-
-Recommended usage:
-
-- `tellbook-server/go.mod`
-  - `require booking/shared/ai_api v0.0.0`
-  - `replace booking/shared/ai_api => ./shared/ai_api`
-- `tellbook-ai-server/go.mod`
-  - `require booking/shared/ai_api v0.0.0`
-  - `replace booking/shared/ai_api => ../tellbook-server/shared/ai_api`
+Request and response structs shared by TellBook's application handlers and in-process AI generation services.
 
 This package is intentionally transport-focused:
 
@@ -17,7 +8,7 @@ This package is intentionally transport-focused:
 - response payloads
 - small shared enums/types
 
-It does not contain provider-specific AI logic.
+Provider-specific AI logic belongs in `internal/llm`; prompt and generation logic belongs in `internal/ai`.
 
 Current contract groups include:
 

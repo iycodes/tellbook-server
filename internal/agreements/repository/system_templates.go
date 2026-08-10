@@ -10,7 +10,7 @@ import (
 	"booking/go-server/internal/agreements/domain"
 	"booking/go-server/internal/agreements/render"
 	agreementseed "booking/go-server/internal/agreements/seed"
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"booking/go-server/internal/agreements/domain"
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 )
 
 func TestRenderCompletedPDFIsDeterministicAndSupportsUnicode(t *testing.T) {

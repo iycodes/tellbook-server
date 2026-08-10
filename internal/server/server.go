@@ -23,8 +23,9 @@ import (
 func New(cfg config.Config, logger *slog.Logger, authHandler *auth.Handler, providerWebhookHandler *payments.ProviderWebhookHandler, appdataHandler *appdata.Handler) *http.Server {
 	router := chi.NewRouter()
 	writeTimeout := cfg.WriteTimeout
-	if cfg.AIRouteTimeout > 0 && cfg.AIRouteTimeout >= writeTimeout {
-		writeTimeout = cfg.AIRouteTimeout + (5 * time.Second)
+	aiRouteTimeout := cfg.SynchronousAIRouteTimeout()
+	if aiRouteTimeout >= writeTimeout {
+		writeTimeout = aiRouteTimeout + (5 * time.Second)
 	}
 
 	router.Use(chimiddleware.RequestID)
@@ -113,10 +114,7 @@ func truncatedLogValue(value string, maxLength int) string {
 
 func routeTimeoutMiddleware(cfg config.Config) func(http.Handler) http.Handler {
 	defaultTimeout := chimiddleware.Timeout(30 * time.Second)
-	aiRouteTimeout := cfg.AIRouteTimeout
-	if aiRouteTimeout <= 0 {
-		aiRouteTimeout = 120 * time.Second
-	}
+	aiRouteTimeout := cfg.SynchronousAIRouteTimeout()
 	aiTimeout := chimiddleware.Timeout(aiRouteTimeout)
 
 	return func(next http.Handler) http.Handler {
@@ -130,7 +128,7 @@ func routeTimeoutMiddleware(cfg config.Config) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			if strings.HasPrefix(r.URL.Path, "/v1/app/ai/") {
+			if isAIRoute(r.Method, r.URL.Path) {
 				aiHandler.ServeHTTP(w, r)
 				return
 			}

@@ -17,7 +17,7 @@ import (
 	agreementservice "booking/go-server/internal/agreements/service"
 	"booking/go-server/internal/mailer"
 	"booking/go-server/internal/secure"
-	aiapi "booking/shared/ai_api"
+	aiapi "booking/go-server/shared/ai_api"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
