@@ -2553,7 +2553,6 @@ CREATE INDEX service_wizard_drafts_client_updated_idx ON public.service_wizard_d
 
 
 --
---
 -- Name: service_wizard_drafts_one_per_service_idx; Type: INDEX; Schema: public; Owner: -
 --
 

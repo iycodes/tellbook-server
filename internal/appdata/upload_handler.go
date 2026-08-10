@@ -270,6 +270,10 @@ func normalizeUploadCategory(value string) string {
 		return "services"
 	case "sections":
 		return "sections"
+	case "profiles":
+		return "profiles"
+	case "portfolio":
+		return "portfolio"
 	default:
 		return "misc"
 	}

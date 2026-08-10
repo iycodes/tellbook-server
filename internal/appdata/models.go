@@ -637,6 +637,23 @@ type PublicPortfolioItem struct {
 	Caption  string `json:"caption"`
 }
 
+type ManagedPortfolioItem struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	ImageURL  string    `json:"image_url"`
+	SortOrder int       `json:"sort_order"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type CreatePortfolioItemInput struct {
+	Title    string `json:"title"`
+	ImageURL string `json:"image_url"`
+}
+
+type ReorderPortfolioItemsInput struct {
+	OrderedIDs []string `json:"ordered_ids"`
+}
+
 type PromotionTargetRef struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`

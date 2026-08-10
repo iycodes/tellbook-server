@@ -32,7 +32,26 @@ func (h *Handler) getPayoutSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(rails) > 0 {
 		response.SelectedRail = rails[0]
-		options, err := h.destinations.Options(r.Context(), profile.CountryCode, profile.CurrencyCode, rails[0])
+		currentDestinationIndex := -1
+		if len(destinations) > 0 {
+			currentDestinationIndex = 0
+		}
+		for index := range destinations {
+			if destinations[index].IsDefault {
+				currentDestinationIndex = index
+				break
+			}
+		}
+		if currentDestinationIndex >= 0 {
+			destination := destinations[currentDestinationIndex]
+			for _, rail := range rails {
+				if destination.Rail == rail {
+					response.SelectedRail = rail
+					break
+				}
+			}
+		}
+		options, err := h.destinations.Options(r.Context(), profile.CountryCode, profile.CurrencyCode, response.SelectedRail)
 		if err != nil {
 			writePayoutProviderError(w, err, "Could not load payout options.")
 			return
