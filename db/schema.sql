@@ -3315,4 +3315,5 @@ ALTER TABLE ONLY public.services
 --
 
 INSERT INTO public.schema_migrations (version) VALUES
-    ('20260808140000');
+    ('20260808140000'),
+    ('20260818120000');
