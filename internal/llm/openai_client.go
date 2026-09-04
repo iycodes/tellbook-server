@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"reflect"
@@ -15,7 +16,9 @@ import (
 	"sync"
 	"time"
 
+	"booking/go-server/internal/aierror"
 	"booking/go-server/internal/config"
+	"booking/go-server/internal/observability"
 	aiapi "booking/go-server/shared/ai_api"
 
 	"github.com/invopop/jsonschema"
@@ -36,8 +39,11 @@ type OpenAIClient struct {
 	responseLogFile string
 }
 
-func NewOpenAIClient(cfg config.Config) *OpenAIClient {
+func NewOpenAIClient(cfg config.Config, operationalMetrics ...*observability.Metrics) *OpenAIClient {
 	httpClient := &http.Client{Timeout: cfg.OpenAITimeout}
+	if len(operationalMetrics) > 0 && operationalMetrics[0] != nil {
+		httpClient = operationalMetrics[0].InstrumentHTTPClient(httpClient, "ai_openai")
+	}
 	client := openai.NewClient(
 		option.WithBaseURL(cfg.OpenAIBaseURL),
 		option.WithAPIKey(cfg.OpenAIAPIKey),
@@ -58,7 +64,7 @@ func (c *OpenAIClient) GenerateJSON(ctx context.Context, systemPrompt, userPromp
 	startedAt := time.Now()
 	schemaName, schema, err := responseSchema(dst)
 	if err != nil {
-		return err
+		return aierror.Terminal("prepare OpenAI request", aierror.KindConfiguration, err)
 	}
 
 	format := responses.ResponseFormatTextConfigParamOfJSONSchema(schemaName, schema)
@@ -78,6 +84,9 @@ func (c *OpenAIClient) GenerateJSON(ctx context.Context, systemPrompt, userPromp
 	})
 	if err != nil {
 		logOpenAIError(err, c.model, time.Since(startedAt))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return safeOpenAIError(err)
 	}
 	if err := appendOpenAIResponseLog(c.responseLogFile, c.model, result); err != nil {
@@ -104,9 +113,9 @@ func (c *OpenAIClient) GenerateJSON(ctx context.Context, systemPrompt, userPromp
 			"reasoning_tokens", result.Usage.OutputTokensDetails.ReasoningTokens,
 		)
 		if reason == "refused" {
-			return fmt.Errorf("call openai: response was refused")
+			return aierror.Terminal("call OpenAI", aierror.KindRefusal, nil)
 		}
-		return fmt.Errorf("call openai: response contained no output")
+		return aierror.InvalidOutput("read OpenAI output", errors.New("empty output"))
 	}
 	if err := json.Unmarshal([]byte(content), dst); err != nil {
 		slog.Error(
@@ -121,7 +130,7 @@ func (c *OpenAIClient) GenerateJSON(ctx context.Context, systemPrompt, userPromp
 			"output_tokens", result.Usage.OutputTokens,
 			"reasoning_tokens", result.Usage.OutputTokensDetails.ReasoningTokens,
 		)
-		return fmt.Errorf("decode openai structured output: provider returned incomplete JSON")
+		return aierror.InvalidOutput("decode OpenAI structured output", err)
 	}
 
 	slog.Info(
@@ -203,12 +212,12 @@ func openAIResponseStatusError(result *responses.Response, model string, duratio
 	if result.Status == responses.ResponseStatusIncomplete {
 		switch reason {
 		case "max_output_tokens":
-			return fmt.Errorf("call openai: response exceeded output token limit")
+			return aierror.Terminal("call OpenAI", aierror.KindOutputTruncated, nil)
 		case "content_filter":
-			return fmt.Errorf("call openai: response was stopped by content filtering")
+			return aierror.Terminal("call OpenAI", aierror.KindContentFiltered, nil)
 		}
 	}
-	return fmt.Errorf("call openai: response status was %s", result.Status)
+	return aierror.Terminal("call OpenAI", aierror.KindMalformedResponse, nil)
 }
 
 func openAIResponseRefused(result *responses.Response) bool {
@@ -312,7 +321,11 @@ func logOpenAIError(err error, model string, duration time.Duration) {
 func safeOpenAIError(err error) error {
 	var apiErr *openai.Error
 	if errors.As(err, &apiErr) {
-		return fmt.Errorf("call openai: provider returned status %d", apiErr.StatusCode)
+		return classifyProviderHTTPStatus("call OpenAI", apiErr.StatusCode)
 	}
-	return fmt.Errorf("call openai: provider request failed")
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && networkErr.Timeout() {
+		return aierror.Transient("call OpenAI", aierror.KindTimeout, err)
+	}
+	return aierror.Transient("call OpenAI", aierror.KindTransport, err)
 }

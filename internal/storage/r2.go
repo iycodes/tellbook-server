@@ -28,6 +28,8 @@ type R2Service struct {
 	publicBucketBaseURL string
 }
 
+const publicObjectCacheControl = "public, max-age=31536000, immutable"
+
 func NewR2Service(cfg config.Config) (*R2Service, error) {
 	hasAnyConfig := cfg.R2PrivateBucketName != "" ||
 		cfg.R2PublicBucketName != "" ||
@@ -88,10 +90,11 @@ func (s *R2Service) Upload(ctx context.Context, content []byte, objectKey, conte
 	}
 
 	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(resolvedBucket),
-		Key:         aws.String(objectKey),
-		Body:        bytes.NewReader(content),
-		ContentType: aws.String(contentType),
+		Bucket:       aws.String(resolvedBucket),
+		Key:          aws.String(objectKey),
+		Body:         bytes.NewReader(content),
+		ContentType:  aws.String(contentType),
+		CacheControl: cacheControlPointer(s.objectCacheControl(resolvedBucket)),
 	})
 	if err != nil {
 		return "", fmt.Errorf("put object: %w", err)
@@ -107,10 +110,11 @@ func (s *R2Service) UploadReader(ctx context.Context, reader io.Reader, objectKe
 	}
 
 	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:      aws.String(resolvedBucket),
-		Key:         aws.String(objectKey),
-		Body:        reader,
-		ContentType: aws.String(contentType),
+		Bucket:       aws.String(resolvedBucket),
+		Key:          aws.String(objectKey),
+		Body:         reader,
+		ContentType:  aws.String(contentType),
+		CacheControl: cacheControlPointer(s.objectCacheControl(resolvedBucket)),
 	})
 	if err != nil {
 		return "", fmt.Errorf("put object: %w", err)
@@ -324,6 +328,20 @@ func (s *R2Service) requireBucketName(bucketName ...string) (string, error) {
 
 func (s *R2Service) isPublicBucket(bucketName string) bool {
 	return s.publicBucketName != "" && bucketName == s.publicBucketName
+}
+
+func (s *R2Service) objectCacheControl(bucketName string) string {
+	if s.isPublicBucket(bucketName) {
+		return publicObjectCacheControl
+	}
+	return ""
+}
+
+func cacheControlPointer(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return aws.String(value)
 }
 
 func normalizeBaseURL(raw string) string {

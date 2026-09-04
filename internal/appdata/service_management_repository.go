@@ -76,6 +76,16 @@ func (r *Repository) CreateServiceSection(ctx context.Context, clientID uuid.UUI
 		return ServiceSectionItem{}, fmt.Errorf("begin create service section: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := enforceProviderCollectionLimit(
+		ctx,
+		tx,
+		clientID,
+		`SELECT COUNT(*) FROM service_sections WHERE client_id = $1`,
+		MaxProviderServiceSections,
+		ErrServiceSectionLimitReached,
+	); err != nil {
+		return ServiceSectionItem{}, err
+	}
 
 	var nextSortOrder int
 	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(sort_order), 0) + 1 FROM service_sections WHERE client_id = $1`, clientID).Scan(&nextSortOrder); err != nil {
@@ -117,19 +127,27 @@ func (r *Repository) UpdateServiceSection(ctx context.Context, clientID, section
 	}
 
 	var coverImageURL string
+	var previousCoverImageURL string
 	var updatedAt time.Time
 	if err := r.db.QueryRow(
 		ctx,
-		`UPDATE service_sections
-		 SET name = $3, description = $4, cover_image_url = $5, updated_at = NOW()
-		 WHERE client_id = $1 AND id = $2
-		 RETURNING COALESCE(cover_image_url, ''), updated_at`,
+		`WITH previous AS (
+			SELECT id, COALESCE(cover_image_url, '') AS cover_image_url
+			FROM service_sections
+			WHERE client_id = $1 AND id = $2
+			FOR UPDATE
+		)
+		UPDATE service_sections section
+		SET name = $3, description = $4, cover_image_url = $5, updated_at = NOW()
+		FROM previous
+		WHERE section.id = previous.id
+		RETURNING COALESCE(section.cover_image_url, ''), section.updated_at, previous.cover_image_url`,
 		clientID,
 		sectionID,
 		name,
 		strings.TrimSpace(input.Description),
 		nullIfBlank(input.CoverImageURL),
-	).Scan(&coverImageURL, &updatedAt); err != nil {
+	).Scan(&coverImageURL, &updatedAt, &previousCoverImageURL); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ServiceSectionItem{}, ErrNotFound
 		}
@@ -146,52 +164,58 @@ func (r *Repository) UpdateServiceSection(ctx context.Context, clientID, section
 	}
 
 	return ServiceSectionItem{
-		ID:            sectionID.String(),
-		Name:          name,
-		Description:   strings.TrimSpace(input.Description),
-		CoverImageURL: coverImageURL,
-		ServiceCount:  serviceCount,
-		UpdatedLabel:  formatUpdatedLabel(updatedAt),
+		ID:               sectionID.String(),
+		Name:             name,
+		Description:      strings.TrimSpace(input.Description),
+		CoverImageURL:    coverImageURL,
+		ServiceCount:     serviceCount,
+		UpdatedLabel:     formatUpdatedLabel(updatedAt),
+		replacedImageURL: previousCoverImageURL,
 	}, nil
 }
 
-func (r *Repository) DeleteServiceSection(ctx context.Context, clientID, sectionID uuid.UUID, input DeleteServiceSectionInput) error {
+func (r *Repository) DeleteServiceSection(ctx context.Context, clientID, sectionID uuid.UUID, input DeleteServiceSectionInput) (string, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin delete service section: %w", err)
+		return "", fmt.Errorf("begin delete service section: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
 	switch input.Mode {
 	case "", "uncategorized":
 		if _, err := tx.Exec(ctx, `UPDATE services SET section_id = NULL, category = '' WHERE client_id = $1 AND section_id = $2`, clientID, sectionID); err != nil {
-			return fmt.Errorf("uncategorize services: %w", err)
+			return "", fmt.Errorf("uncategorize services: %w", err)
 		}
 	case "move":
 		targetID, err := uuid.Parse(strings.TrimSpace(input.TargetSectionID))
 		if err != nil {
-			return fmt.Errorf("target section is required when move mode is used")
+			return "", fmt.Errorf("target section is required when move mode is used")
 		}
 		if _, err := tx.Exec(ctx, `UPDATE services SET section_id = $3, category = COALESCE((SELECT name FROM service_sections WHERE id = $3 AND client_id = $1), category) WHERE client_id = $1 AND section_id = $2`, clientID, sectionID, targetID); err != nil {
-			return fmt.Errorf("move services to section: %w", err)
+			return "", fmt.Errorf("move services to section: %w", err)
 		}
 	default:
-		return fmt.Errorf("unsupported delete mode")
+		return "", fmt.Errorf("unsupported delete mode")
 	}
 
-	commandTag, err := tx.Exec(ctx, `DELETE FROM service_sections WHERE client_id = $1 AND id = $2`, clientID, sectionID)
-	if err != nil {
-		return fmt.Errorf("delete service section: %w", err)
-	}
-	if commandTag.RowsAffected() == 0 {
-		return ErrNotFound
+	var coverImageURL string
+	if err := tx.QueryRow(
+		ctx,
+		`DELETE FROM service_sections WHERE client_id = $1 AND id = $2 RETURNING COALESCE(cover_image_url, '')`,
+		clientID,
+		sectionID,
+	).Scan(&coverImageURL); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("delete service section: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit delete service section: %w", err)
+		return "", fmt.Errorf("commit delete service section: %w", err)
 	}
 
-	return nil
+	return coverImageURL, nil
 }
 
 func (r *Repository) GetServiceSectionDetails(ctx context.Context, clientID, sectionID uuid.UUID) (ServiceSectionDetailsResponse, error) {
@@ -426,6 +450,16 @@ func (r *Repository) DuplicateManagedService(ctx context.Context, clientID, serv
 		return ManagedServiceItem{}, fmt.Errorf("begin duplicate managed service: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := enforceProviderCollectionLimit(
+		ctx,
+		tx,
+		clientID,
+		`SELECT COUNT(*) FROM services WHERE client_id = $1`,
+		MaxProviderServices,
+		ErrServiceLimitReached,
+	); err != nil {
+		return ManagedServiceItem{}, err
+	}
 
 	var sourceName string
 	var sourceSlug string
@@ -613,6 +647,19 @@ func (r *Repository) saveManagedService(ctx context.Context, clientID, serviceID
 		return ManagedServiceItem{}, fmt.Errorf("begin save managed service: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	previousImageURL := ""
+	if create {
+		if err := enforceProviderCollectionLimit(
+			ctx,
+			tx,
+			clientID,
+			`SELECT COUNT(*) FROM services WHERE client_id = $1`,
+			MaxProviderServices,
+			ErrServiceLimitReached,
+		); err != nil {
+			return ManagedServiceItem{}, err
+		}
+	}
 
 	currencyCode, err := loadConfiguredCurrencyCodeTx(ctx, tx, clientID)
 	if err != nil {
@@ -677,6 +724,17 @@ func (r *Repository) saveManagedService(ctx context.Context, clientID, serviceID
 			input.StandaloneSignatureRequired,
 			strings.TrimSpace(input.Instructions), strings.TrimSpace(input.Badge), currencyCode)
 	} else {
+		if err := tx.QueryRow(
+			ctx,
+			`SELECT COALESCE(image_url, '') FROM services WHERE client_id = $1 AND id = $2 FOR UPDATE`,
+			clientID,
+			serviceID,
+		).Scan(&previousImageURL); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ManagedServiceItem{}, ErrNotFound
+			}
+			return ManagedServiceItem{}, fmt.Errorf("lock managed service: %w", err)
+		}
 		if err := ensureUniqueServiceSlugExcluding(ctx, tx, clientID, serviceID, &slug); err != nil {
 			return ManagedServiceItem{}, err
 		}
@@ -730,7 +788,9 @@ func (r *Repository) saveManagedService(ctx context.Context, clientID, serviceID
 	if err := tx.Commit(ctx); err != nil {
 		return ManagedServiceItem{}, fmt.Errorf("commit managed service: %w", err)
 	}
-	return r.GetManagedServiceDetails(ctx, clientID, serviceID)
+	item, err := r.GetManagedServiceDetails(ctx, clientID, serviceID)
+	item.replacedImageURL = previousImageURL
+	return item, err
 }
 
 func consumeServiceWizardDraft(ctx context.Context, tx pgx.Tx, clientID, serviceID uuid.UUID, rawDraftID string, create bool) error {
@@ -1003,15 +1063,20 @@ func replaceServiceChildren(ctx context.Context, tx pgx.Tx, serviceID uuid.UUID,
 	return nil
 }
 
-func (r *Repository) DeleteManagedService(ctx context.Context, clientID, serviceID uuid.UUID) error {
-	commandTag, err := r.db.Exec(ctx, `DELETE FROM services WHERE client_id = $1 AND id = $2`, clientID, serviceID)
-	if err != nil {
-		return fmt.Errorf("delete managed service: %w", err)
+func (r *Repository) DeleteManagedService(ctx context.Context, clientID, serviceID uuid.UUID) (string, error) {
+	var imageURL string
+	if err := r.db.QueryRow(
+		ctx,
+		`DELETE FROM services WHERE client_id = $1 AND id = $2 RETURNING COALESCE(image_url, '')`,
+		clientID,
+		serviceID,
+	).Scan(&imageURL); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("delete managed service: %w", err)
 	}
-	if commandTag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return imageURL, nil
 }
 
 func (r *Repository) UpdateManagedServiceVisibility(ctx context.Context, clientID, serviceID uuid.UUID, isHidden bool) (ManagedServiceItem, error) {

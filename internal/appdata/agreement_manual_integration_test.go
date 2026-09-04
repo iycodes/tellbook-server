@@ -32,7 +32,8 @@ func TestManualAgreementCreateActivateAndSend(t *testing.T) {
 	if err := pool.QueryRow(ctx, `
 		SELECT b.client_id, b.id, b.customer_id
 		FROM bookings b
-		INNER JOIN customers c ON c.id = b.customer_id AND c.email <> ''
+		INNER JOIN customers c ON c.id = b.customer_id AND c.client_id = b.client_id AND c.email <> ''
+		INNER JOIN client_profiles profile ON profile.client_id = b.client_id
 		ORDER BY b.created_at DESC
 		LIMIT 1
 	`).Scan(&clientID, &bookingID, &customerID); err != nil {
@@ -106,6 +107,10 @@ func TestManualAgreementCreateActivateAndSend(t *testing.T) {
 		CustomerID:       customerID.String(),
 		BookingID:        bookingID.String(),
 		TemplateFamilyID: familyID.String(),
+		Values: map[string]string{
+			"CANCELLATION_POLICY": "24 hours notice",
+			"LATENESS_POLICY":     "Please arrive on time",
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

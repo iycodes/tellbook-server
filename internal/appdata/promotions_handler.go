@@ -14,13 +14,22 @@ func (h *Handler) listPromotions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items, err := h.repo.ListPromotions(r.Context(), authedClient.ID, r.URL.Query().Get("type"))
+	limit, err := boundedListLimit(r, defaultPromotionListLimit, defaultPromotionListLimit)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_promotion_list", err.Error())
+		return
+	}
+	response, err := h.repo.ListPromotions(r.Context(), authedClient.ID, r.URL.Query().Get("type"), r.URL.Query().Get("cursor"), limit)
+	if errors.Is(err, ErrInvalidKeysetCursor) {
+		writeError(w, http.StatusBadRequest, "invalid_promotion_cursor", "Discount cursor does not match this list.")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "promotions_failed", "Could not load discounts.")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) createPromotion(w http.ResponseWriter, r *http.Request) {
@@ -185,11 +194,20 @@ func (h *Handler) listPromotionRedemptions(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	items, err := h.repo.ListPromotionRedemptions(r.Context(), authedClient.ID, promotionID)
+	limit, err := boundedListLimit(r, defaultPromotionListLimit, defaultPromotionListLimit)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_promotion_redemption_list", err.Error())
+		return
+	}
+	response, err := h.repo.ListPromotionRedemptions(r.Context(), authedClient.ID, promotionID, r.URL.Query().Get("cursor"), limit)
+	if errors.Is(err, ErrInvalidKeysetCursor) {
+		writeError(w, http.StatusBadRequest, "invalid_promotion_redemption_cursor", "Redemption cursor does not match this discount.")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "promotion_redemptions_failed", "Could not load discount usage.")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeJSON(w, http.StatusOK, response)
 }

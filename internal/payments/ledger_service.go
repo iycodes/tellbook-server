@@ -38,6 +38,7 @@ type CreatePaymentAttemptInput struct {
 	checkoutInitializationLeaseOwner     string
 	checkoutInitializationLeaseExpiresAt *time.Time
 	nextProviderCheckAt                  *time.Time
+	expiresAt                            *time.Time
 }
 
 type paymentAttemptIdentity struct {
@@ -108,6 +109,7 @@ func (s *LedgerService) CreatePaymentAttempt(ctx context.Context, input CreatePa
 		CheckoutInitializationLeaseOwner:     input.checkoutInitializationLeaseOwner,
 		CheckoutInitializationLeaseExpiresAt: input.checkoutInitializationLeaseExpiresAt,
 		NextProviderCheckAt:                  input.nextProviderCheckAt,
+		ExpiresAt:                            input.expiresAt,
 	})
 }
 

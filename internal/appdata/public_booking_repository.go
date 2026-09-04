@@ -2,10 +2,12 @@ package appdata
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"net/mail"
 	"sort"
 	"strings"
 	"time"
@@ -56,6 +58,7 @@ type publicBookingServiceInfo struct {
 	AvailabilityMode            string
 	MinimumNoticeMinutes        int
 	MaxBookingsPerDay           int
+	ConcurrentBookingCapacity   int
 	PrepTimeMinutes             int
 	BufferTimeMinutes           int
 	VirtualDeliveryLabel        string
@@ -91,6 +94,7 @@ func getPublicServiceForBooking(ctx context.Context, q publicBookingQuerier, slu
 			COALESCE(bl.resolution_status, ''),
 			s.travel_fee_minor, s.max_travel_distance_meters,
 			s.availability_mode, s.minimum_notice_minutes, s.max_bookings_per_day,
+			cp.concurrent_booking_capacity,
 			s.prep_time_minutes, s.buffer_time_minutes,
 			s.virtual_delivery_label, COALESCE(s.virtual_join_url, ''),
 			COALESCE(s.virtual_instructions, ''), s.cancellation_policy, s.lateness_policy,
@@ -133,6 +137,7 @@ func getPublicServiceForBooking(ctx context.Context, q publicBookingQuerier, slu
 		&service.ProviderResolutionStatus, &service.TravelFeeMinor,
 		&service.MaxTravelDistanceMeters, &service.AvailabilityMode,
 		&service.MinimumNoticeMinutes, &service.MaxBookingsPerDay,
+		&service.ConcurrentBookingCapacity,
 		&service.PrepTimeMinutes, &service.BufferTimeMinutes,
 		&service.VirtualDeliveryLabel, &service.VirtualJoinURL,
 		&service.VirtualInstructions, &service.CancellationPolicy,
@@ -177,6 +182,21 @@ func (r *Repository) ListPublicServicesBySlug(ctx context.Context, slug string) 
 			s.virtual_delivery_label, s.minimum_notice_minutes,
 			EXISTS (
 				SELECT 1 FROM service_short_notice_rules snr WHERE snr.service_id = s.id
+			),
+			(s.fulfillment_mode = 'virtual' OR
+				(bl.id IS NOT NULL AND bl.resolution_status = 'coordinates_resolved'))
+			AND (
+				(s.availability_mode = 'custom' AND EXISTS (
+					SELECT 1 FROM service_availability_windows availability_window
+					WHERE availability_window.service_id = s.id
+					  AND EXTRACT(EPOCH FROM (availability_window.end_time - availability_window.start_time)) / 60 >=
+						s.prep_time_minutes + s.duration_minutes + s.buffer_time_minutes
+				)) OR (s.availability_mode <> 'custom' AND EXISTS (
+					SELECT 1 FROM provider_availability_windows availability_window
+					WHERE availability_window.client_id = s.client_id
+					  AND EXTRACT(EPOCH FROM (availability_window.end_time - availability_window.start_time)) / 60 >=
+						s.prep_time_minutes + s.duration_minutes + s.buffer_time_minutes
+				))
 			)
 		FROM services s
 		INNER JOIN client_profile_handles cph
@@ -200,6 +220,7 @@ func (r *Repository) ListPublicServicesBySlug(ctx context.Context, slug string) 
 	items := make([]PublicServiceItem, 0)
 	for rows.Next() {
 		var item PublicServiceItem
+		var hasBookableConfiguration bool
 		if err := rows.Scan(
 			&item.ID, &item.Title, &item.Slug, &item.Description, &item.Category,
 			&item.IconName, &item.ImageURL, &item.DurationMinutes,
@@ -210,10 +231,11 @@ func (r *Repository) ListPublicServicesBySlug(ctx context.Context, slug string) 
 			&item.FulfillmentMode, &item.ProviderLocationLabel,
 			&item.VirtualDeliveryLabel, &item.MinimumNoticeMinutes,
 			&item.HasShortNoticePricing,
+			&hasBookableConfiguration,
 		); err != nil {
 			return nil, fmt.Errorf("scan public service: %w", err)
 		}
-		item.IsBookable = item.Status == "published"
+		item.IsBookable = item.Status == "published" && hasBookableConfiguration
 		item.FulfillmentLabel = publicFulfillmentLabel(item.FulfillmentMode)
 		items = append(items, item)
 	}
@@ -243,7 +265,7 @@ type publicAvailabilityState struct {
 	Rules    []bookingdomain.ShortNoticeRule
 }
 
-func (r *Repository) GetPublicAvailability(ctx context.Context, slug string, serviceID uuid.UUID, date time.Time) (PublicAvailabilityResponse, error) {
+func (r *Repository) searchPublicAvailabilityDay(ctx context.Context, slug string, serviceID uuid.UUID, date time.Time) (PublicAvailabilityResponse, error) {
 	service, err := r.getPublicServiceForBooking(ctx, slug, serviceID)
 	if err != nil {
 		return PublicAvailabilityResponse{}, err
@@ -253,26 +275,9 @@ func (r *Repository) GetPublicAvailability(ctx context.Context, slug string, ser
 		return PublicAvailabilityResponse{}, err
 	}
 
-	slots := make([]PublicAvailabilitySlot, 0, len(state.Slots))
-	for _, slot := range state.Slots {
-		rule, err := bookingdomain.SelectShortNoticeRule(
-			slot.Start, time.Now().UTC(), service.MinimumNoticeMinutes, state.Rules,
-		)
-		if err != nil {
-			return PublicAvailabilityResponse{}, err
-		}
-		fee, err := bookingdomain.ShortNoticeFee(service.PriceAmountMinor, rule)
-		if err != nil {
-			return PublicAvailabilityResponse{}, err
-		}
-		slots = append(slots, PublicAvailabilitySlot{
-			StartAt:                    slot.Start.Format(time.RFC3339),
-			Label:                      slot.Start.Format("03:04 PM"),
-			BasePriceAmountMinor:       money.Minor(service.PriceAmountMinor),
-			ShortNoticeFeeAmountMinor:  money.Minor(fee),
-			EstimatedTotalBeforeTravel: money.Minor(service.PriceAmountMinor + fee),
-			ShortNoticeApplies:         rule != nil,
-		})
+	slots, err := publicAvailabilitySlots(service, state, time.Now().UTC())
+	if err != nil {
+		return PublicAvailabilityResponse{}, err
 	}
 
 	return PublicAvailabilityResponse{
@@ -286,6 +291,77 @@ func (r *Repository) GetPublicAvailability(ctx context.Context, slug string, ser
 	}, nil
 }
 
+func (r *Repository) searchPublicAvailabilityRange(
+	ctx context.Context,
+	slug string,
+	serviceID uuid.UUID,
+	from *time.Time,
+	days int,
+) (PublicAvailabilityRangeResponse, error) {
+	if days < 1 || days > 31 {
+		return PublicAvailabilityRangeResponse{}, fmt.Errorf("days must be between 1 and 31")
+	}
+	service, err := r.getPublicServiceForBooking(ctx, slug, serviceID)
+	if err != nil {
+		return PublicAvailabilityRangeResponse{}, err
+	}
+	now := time.Now().UTC()
+	states, err := loadPublicAvailabilityRangeStates(ctx, r.db, service, from, days, now)
+	if err != nil {
+		return PublicAvailabilityRangeResponse{}, err
+	}
+	dates := make([]PublicAvailabilityDay, 0, len(states))
+	for _, state := range states {
+		slots, slotErr := publicAvailabilitySlots(service, state, now)
+		if slotErr != nil {
+			return PublicAvailabilityRangeResponse{}, slotErr
+		}
+		dates = append(dates, PublicAvailabilityDay{
+			Date:  state.Date.Format("2006-01-02"),
+			Slots: slots,
+		})
+	}
+	return PublicAvailabilityRangeResponse{
+		ServiceID:       service.ID.String(),
+		From:            states[0].Date.Format("2006-01-02"),
+		Days:            days,
+		Timezone:        service.Timezone,
+		CurrencyCode:    service.CurrencyCode,
+		DurationMinutes: service.DurationMinutes,
+		LocationLabel:   publicServiceLocationLabel(service),
+		Dates:           dates,
+	}, nil
+}
+
+func publicAvailabilitySlots(
+	service publicBookingServiceInfo,
+	state publicAvailabilityState,
+	now time.Time,
+) ([]PublicAvailabilitySlot, error) {
+	slots := make([]PublicAvailabilitySlot, 0, len(state.Slots))
+	for _, slot := range state.Slots {
+		rule, err := bookingdomain.SelectShortNoticeRule(
+			slot.Start, now, service.MinimumNoticeMinutes, state.Rules,
+		)
+		if err != nil {
+			return nil, err
+		}
+		fee, err := bookingdomain.ShortNoticeFee(service.PriceAmountMinor, rule)
+		if err != nil {
+			return nil, err
+		}
+		slots = append(slots, PublicAvailabilitySlot{
+			StartAt:                    slot.Start.Format(time.RFC3339),
+			Label:                      slot.Start.Format("03:04 PM"),
+			BasePriceAmountMinor:       money.Minor(service.PriceAmountMinor),
+			ShortNoticeFeeAmountMinor:  money.Minor(fee),
+			EstimatedTotalBeforeTravel: money.Minor(service.PriceAmountMinor + fee),
+			ShortNoticeApplies:         rule != nil,
+		})
+	}
+	return slots, nil
+}
+
 func loadPublicAvailabilityState(
 	ctx context.Context,
 	q publicBookingQuerier,
@@ -293,79 +369,165 @@ func loadPublicAvailabilityState(
 	date time.Time,
 	now time.Time,
 ) (publicAvailabilityState, error) {
+	return loadPublicAvailabilityStateExcluding(ctx, q, service, date, now, nil)
+}
+
+func loadPublicAvailabilityStateExcluding(
+	ctx context.Context,
+	q publicBookingQuerier,
+	service publicBookingServiceInfo,
+	date time.Time,
+	now time.Time,
+	excludeBookingID *uuid.UUID,
+) (publicAvailabilityState, error) {
+	states, err := loadPublicAvailabilityRangeStatesExcluding(ctx, q, service, &date, 1, now, excludeBookingID)
+	if err != nil {
+		return publicAvailabilityState{}, err
+	}
+	return states[0], nil
+}
+
+func loadPublicAvailabilityRangeStates(
+	ctx context.Context,
+	q publicBookingQuerier,
+	service publicBookingServiceInfo,
+	from *time.Time,
+	days int,
+	now time.Time,
+) ([]publicAvailabilityState, error) {
+	return loadPublicAvailabilityRangeStatesExcluding(ctx, q, service, from, days, now, nil)
+}
+
+func loadPublicAvailabilityRangeStatesExcluding(
+	ctx context.Context,
+	q publicBookingQuerier,
+	service publicBookingServiceInfo,
+	from *time.Time,
+	days int,
+	now time.Time,
+	excludeBookingID *uuid.UUID,
+) ([]publicAvailabilityState, error) {
 	location, err := loadLocation(service.Timezone)
 	if err != nil {
-		return publicAvailabilityState{}, err
+		return nil, err
 	}
-	selectedDate := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, location)
-	dayEnd := selectedDate.AddDate(0, 0, 1)
+	startSource := now.In(location)
+	if from != nil {
+		startSource = *from
+	}
+	rangeStart := time.Date(startSource.Year(), startSource.Month(), startSource.Day(), 0, 0, 0, 0, location)
+	rangeEnd := rangeStart.AddDate(0, 0, days)
 
-	windows, err := loadPublicAvailabilityWindows(ctx, q, service, selectedDate.Weekday())
+	windowsByDay, err := loadPublicAvailabilityWindowsByDay(ctx, q, service)
 	if err != nil {
-		return publicAvailabilityState{}, err
+		return nil, err
 	}
-	busyRanges, err := loadPublicBusyRanges(ctx, q, service.ClientID, selectedDate, dayEnd)
+	busyRanges, err := loadPublicBusyRanges(ctx, q, service.ClientID, rangeStart, rangeEnd, excludeBookingID)
 	if err != nil {
-		return publicAvailabilityState{}, err
+		return nil, err
 	}
-	var existingServiceCount int
-	if err := q.QueryRow(ctx, `
-		SELECT COUNT(*)::int
-		FROM bookings
-		WHERE client_id = $1 AND service_id = $2
-		  AND start_at >= $3 AND start_at < $4
-		  AND status NOT IN ('cancelled', 'canceled')
-	`, service.ClientID, service.ID, selectedDate, dayEnd).Scan(&existingServiceCount); err != nil {
-		return publicAvailabilityState{}, fmt.Errorf("count service bookings: %w", err)
-	}
-
-	slots, err := bookingdomain.GenerateAvailableSlots(bookingdomain.AvailabilityRequest{
-		Date:                 selectedDate,
-		Now:                  now,
-		Location:             location,
-		DurationMinutes:      service.DurationMinutes,
-		PrepTimeMinutes:      service.PrepTimeMinutes,
-		BufferTimeMinutes:    service.BufferTimeMinutes,
-		MinimumNoticeMinutes: service.MinimumNoticeMinutes,
-		MaxBookingsPerDay:    service.MaxBookingsPerDay,
-		ExistingServiceCount: existingServiceCount,
-		Windows:              windows,
-		BusyRanges:           busyRanges,
-	})
+	bookingCounts, err := loadPublicServiceBookingCounts(ctx, q, service, rangeStart, rangeEnd, excludeBookingID)
 	if err != nil {
-		return publicAvailabilityState{}, fmt.Errorf("generate availability: %w", err)
+		return nil, err
 	}
 	rules, err := loadPublicShortNoticeRules(ctx, q, service.ID)
 	if err != nil {
-		return publicAvailabilityState{}, err
+		return nil, err
 	}
-	return publicAvailabilityState{Date: selectedDate, Location: location, Slots: slots, Rules: rules}, nil
+
+	states := make([]publicAvailabilityState, 0, days)
+	for offset := 0; offset < days; offset++ {
+		selectedDate := rangeStart.AddDate(0, 0, offset)
+		dayEnd := selectedDate.AddDate(0, 0, 1)
+		dayBusyRanges := make([]bookingdomain.OccupiedRange, 0)
+		for _, occupied := range busyRanges {
+			if occupied.Start.Before(dayEnd) && occupied.End.After(selectedDate) {
+				dayBusyRanges = append(dayBusyRanges, occupied)
+			}
+		}
+		slots, generateErr := bookingdomain.GenerateAvailableSlots(bookingdomain.AvailabilityRequest{
+			Date:                 selectedDate,
+			Now:                  now,
+			Location:             location,
+			DurationMinutes:      service.DurationMinutes,
+			PrepTimeMinutes:      service.PrepTimeMinutes,
+			BufferTimeMinutes:    service.BufferTimeMinutes,
+			MinimumNoticeMinutes: service.MinimumNoticeMinutes,
+			MaxBookingsPerDay:    service.MaxBookingsPerDay,
+			ExistingServiceCount: bookingCounts[selectedDate.Format("2006-01-02")],
+			ConcurrentCapacity:   service.ConcurrentBookingCapacity,
+			Windows:              windowsByDay[selectedDate.Weekday()],
+			BusyRanges:           dayBusyRanges,
+		})
+		if generateErr != nil {
+			return nil, fmt.Errorf("generate availability: %w", generateErr)
+		}
+		states = append(states, publicAvailabilityState{
+			Date: selectedDate, Location: location, Slots: slots, Rules: rules,
+		})
+	}
+	return states, nil
 }
 
-func loadPublicAvailabilityWindows(ctx context.Context, q publicBookingQuerier, service publicBookingServiceInfo, weekday time.Weekday) ([]bookingdomain.AvailabilityWindow, error) {
+func loadPublicServiceBookingCounts(
+	ctx context.Context,
+	q publicBookingQuerier,
+	service publicBookingServiceInfo,
+	rangeStart, rangeEnd time.Time,
+	excludeBookingID *uuid.UUID,
+) (map[string]int, error) {
+	rows, err := q.Query(ctx, `
+		SELECT TO_CHAR(start_at AT TIME ZONE $5, 'YYYY-MM-DD'), COUNT(*)::int
+		FROM bookings
+		WHERE client_id = $1 AND service_id = $2
+		  AND start_at >= $3 AND start_at < $4
+		  AND status NOT IN ('cancelled', 'canceled', 'declined', 'expired')
+		  AND ($6::uuid IS NULL OR id <> $6)
+		GROUP BY 1
+	`, service.ClientID, service.ID, rangeStart, rangeEnd, service.Timezone, excludeBookingID)
+	if err != nil {
+		return nil, fmt.Errorf("count service bookings: %w", err)
+	}
+	defer rows.Close()
+	counts := make(map[string]int)
+	for rows.Next() {
+		var date string
+		var count int
+		if err := rows.Scan(&date, &count); err != nil {
+			return nil, fmt.Errorf("scan service booking count: %w", err)
+		}
+		counts[date] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate service booking counts: %w", err)
+	}
+	return counts, nil
+}
+
+func loadPublicAvailabilityWindowsByDay(ctx context.Context, q publicBookingQuerier, service publicBookingServiceInfo) (map[time.Weekday][]bookingdomain.AvailabilityWindow, error) {
 	query := `
 		SELECT day_of_week, start_time, end_time, slot_interval_minutes
 		FROM provider_availability_windows
-		WHERE client_id = $1 AND day_of_week = $2
-		ORDER BY start_time ASC
+		WHERE client_id = $1
+		ORDER BY day_of_week, start_time ASC
 	`
 	argument := service.ClientID
 	if service.AvailabilityMode == string(bookingdomain.AvailabilityCustom) {
 		query = `
 			SELECT day_of_week, start_time, end_time, slot_interval_minutes
 			FROM service_availability_windows
-			WHERE service_id = $1 AND day_of_week = $2
-			ORDER BY start_time ASC
+			WHERE service_id = $1
+			ORDER BY day_of_week, start_time ASC
 		`
 		argument = service.ID
 	}
-	rows, err := q.Query(ctx, query, argument, int(weekday))
+	rows, err := q.Query(ctx, query, argument)
 	if err != nil {
 		return nil, fmt.Errorf("list availability windows: %w", err)
 	}
 	defer rows.Close()
 
-	windows := make([]bookingdomain.AvailabilityWindow, 0)
+	windows := make(map[time.Weekday][]bookingdomain.AvailabilityWindow)
 	for rows.Next() {
 		var day int
 		var startAt time.Time
@@ -374,7 +536,8 @@ func loadPublicAvailabilityWindows(ctx context.Context, q publicBookingQuerier, 
 		if err := rows.Scan(&day, &startAt, &endAt, &interval); err != nil {
 			return nil, fmt.Errorf("scan availability window: %w", err)
 		}
-		windows = append(windows, bookingdomain.AvailabilityWindow{
+		weekday := time.Weekday(day)
+		windows[weekday] = append(windows[weekday], bookingdomain.AvailabilityWindow{
 			DayOfWeek:           time.Weekday(day),
 			StartMinuteOfDay:    startAt.Hour()*60 + startAt.Minute(),
 			EndMinuteOfDay:      endAt.Hour()*60 + endAt.Minute(),
@@ -387,14 +550,15 @@ func loadPublicAvailabilityWindows(ctx context.Context, q publicBookingQuerier, 
 	return windows, nil
 }
 
-func loadPublicBusyRanges(ctx context.Context, q publicBookingQuerier, clientID uuid.UUID, dayStart, dayEnd time.Time) ([]bookingdomain.OccupiedRange, error) {
+func loadPublicBusyRanges(ctx context.Context, q publicBookingQuerier, clientID uuid.UUID, dayStart, dayEnd time.Time, excludeBookingID *uuid.UUID) ([]bookingdomain.OccupiedRange, error) {
 	rows, err := q.Query(ctx, `
 		SELECT occupied_start_at, occupied_end_at
 		FROM bookings
 		WHERE client_id = $1
 		  AND occupied_start_at < $3 AND occupied_end_at > $2
-		  AND status NOT IN ('cancelled', 'canceled')
-	`, clientID, dayStart, dayEnd)
+		  AND status NOT IN ('cancelled', 'canceled', 'declined', 'expired')
+		  AND ($4::uuid IS NULL OR id <> $4)
+	`, clientID, dayStart, dayEnd, excludeBookingID)
 	if err != nil {
 		return nil, fmt.Errorf("list busy ranges: %w", err)
 	}
@@ -468,10 +632,14 @@ type quoteFulfillmentSnapshot struct {
 	TravelFeeMinor        int64
 }
 
-func (r *Repository) CreatePublicBookingQuote(ctx context.Context, slug string, input CreatePublicBookingQuoteInput) (PublicBookingQuoteResponse, error) {
+func (r *Repository) createPublicBookingQuote(ctx context.Context, slug string, input CreatePublicBookingQuoteInput) (PublicBookingQuoteResponse, error) {
+	idempotencyKey, err := uuid.Parse(strings.TrimSpace(input.IdempotencyKey))
+	if err != nil {
+		return PublicBookingQuoteResponse{}, fmt.Errorf("%w: idempotency_key must be a UUID", ErrInvalidQuoteRequest)
+	}
 	serviceID, err := uuid.Parse(strings.TrimSpace(input.ServiceID))
 	if err != nil {
-		return PublicBookingQuoteResponse{}, fmt.Errorf("invalid service_id")
+		return PublicBookingQuoteResponse{}, fmt.Errorf("%w: invalid service_id", ErrInvalidQuoteRequest)
 	}
 	service, err := r.getPublicServiceForBooking(ctx, slug, serviceID)
 	if err != nil {
@@ -480,19 +648,22 @@ func (r *Repository) CreatePublicBookingQuote(ctx context.Context, slug string, 
 	if err := r.EnsureClientMarketConfigured(ctx, service.ClientID); err != nil {
 		return PublicBookingQuoteResponse{}, err
 	}
-	email := strings.ToLower(strings.TrimSpace(input.CustomerEmail))
-	if email == "" {
-		return PublicBookingQuoteResponse{}, fmt.Errorf("customer_email is required")
-	}
-	if strings.TrimSpace(input.CustomerName) == "" {
-		return PublicBookingQuoteResponse{}, fmt.Errorf("customer_name is required")
-	}
-	if strings.TrimSpace(input.CustomerPhone) == "" {
-		return PublicBookingQuoteResponse{}, fmt.Errorf("customer_phone is required")
+	email, err := validatePublicBookingContact(input)
+	if err != nil {
+		return PublicBookingQuoteResponse{}, err
 	}
 	requestedStart, err := time.Parse(time.RFC3339, strings.TrimSpace(input.StartsAt))
 	if err != nil {
-		return PublicBookingQuoteResponse{}, fmt.Errorf("invalid starts_at")
+		return PublicBookingQuoteResponse{}, fmt.Errorf("%w: invalid starts_at", ErrInvalidQuoteRequest)
+	}
+	requestFingerprint, err := publicQuoteRequestFingerprint(input, serviceID, requestedStart, email)
+	if err != nil {
+		return PublicBookingQuoteResponse{}, fmt.Errorf("fingerprint booking quote: %w", err)
+	}
+	if replay, found, err := loadIdempotentPublicQuote(ctx, r.db, service.ClientID, idempotencyKey, requestFingerprint); err != nil {
+		return PublicBookingQuoteResponse{}, err
+	} else if found {
+		return replay, nil
 	}
 	now := time.Now().UTC()
 	state, err := loadPublicAvailabilityState(ctx, r.db, service, requestedStart, now)
@@ -585,6 +756,14 @@ func (r *Repository) CreatePublicBookingQuote(ctx context.Context, slug string, 
 		return PublicBookingQuoteResponse{}, fmt.Errorf("begin booking quote: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, service.ClientID.String()+":"+idempotencyKey.String()); err != nil {
+		return PublicBookingQuoteResponse{}, fmt.Errorf("lock booking quote idempotency key: %w", err)
+	}
+	if replay, found, err := loadIdempotentPublicQuote(ctx, tx, service.ClientID, idempotencyKey, requestFingerprint); err != nil {
+		return PublicBookingQuoteResponse{}, err
+	} else if found {
+		return replay, nil
+	}
 	if err := reserveQuotePromotionCapacity(ctx, tx, resolution, email); err != nil {
 		return PublicBookingQuoteResponse{}, err
 	}
@@ -613,6 +792,42 @@ func (r *Repository) CreatePublicBookingQuote(ctx context.Context, slug string, 
 		ruleAmount = rule.AmountMinor
 		rulePercentage = rule.PercentageBasisPoints
 	}
+	response := PublicBookingQuoteResponse{
+		QuoteToken:                   quoteToken,
+		ExpiresAt:                    expiresAt.Format(time.RFC3339),
+		ServiceID:                    service.ID.String(),
+		ServiceTitle:                 service.Title,
+		StartsAt:                     selected.Start.Format(time.RFC3339),
+		EndsAt:                       selected.End.Format(time.RFC3339),
+		LocationLabel:                fulfillment.LocationLabel,
+		FulfillmentMode:              service.FulfillmentMode,
+		BaseServiceAmountMinor:       money.Minor(pricing.BaseServiceAmountMinor),
+		DiscountAmountMinor:          money.Minor(pricing.ServiceDiscountAmountMinor),
+		DiscountName:                 resolution.Snapshot.DiscountName,
+		DiscountCode:                 resolution.Snapshot.DiscountCode,
+		ShortNoticeFeeMinor:          money.Minor(pricing.ShortNoticeFeeMinor),
+		TravelFeeMinor:               money.Minor(pricing.TravelFeeMinor),
+		TravelDistanceMeters:         fulfillment.TravelDistanceMeters,
+		DiscountedServiceAmountMinor: money.Minor(pricing.DiscountedServiceAmountMinor),
+		TotalAmountMinor:             money.Minor(pricing.FinalTotalMinor),
+		DepositAmountMinor:           money.Minor(pricing.DepositDueMinor),
+		RemainingAmountMinor:         money.Minor(pricing.RemainingBalanceMinor),
+		CountryCode:                  service.CountryCode,
+		CurrencyCode:                 service.CurrencyCode,
+		Timezone:                     service.Timezone,
+		Locale:                       service.Locale,
+		Agreement:                    agreementSnapshot.response,
+		StandaloneSignatureRequired:  service.StandaloneSignatureRequired,
+		SlotHeld:                     false,
+		AvailabilityRevalidated:      true,
+	}
+	if rule != nil {
+		response.ShortNoticeLabel = "Short-notice fee"
+	}
+	responseSnapshot, err := json.Marshal(response)
+	if err != nil {
+		return PublicBookingQuoteResponse{}, fmt.Errorf("encode booking quote response: %w", err)
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO booking_quotes (
 			id, public_token, client_id, service_id,
@@ -636,12 +851,14 @@ func (r *Repository) CreatePublicBookingQuote(ctx context.Context, slug string, 
 			short_notice_surcharge_type, short_notice_surcharge_amount_minor,
 			short_notice_surcharge_percentage_bps, short_notice_fee_minor, travel_fee_minor,
 			discounted_service_amount_minor, total_amount_minor, deposit_amount_minor,
-			remaining_amount_minor, customer_email_normalized, expires_at, created_at, updated_at
+			remaining_amount_minor, customer_email_normalized,
+			idempotency_key, request_fingerprint, response_snapshot,
+			expires_at, created_at, updated_at
 		) VALUES (
 			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
 			$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,
 			$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56,
-			$57,$58,$59,$60,$61,$62,$63,$64,$65,$66,$67,$68,$69,$70,$71,NOW(),NOW()
+			$57,$58,$59,$60,$61,$62,$63,$64,$65,$66,$67,$68,$69,$70,$71,$72,$73,$74,NOW(),NOW()
 		)
 	`, quoteID, quoteToken, service.ClientID, service.ID,
 		service.Title, service.BusinessName, service.ImageURL, service.DurationMinutes,
@@ -670,7 +887,8 @@ func (r *Repository) CreatePublicBookingQuote(ctx context.Context, slug string, 
 		resolution.Snapshot.DiscountAmountMinor, ruleID, ruleThreshold, ruleType,
 		ruleAmount, rulePercentage, shortNoticeFee, fulfillment.TravelFeeMinor,
 		pricing.DiscountedServiceAmountMinor, pricing.FinalTotalMinor,
-		pricing.DepositDueMinor, pricing.RemainingBalanceMinor, email, expiresAt,
+		pricing.DepositDueMinor, pricing.RemainingBalanceMinor, email,
+		idempotencyKey, requestFingerprint, responseSnapshot, expiresAt,
 	); err != nil {
 		return PublicBookingQuoteResponse{}, fmt.Errorf("insert booking quote: %w", err)
 	}
@@ -681,37 +899,92 @@ func (r *Repository) CreatePublicBookingQuote(ctx context.Context, slug string, 
 		return PublicBookingQuoteResponse{}, fmt.Errorf("commit booking quote: %w", err)
 	}
 
-	response := PublicBookingQuoteResponse{
-		QuoteToken:                   quoteToken,
-		ExpiresAt:                    expiresAt.Format(time.RFC3339),
-		ServiceID:                    service.ID.String(),
-		ServiceTitle:                 service.Title,
-		StartsAt:                     selected.Start.Format(time.RFC3339),
-		EndsAt:                       selected.End.Format(time.RFC3339),
-		LocationLabel:                fulfillment.LocationLabel,
-		FulfillmentMode:              service.FulfillmentMode,
-		BaseServiceAmountMinor:       money.Minor(pricing.BaseServiceAmountMinor),
-		DiscountAmountMinor:          money.Minor(pricing.ServiceDiscountAmountMinor),
-		DiscountName:                 resolution.Snapshot.DiscountName,
-		DiscountCode:                 resolution.Snapshot.DiscountCode,
-		ShortNoticeFeeMinor:          money.Minor(pricing.ShortNoticeFeeMinor),
-		TravelFeeMinor:               money.Minor(pricing.TravelFeeMinor),
-		TravelDistanceMeters:         fulfillment.TravelDistanceMeters,
-		DiscountedServiceAmountMinor: money.Minor(pricing.DiscountedServiceAmountMinor),
-		TotalAmountMinor:             money.Minor(pricing.FinalTotalMinor),
-		DepositAmountMinor:           money.Minor(pricing.DepositDueMinor),
-		RemainingAmountMinor:         money.Minor(pricing.RemainingBalanceMinor),
-		CountryCode:                  service.CountryCode,
-		CurrencyCode:                 service.CurrencyCode,
-		Timezone:                     service.Timezone,
-		Locale:                       service.Locale,
-		Agreement:                    agreementSnapshot.response,
-		StandaloneSignatureRequired:  service.StandaloneSignatureRequired,
-	}
-	if rule != nil {
-		response.ShortNoticeLabel = "Short-notice fee"
-	}
 	return response, nil
+}
+
+func publicQuoteRequestFingerprint(input CreatePublicBookingQuoteInput, serviceID uuid.UUID, startsAt time.Time, email string) (string, error) {
+	normalized := struct {
+		ServiceID             string `json:"service_id"`
+		StartsAt              string `json:"starts_at"`
+		CustomerName          string `json:"customer_name"`
+		CustomerEmail         string `json:"customer_email"`
+		CustomerPhone         string `json:"customer_phone"`
+		BookingNotes          string `json:"booking_notes"`
+		DiscountCode          string `json:"discount_code"`
+		CustomerLocationToken string `json:"customer_location_token"`
+	}{
+		ServiceID: serviceID.String(), StartsAt: startsAt.UTC().Format(time.RFC3339Nano),
+		CustomerName: strings.TrimSpace(input.CustomerName), CustomerEmail: email,
+		CustomerPhone: strings.TrimSpace(input.CustomerPhone), BookingNotes: strings.TrimSpace(input.BookingNotes),
+		DiscountCode:          strings.ToUpper(strings.TrimSpace(input.DiscountCode)),
+		CustomerLocationToken: strings.TrimSpace(input.CustomerLocationToken),
+	}
+	payload, err := json.Marshal(normalized)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(payload)), nil
+}
+
+func loadIdempotentPublicQuote(
+	ctx context.Context,
+	q publicBookingQuerier,
+	clientID, idempotencyKey uuid.UUID,
+	requestFingerprint string,
+) (PublicBookingQuoteResponse, bool, error) {
+	var storedFingerprint string
+	var storedResponse []byte
+	err := q.QueryRow(ctx, `
+		SELECT request_fingerprint, response_snapshot
+		FROM booking_quotes
+		WHERE client_id = $1 AND idempotency_key = $2
+	`, clientID, idempotencyKey).Scan(&storedFingerprint, &storedResponse)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return PublicBookingQuoteResponse{}, false, nil
+	}
+	if err != nil {
+		return PublicBookingQuoteResponse{}, false, fmt.Errorf("load idempotent booking quote: %w", err)
+	}
+	if storedFingerprint != requestFingerprint {
+		return PublicBookingQuoteResponse{}, false, ErrIdempotencyConflict
+	}
+	var replay PublicBookingQuoteResponse
+	if err := json.Unmarshal(storedResponse, &replay); err != nil {
+		return PublicBookingQuoteResponse{}, false, fmt.Errorf("decode idempotent booking quote: %w", err)
+	}
+	replay.IdempotentReplay = true
+	return replay, true, nil
+}
+
+func validPublicBookingPhone(value string) bool {
+	value = strings.TrimSpace(value)
+	digits := 0
+	for index, character := range value {
+		switch {
+		case character >= '0' && character <= '9':
+			digits++
+		case character == '+' && index == 0:
+		case character == ' ' || character == '-' || character == '(' || character == ')':
+		default:
+			return false
+		}
+	}
+	return digits >= 7 && digits <= 15
+}
+
+func validatePublicBookingContact(input CreatePublicBookingQuoteInput) (string, error) {
+	email := strings.ToLower(strings.TrimSpace(input.CustomerEmail))
+	parsedEmail, err := mail.ParseAddress(email)
+	if err != nil || strings.ToLower(parsedEmail.Address) != email {
+		return "", fmt.Errorf("%w: enter a valid email address", ErrInvalidContact)
+	}
+	if strings.TrimSpace(input.CustomerName) == "" {
+		return "", fmt.Errorf("%w: customer_name is required", ErrInvalidContact)
+	}
+	if !validPublicBookingPhone(input.CustomerPhone) {
+		return "", fmt.Errorf("%w: enter a valid phone number", ErrInvalidContact)
+	}
+	return email, nil
 }
 
 type publicQuoteAgreementSnapshot struct {
@@ -841,13 +1114,13 @@ func (r *Repository) resolveQuoteFulfillment(ctx context.Context, service public
 				if r.googleMapsAPIKey == "" {
 					return quoteFulfillmentSnapshot{}, ErrLocationNotAllowed
 				}
-				address, latitude, longitude, geocodeErr := r.googleGeocodeAddress(ctx, service.ProviderLocationLabel)
+				resolved, geocodeErr := r.googleGeocodeAddress(ctx, service.ProviderLocationLabel)
 				if geocodeErr != nil {
 					return quoteFulfillmentSnapshot{}, ErrLocationNotAllowed
 				}
-				snapshot.ProviderLocationLabel = address
-				snapshot.ProviderLatitude = &latitude
-				snapshot.ProviderLongitude = &longitude
+				snapshot.ProviderLocationLabel = resolved.FormattedAddress
+				snapshot.ProviderLatitude = &resolved.Latitude
+				snapshot.ProviderLongitude = &resolved.Longitude
 			}
 			if snapshot.CustomerLatitude == nil || snapshot.CustomerLongitude == nil {
 				return quoteFulfillmentSnapshot{}, ErrLocationNotAllowed

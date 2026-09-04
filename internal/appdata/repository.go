@@ -12,25 +12,41 @@ import (
 	"time"
 
 	agreementservice "booking/go-server/internal/agreements/service"
+	"booking/go-server/internal/bookingdomain"
 	"booking/go-server/internal/money"
+	"booking/go-server/internal/observability"
 	"booking/go-server/internal/payments"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/singleflight"
 )
 
 type Repository struct {
-	db               *pgxpool.Pool
-	httpClient       *http.Client
-	googleMapsAPIKey string
-	agreementTokens  *agreementservice.PublicTokenManager
+	db                            *pgxpool.Pool
+	httpClient                    *http.Client
+	googleMapsAPIKey              string
+	locationResolutionFlight      singleflight.Group
+	agreementTokens               *agreementservice.PublicTokenManager
+	inboxAIAutomationEnabled      bool
+	inboxAIAutomationAllowlist    map[uuid.UUID]struct{}
+	inboxAISemiPilotReplyDelay    time.Duration
+	inboxAIAutopilotPaymentWindow time.Duration
 }
 
 func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{
-		db:         db,
-		httpClient: &http.Client{Timeout: 8 * time.Second},
+		db:                            db,
+		httpClient:                    &http.Client{Timeout: 8 * time.Second},
+		inboxAISemiPilotReplyDelay:    800 * time.Millisecond,
+		inboxAIAutopilotPaymentWindow: 30 * time.Minute,
+	}
+}
+
+func (r *Repository) ConfigureInboxAIAutopilotPaymentWindow(window time.Duration) {
+	if r != nil && window >= 5*time.Minute && window <= 24*time.Hour {
+		r.inboxAIAutopilotPaymentWindow = window
 	}
 }
 
@@ -38,29 +54,72 @@ func (r *Repository) ConfigureGoogleMaps(apiKey string) {
 	r.googleMapsAPIKey = strings.TrimSpace(apiKey)
 }
 
+func (r *Repository) ConfigureOperationalMetrics(metrics *observability.Metrics) {
+	if r != nil && metrics != nil {
+		r.httpClient = metrics.InstrumentHTTPClient(r.httpClient, "google_maps")
+	}
+}
+
 func (r *Repository) ConfigureAgreementTokens(manager *agreementservice.PublicTokenManager) {
 	r.agreementTokens = manager
 }
 
+func (r *Repository) ConfigureInboxAIAutomation(
+	enabled bool,
+	providerAllowlist []string,
+	replyDelays ...time.Duration,
+) {
+	r.inboxAIAutomationEnabled = enabled
+	if len(replyDelays) > 0 && replyDelays[0] >= 0 {
+		r.inboxAISemiPilotReplyDelay = replyDelays[0]
+	}
+	r.inboxAIAutomationAllowlist = make(map[uuid.UUID]struct{}, len(providerAllowlist))
+	for _, rawID := range providerAllowlist {
+		if id, err := uuid.Parse(strings.TrimSpace(rawID)); err == nil {
+			r.inboxAIAutomationAllowlist[id] = struct{}{}
+		}
+	}
+}
+
+func (r *Repository) inboxAIAutomationAvailable(clientID uuid.UUID) bool {
+	if r == nil || !r.inboxAIAutomationEnabled {
+		return false
+	}
+	_, allowed := r.inboxAIAutomationAllowlist[clientID]
+	return allowed
+}
+
 func (r *Repository) GetDashboard(ctx context.Context, clientID uuid.UUID) (DashboardResponse, error) {
-	profile, err := r.getDashboardProfile(ctx, clientID)
+	profile, currencyCode, dayStart, dayEnd, err := r.getDashboardProfile(ctx, clientID)
 	if err != nil {
 		return DashboardResponse{}, err
 	}
 
-	stats, err := r.getDashboardStats(ctx, clientID)
+	batch := &pgx.Batch{}
+	batch.Queue(dashboardStatsQuery, clientID, dayStart, dayEnd, currencyCode)
+	batch.Queue(dashboardAttentionQuery, clientID)
+	batch.Queue(dashboardTodayBookingsQuery, clientID, dayStart, dayEnd)
+	results := r.db.SendBatch(ctx, batch)
+	defer results.Close()
+
+	stats, err := scanDashboardStats(results.QueryRow(), currencyCode)
 	if err != nil {
 		return DashboardResponse{}, err
 	}
-
-	attention, err := r.getTopAttentionItem(ctx, clientID)
+	attention, err := scanDashboardAttention(results.QueryRow())
 	if err != nil {
 		return DashboardResponse{}, err
 	}
-
-	bookings, err := r.getTodayBookings(ctx, clientID)
+	rows, err := results.Query()
+	if err != nil {
+		return DashboardResponse{}, fmt.Errorf("get today bookings: %w", err)
+	}
+	bookings, err := scanDashboardBookings(rows)
 	if err != nil {
 		return DashboardResponse{}, err
+	}
+	if err := results.Close(); err != nil {
+		return DashboardResponse{}, fmt.Errorf("close dashboard batch: %w", err)
 	}
 
 	return DashboardResponse{
@@ -71,10 +130,64 @@ func (r *Repository) GetDashboard(ctx context.Context, clientID uuid.UUID) (Dash
 	}, nil
 }
 
+const defaultBookingListLimit = 100
+
+type BookingListInput struct {
+	WindowStart time.Time
+	WindowEnd   time.Time
+	Cursor      string
+	Limit       int
+}
+
+type bookingListCursor struct {
+	StartAt time.Time `json:"start_at"`
+	ID      uuid.UUID `json:"id"`
+}
+
+func defaultBookingListWindow(now time.Time) (time.Time, time.Time) {
+	now = now.UTC()
+	return now.AddDate(0, -3, 0), now.AddDate(1, 0, 0)
+}
+
 func (r *Repository) ListBookings(ctx context.Context, clientID uuid.UUID) ([]BookingItem, error) {
+	windowStart, windowEnd := defaultBookingListWindow(time.Now())
+	page, err := r.ListBookingsWindow(ctx, clientID, BookingListInput{
+		WindowStart: windowStart, WindowEnd: windowEnd, Limit: defaultBookingListLimit,
+	})
+	items := page.Items
+	return items, err
+}
+
+func (r *Repository) ListBookingsWindow(
+	ctx context.Context,
+	clientID uuid.UUID,
+	input BookingListInput,
+) (BookingListResponse, error) {
+	input.WindowStart = input.WindowStart.UTC()
+	input.WindowEnd = input.WindowEnd.UTC()
+	if input.Limit < 1 || input.Limit > defaultBookingListLimit {
+		return BookingListResponse{}, errors.New("booking list limit is invalid")
+	}
+	fingerprint := keysetFilterFingerprint(
+		"provider-bookings", input.WindowStart.Format(time.RFC3339Nano), input.WindowEnd.Format(time.RFC3339Nano),
+	)
+	var cursor bookingListCursor
+	if err := decodeKeysetCursor(input.Cursor, fingerprint, &cursor); err != nil {
+		return BookingListResponse{}, err
+	}
+	var cursorStart any
+	var cursorID any
+	if strings.TrimSpace(input.Cursor) != "" {
+		if cursor.StartAt.IsZero() || cursor.ID == uuid.Nil {
+			return BookingListResponse{}, ErrInvalidKeysetCursor
+		}
+		cursorStart = cursor.StartAt.UTC()
+		cursorID = cursor.ID
+	}
 	const query = `
 		SELECT
 			b.id,
+			b.source,
 			b.customer_id,
 			b.title,
 			b.start_at,
@@ -88,14 +201,19 @@ func (r *Repository) ListBookings(ctx context.Context, clientID uuid.UUID) ([]Bo
 			b.notes
 		FROM bookings b
 		LEFT JOIN customers c ON c.id = b.customer_id
-		LEFT JOIN services s ON s.id = b.service_id
-		WHERE b.client_id = $1
-		ORDER BY b.start_at ASC
+			LEFT JOIN services s ON s.id = b.service_id
+			WHERE b.client_id = $1
+			  AND b.start_at >= $2
+			  AND b.start_at < $3
+			  AND ($4::timestamptz IS NULL OR (b.start_at, b.id) > ($4, $5::uuid))
+			ORDER BY b.start_at ASC, b.id ASC
+			LIMIT $6
 	`
-
-	rows, err := r.db.Query(ctx, query, clientID)
+	rows, err := r.db.Query(
+		ctx, query, clientID, input.WindowStart, input.WindowEnd, cursorStart, cursorID, input.Limit+1,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("list bookings: %w", err)
+		return BookingListResponse{}, fmt.Errorf("list bookings: %w", err)
 	}
 	defer rows.Close()
 
@@ -105,6 +223,7 @@ func (r *Repository) ListBookings(ctx context.Context, clientID uuid.UUID) ([]Bo
 		var id, customerID uuid.UUID
 		if err := rows.Scan(
 			&id,
+			&item.Source,
 			&customerID,
 			&item.Title,
 			&item.StartAt,
@@ -117,7 +236,7 @@ func (r *Repository) ListBookings(ctx context.Context, clientID uuid.UUID) ([]Bo
 			&item.LocationLabel,
 			&item.Notes,
 		); err != nil {
-			return nil, fmt.Errorf("scan booking: %w", err)
+			return BookingListResponse{}, fmt.Errorf("scan booking: %w", err)
 		}
 		item.ID = id.String()
 		item.CustomerID = customerID.String()
@@ -125,10 +244,42 @@ func (r *Repository) ListBookings(ctx context.Context, clientID uuid.UUID) ([]Bo
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate bookings: %w", err)
+		return BookingListResponse{}, fmt.Errorf("iterate bookings: %w", err)
 	}
 
-	return bookings, nil
+	hasMore := len(bookings) > input.Limit
+	if hasMore {
+		bookings = bookings[:input.Limit]
+	}
+	response := BookingListResponse{
+		Items: bookings, WindowStart: input.WindowStart, WindowEnd: input.WindowEnd,
+	}
+	if hasMore {
+		last := bookings[len(bookings)-1]
+		lastID, err := uuid.Parse(last.ID)
+		if err != nil {
+			return BookingListResponse{}, fmt.Errorf("encode booking cursor: %w", err)
+		}
+		response.NextCursor, err = encodeKeysetCursor(fingerprint, bookingListCursor{
+			StartAt: last.StartAt.UTC(), ID: lastID,
+		})
+		if err != nil {
+			return BookingListResponse{}, fmt.Errorf("encode booking cursor: %w", err)
+		}
+	}
+	return response, nil
+}
+
+func (r *Repository) LatestBookingEventCursor(ctx context.Context, clientID uuid.UUID) (int64, error) {
+	var cursor int64
+	if err := r.db.QueryRow(ctx, `
+		SELECT COALESCE(MAX(sequence), 0)
+		FROM booking_domain_events
+		WHERE client_id = $1
+	`, clientID).Scan(&cursor); err != nil {
+		return 0, fmt.Errorf("load booking event cursor: %w", err)
+	}
+	return cursor, nil
 }
 
 type bookingInsightRecord struct {
@@ -181,7 +332,7 @@ func (r *Repository) GetBookingOptimizationInsight(ctx context.Context, clientID
 		WHERE client_id = $1
 		  AND end_at >= NOW()
 		  AND start_at <= NOW() + INTERVAL '21 days'
-		  AND status NOT IN ('cancelled', 'canceled')
+		  AND status NOT IN ('cancelled', 'canceled', 'declined', 'expired')
 		ORDER BY start_at ASC
 	`
 
@@ -608,6 +759,7 @@ func (r *Repository) GetBookingDetails(ctx context.Context, clientID, bookingID 
 	const query = `
 		SELECT
 			b.id,
+			b.source,
 			b.status,
 			b.title,
 			COALESCE(NULLIF(b.stylist_name, ''), cp.business_name),
@@ -621,7 +773,12 @@ func (r *Repository) GetBookingDetails(ctx context.Context, clientID, bookingID 
 			b.agreement_status,
 			b.notes,
 			b.location_label,
-			COALESCE(b.image_url, s.image_url, '')
+			COALESCE(b.image_url, s.image_url, ''),
+			b.timezone, b.fulfillment_mode, COALESCE(s.prep_aftercare_instructions, ''),
+			b.cancellation_notice_minutes_snapshot, b.cancellation_refund_bps_snapshot,
+			b.reschedule_notice_minutes_snapshot, b.reschedule_fee_minor_snapshot,
+			b.automated_reschedule_snapshot,
+			(NULLIF(BTRIM(b.agreement_title_snapshot), '') IS NOT NULL OR b.standalone_signature_required_snapshot)
 		FROM bookings b
 		INNER JOIN client_profiles cp ON cp.client_id = b.client_id
 		LEFT JOIN services s ON s.id = b.service_id
@@ -635,8 +792,13 @@ func (r *Repository) GetBookingDetails(ctx context.Context, clientID, bookingID 
 	var rateAmount int64
 	var durationMinutes int
 	var totalAmount int64
+	var cancellationNoticeMinutes, rescheduleNoticeMinutes int
+	var cancellationRefundBPS, rescheduleFeeMinor int64
+	var automatedReschedule bool
+	var agreementRequired bool
 	if err := r.db.QueryRow(ctx, query, clientID, bookingID).Scan(
 		&id,
+		&response.Source,
 		&response.Status,
 		&response.Title,
 		&response.Stylist,
@@ -651,6 +813,15 @@ func (r *Repository) GetBookingDetails(ctx context.Context, clientID, bookingID 
 		&response.Notes,
 		&response.Location,
 		&response.ImageURL,
+		&response.Timezone,
+		&response.FulfillmentMode,
+		&response.Preparation,
+		&cancellationNoticeMinutes,
+		&cancellationRefundBPS,
+		&rescheduleNoticeMinutes,
+		&rescheduleFeeMinor,
+		&automatedReschedule,
+		&agreementRequired,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return BookingDetailsResponse{}, ErrNotFound
@@ -664,12 +835,209 @@ func (r *Repository) GetBookingDetails(ctx context.Context, clientID, bookingID 
 	response.BaseServiceAmountMinor = money.Minor(rateAmount)
 	response.DurationLabel = fmt.Sprintf("%d min", durationMinutes)
 	response.TotalAmountMinor = money.Minor(totalAmount)
+	response.StartsAt = startAt
+	response.EndsAt = endAt
+	permissions := bookingdomain.Permissions(response.Status, startAt, endAt, time.Now(), bookingdomain.ChangePolicy{
+		CancellationNoticeMinutes: cancellationNoticeMinutes,
+		CancellationRefundBPS:     cancellationRefundBPS,
+		RescheduleNoticeMinutes:   rescheduleNoticeMinutes,
+		RescheduleFeeMinor:        rescheduleFeeMinor,
+		AutomatedReschedule:       automatedReschedule,
+	})
+	response.AllowedActions = ProviderBookingAllowedActions{
+		Confirm: permissions.ProviderConfirm && initialBookingObligationSatisfied(response.PaymentStatus) &&
+			bookingAgreementObligationSatisfied(agreementRequired, response.AgreementStatus),
+		Decline:  permissions.ProviderDecline,
+		Complete: permissions.ProviderComplete, MarkNoShow: permissions.ProviderNoShow,
+	}
+	paymentHistory, refundHistory, changeHistory, err := r.loadBookingHistories(ctx, bookingID)
+	if err != nil {
+		return BookingDetailsResponse{}, err
+	}
+	response.PaymentHistory = paymentHistory
+	response.RefundHistory = refundHistory
+	response.ChangeHistory = changeHistory
 
 	return response, nil
 }
 
-func (r *Repository) ListCustomers(ctx context.Context, clientID uuid.UUID) ([]CustomerItem, error) {
+func (r *Repository) loadBookingHistories(
+	ctx context.Context,
+	bookingID uuid.UUID,
+) ([]BookingDetailPaymentItem, []BookingDetailRefundItem, []BookingDetailEvent, error) {
+	paymentHistory := make([]BookingDetailPaymentItem, 0)
+	paymentRows, err := r.db.Query(ctx, `
+		SELECT id, purpose, method, status, amount_minor, currency_code, reference, paid_at, created_at
+		FROM payments WHERE booking_id=$1 ORDER BY created_at DESC, id DESC
+		LIMIT 50
+	`, bookingID)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("list booking payment history: %w", err)
+	}
+	for paymentRows.Next() {
+		var item BookingDetailPaymentItem
+		var amount int64
+		if err := paymentRows.Scan(&item.ID, &item.Purpose, &item.Method, &item.Status, &amount,
+			&item.CurrencyCode, &item.Reference, &item.PaidAt, &item.CreatedAt); err != nil {
+			paymentRows.Close()
+			return nil, nil, nil, fmt.Errorf("scan booking payment history: %w", err)
+		}
+		item.AmountMinor = money.Minor(amount)
+		paymentHistory = append(paymentHistory, item)
+	}
+	if err := paymentRows.Err(); err != nil {
+		paymentRows.Close()
+		return nil, nil, nil, fmt.Errorf("iterate booking payment history: %w", err)
+	}
+	paymentRows.Close()
+
+	refundHistory := make([]BookingDetailRefundItem, 0)
+	refundRows, err := r.db.Query(ctx, `
+		SELECT id, payment_id, kind, status, amount_minor, allocation_impact_minor,
+			currency_code, reference, reason, occurred_at, created_at
+		FROM (
+			SELECT adjustment.id::text id, adjustment.payment_id::text payment_id,
+				adjustment.kind, adjustment.status, adjustment.amount_minor,
+				adjustment.allocation_impact_minor, adjustment.currency_code,
+				adjustment.provider_reference reference, adjustment.reason,
+				adjustment.occurred_at, adjustment.created_at
+			FROM payment_adjustments adjustment
+			INNER JOIN payments payment ON payment.id=adjustment.payment_id
+			WHERE payment.booking_id=$1
+			UNION ALL
+			SELECT request.id::text, ''::text, 'refund', request.status,
+				request.amount_minor, 0::bigint, request.currency_code,
+				request.command_id::text, request.reason, request.created_at, request.created_at
+			FROM booking_refund_requests request
+			WHERE request.booking_id=$1 AND request.status IN ('queued','processing','failed','manual_review')
+		) history
+		ORDER BY occurred_at DESC, id DESC
+		LIMIT 50
+	`, bookingID)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("list booking refund history: %w", err)
+	}
+	for refundRows.Next() {
+		var item BookingDetailRefundItem
+		var amount, allocationImpact int64
+		if err := refundRows.Scan(
+			&item.ID, &item.PaymentID, &item.Kind, &item.Status, &amount, &allocationImpact,
+			&item.CurrencyCode, &item.Reference, &item.Reason, &item.OccurredAt, &item.CreatedAt,
+		); err != nil {
+			refundRows.Close()
+			return nil, nil, nil, fmt.Errorf("scan booking refund history: %w", err)
+		}
+		item.AmountMinor = money.Minor(amount)
+		item.AllocationImpactMinor = money.Minor(allocationImpact)
+		refundHistory = append(refundHistory, item)
+	}
+	if err := refundRows.Err(); err != nil {
+		refundRows.Close()
+		return nil, nil, nil, fmt.Errorf("iterate booking refund history: %w", err)
+	}
+	refundRows.Close()
+
+	changeHistory := make([]BookingDetailEvent, 0)
+	eventRows, err := r.db.Query(ctx, `
+		SELECT event_type, created_at FROM booking_domain_events
+		WHERE booking_id=$1 ORDER BY sequence DESC LIMIT 50
+	`, bookingID)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("list booking change history: %w", err)
+	}
+	defer eventRows.Close()
+	for eventRows.Next() {
+		var item BookingDetailEvent
+		if err := eventRows.Scan(&item.Type, &item.CreatedAt); err != nil {
+			return nil, nil, nil, fmt.Errorf("scan booking change history: %w", err)
+		}
+		changeHistory = append(changeHistory, item)
+	}
+	if err := eventRows.Err(); err != nil {
+		return nil, nil, nil, fmt.Errorf("iterate booking change history: %w", err)
+	}
+
+	return paymentHistory, refundHistory, changeHistory, nil
+}
+
+const defaultCustomerListLimit = 40
+
+type CustomerListInput struct {
+	Query         string
+	Filter        string
+	Cursor        string
+	Limit         int
+	IncludeCounts bool
+}
+
+type customerListCursor struct {
+	LastSeenAt time.Time `json:"last_seen_at"`
+	ID         uuid.UUID `json:"id"`
+}
+
+func (r *Repository) ListCustomers(
+	ctx context.Context,
+	clientID uuid.UUID,
+	input CustomerListInput,
+) (CustomerListResponse, error) {
+	input.Query = strings.TrimSpace(input.Query)
+	input.Filter = strings.ToLower(strings.TrimSpace(input.Filter))
+	if input.Filter == "" {
+		input.Filter = "all"
+	}
+	switch input.Filter {
+	case "upcoming", "completed", "all", "vip", "repeat", "new", "inactive":
+	default:
+		return CustomerListResponse{}, errors.New("customer filter is invalid")
+	}
+	if input.Limit < 1 || input.Limit > defaultCustomerListLimit {
+		return CustomerListResponse{}, errors.New("customer list limit is invalid")
+	}
+	fingerprint := keysetFilterFingerprint("provider-customers", input.Filter, input.Query)
+	var cursor customerListCursor
+	if err := decodeKeysetCursor(input.Cursor, fingerprint, &cursor); err != nil {
+		return CustomerListResponse{}, err
+	}
+	var cursorLastSeen any
+	var cursorID any
+	if strings.TrimSpace(input.Cursor) != "" {
+		if cursor.LastSeenAt.IsZero() || cursor.ID == uuid.Nil {
+			return CustomerListResponse{}, ErrInvalidKeysetCursor
+		}
+		cursorLastSeen = cursor.LastSeenAt.UTC()
+		cursorID = cursor.ID
+	}
+	searchPattern := customerSearchPattern(input.Query)
 	const query = `
+		WITH page AS MATERIALIZED (
+			SELECT c.*
+			FROM customers c
+			WHERE c.client_id=$1
+			  AND ($2='' OR c.full_name ILIKE $2 ESCAPE '\' OR c.email ILIKE $2 ESCAPE '\'
+				OR c.phone ILIKE $2 ESCAPE '\' OR c.tier_label ILIKE $2 ESCAPE '\'
+				OR c.status_label ILIKE $2 ESCAPE '\' OR c.badge_label ILIKE $2 ESCAPE '\'
+				OR EXISTS (SELECT 1 FROM unnest(c.tags) tag WHERE tag ILIKE $2 ESCAPE '\'))
+			  AND (
+				$3='all'
+				OR ($3='upcoming' AND EXISTS (
+					SELECT 1 FROM bookings b WHERE b.client_id=$1 AND b.customer_id=c.id
+					  AND b.start_at>=NOW() AND b.status NOT IN ('cancelled','canceled','declined','expired')
+				))
+				OR ($3='completed' AND EXISTS (
+					SELECT 1 FROM bookings b WHERE b.client_id=$1 AND b.customer_id=c.id
+					  AND b.end_at<NOW() AND b.status NOT IN ('cancelled','canceled','declined','expired')
+				))
+				OR ($3='vip' AND (LOWER(c.badge_tone)='vip' OR EXISTS (
+					SELECT 1 FROM unnest(c.tags) tag WHERE LOWER(tag)='vip'
+				)))
+				OR ($3='repeat' AND EXISTS (SELECT 1 FROM unnest(c.tags) tag WHERE LOWER(tag)='repeat'))
+				OR ($3='new' AND EXISTS (SELECT 1 FROM unnest(c.tags) tag WHERE LOWER(tag)='new'))
+				OR ($3='inactive' AND LOWER(c.status_label) LIKE '%inactive%')
+			  )
+			  AND ($4::timestamptz IS NULL OR (COALESCE(c.last_seen_at,c.created_at),c.id)<($4,$5::uuid))
+			ORDER BY COALESCE(c.last_seen_at,c.created_at) DESC,c.id DESC
+			LIMIT $6
+		)
 		SELECT
 			c.id,
 			c.full_name,
@@ -687,38 +1055,36 @@ func (r *Repository) ListCustomers(ctx context.Context, clientID uuid.UUID) ([]C
 			COALESCE(booking_summary.has_completed_booking, FALSE),
 			booking_summary.next_booking_at,
 			booking_summary.last_completed_booking_at
-		FROM customers c
+		FROM page c
 		LEFT JOIN LATERAL (
 			SELECT
 				COUNT(*) FILTER (
 					WHERE b.start_at >= NOW()
-					  AND b.status NOT IN ('cancelled', 'canceled')
+					  AND b.status NOT IN ('cancelled', 'canceled', 'declined', 'expired')
 				) > 0 AS has_upcoming_booking,
 				COUNT(*) FILTER (
 					WHERE b.end_at < NOW()
-					  AND b.status NOT IN ('cancelled', 'canceled')
+					  AND b.status NOT IN ('cancelled', 'canceled', 'declined', 'expired')
 				) > 0 AS has_completed_booking,
 				MIN(b.start_at) FILTER (
 					WHERE b.start_at >= NOW()
-					  AND b.status NOT IN ('cancelled', 'canceled')
+					  AND b.status NOT IN ('cancelled', 'canceled', 'declined', 'expired')
 				) AS next_booking_at,
 				MAX(b.end_at) FILTER (
 					WHERE b.end_at < NOW()
-					  AND b.status NOT IN ('cancelled', 'canceled')
+					  AND b.status NOT IN ('cancelled', 'canceled', 'declined', 'expired')
 				) AS last_completed_booking_at
 			FROM bookings b
 			WHERE b.client_id = $1 AND b.customer_id = c.id
 		) AS booking_summary ON TRUE
-		WHERE c.client_id = $1
-		ORDER BY
-			COALESCE(booking_summary.has_upcoming_booking, FALSE) DESC,
-			booking_summary.next_booking_at ASC NULLS LAST,
-			c.full_name ASC
+		ORDER BY COALESCE(c.last_seen_at,c.created_at) DESC,c.id DESC
 	`
 
-	rows, err := r.db.Query(ctx, query, clientID)
+	rows, err := r.db.Query(
+		ctx, query, clientID, searchPattern, input.Filter, cursorLastSeen, cursorID, input.Limit+1,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("list customers: %w", err)
+		return CustomerListResponse{}, fmt.Errorf("list customers: %w", err)
 	}
 	defer rows.Close()
 
@@ -744,17 +1110,97 @@ func (r *Repository) ListCustomers(ctx context.Context, clientID uuid.UUID) ([]C
 			&item.NextBookingAt,
 			&item.LastCompletedBookingAt,
 		); err != nil {
-			return nil, fmt.Errorf("scan customer: %w", err)
+			return CustomerListResponse{}, fmt.Errorf("scan customer: %w", err)
 		}
 		item.ID = id.String()
 		customers = append(customers, item)
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate customers: %w", err)
+		return CustomerListResponse{}, fmt.Errorf("iterate customers: %w", err)
 	}
+	hasMore := len(customers) > input.Limit
+	if hasMore {
+		customers = customers[:input.Limit]
+	}
+	response := CustomerListResponse{Items: customers}
+	if hasMore {
+		last := customers[len(customers)-1]
+		lastID, err := uuid.Parse(last.ID)
+		if err != nil {
+			return CustomerListResponse{}, fmt.Errorf("encode customer cursor: %w", err)
+		}
+		response.NextCursor, err = encodeKeysetCursor(fingerprint, customerListCursor{
+			LastSeenAt: last.LastSeenAt.UTC(), ID: lastID,
+		})
+		if err != nil {
+			return CustomerListResponse{}, fmt.Errorf("encode customer cursor: %w", err)
+		}
+	}
+	if input.IncludeCounts {
+		counts, err := r.countCustomers(ctx, clientID, searchPattern)
+		if err != nil {
+			return CustomerListResponse{}, err
+		}
+		response.Counts = counts
+	}
+	return response, nil
+}
 
-	return customers, nil
+func customerSearchPattern(query string) string {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return ""
+	}
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(query)
+	return "%" + escaped + "%"
+}
+
+func (r *Repository) countCustomers(
+	ctx context.Context,
+	clientID uuid.UUID,
+	searchPattern string,
+) (map[string]int, error) {
+	var upcoming, completed, all, vip, repeat, newCount, inactive int
+	err := r.db.QueryRow(ctx, `
+		WITH candidates AS MATERIALIZED (
+			SELECT c.*,
+				EXISTS (
+					SELECT 1 FROM bookings b WHERE b.client_id=$1 AND b.customer_id=c.id
+					  AND b.start_at>=NOW() AND b.status NOT IN ('cancelled','canceled','declined','expired')
+				) AS has_upcoming,
+				EXISTS (
+					SELECT 1 FROM bookings b WHERE b.client_id=$1 AND b.customer_id=c.id
+					  AND b.end_at<NOW() AND b.status NOT IN ('cancelled','canceled','declined','expired')
+				) AS has_completed
+			FROM customers c
+			WHERE c.client_id=$1
+			  AND ($2='' OR c.full_name ILIKE $2 ESCAPE '\' OR c.email ILIKE $2 ESCAPE '\'
+				OR c.phone ILIKE $2 ESCAPE '\' OR c.tier_label ILIKE $2 ESCAPE '\'
+				OR c.status_label ILIKE $2 ESCAPE '\' OR c.badge_label ILIKE $2 ESCAPE '\'
+				OR EXISTS (SELECT 1 FROM unnest(c.tags) tag WHERE tag ILIKE $2 ESCAPE '\'))
+		)
+		SELECT
+			COUNT(*) FILTER (WHERE has_upcoming),
+			COUNT(*) FILTER (WHERE has_completed),
+			COUNT(*),
+			COUNT(*) FILTER (WHERE LOWER(badge_tone)='vip' OR EXISTS (
+				SELECT 1 FROM unnest(tags) tag WHERE LOWER(tag)='vip'
+			)),
+			COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM unnest(tags) tag WHERE LOWER(tag)='repeat')),
+			COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM unnest(tags) tag WHERE LOWER(tag)='new')),
+			COUNT(*) FILTER (WHERE LOWER(status_label) LIKE '%inactive%')
+		FROM candidates
+	`, clientID, searchPattern).Scan(
+		&upcoming, &completed, &all, &vip, &repeat, &newCount, &inactive,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("count customers: %w", err)
+	}
+	return map[string]int{
+		"upcoming": upcoming, "completed": completed, "all": all, "vip": vip,
+		"repeat": repeat, "new": newCount, "inactive": inactive,
+	}, nil
 }
 
 func (r *Repository) GetCustomerDetails(ctx context.Context, clientID, customerID uuid.UUID) (CustomerDetailsResponse, error) {
@@ -889,7 +1335,49 @@ func (r *Repository) GetCustomerDetails(ctx context.Context, clientID, customerI
 	return response, nil
 }
 
-func (r *Repository) GetNotifications(ctx context.Context, clientID uuid.UUID) (NotificationsResponse, error) {
+const defaultNotificationListLimit = 40
+
+type NotificationListInput struct {
+	Filter        string
+	Cursor        string
+	Limit         int
+	IncludeCounts bool
+}
+
+type notificationListCursor struct {
+	CreatedAt time.Time `json:"created_at"`
+	ID        uuid.UUID `json:"id"`
+}
+
+func (r *Repository) GetNotifications(
+	ctx context.Context,
+	clientID uuid.UUID,
+	input NotificationListInput,
+) (NotificationsResponse, error) {
+	input.Filter = strings.ToLower(strings.TrimSpace(input.Filter))
+	if input.Filter == "" {
+		input.Filter = "all"
+	}
+	if input.Filter != "all" && input.Filter != "unread" && input.Filter != "action_required" {
+		return NotificationsResponse{}, errors.New("notification filter is invalid")
+	}
+	if input.Limit < 1 || input.Limit > defaultNotificationListLimit {
+		return NotificationsResponse{}, errors.New("notification list limit is invalid")
+	}
+	fingerprint := keysetFilterFingerprint("provider-notifications", input.Filter)
+	var cursor notificationListCursor
+	if err := decodeKeysetCursor(input.Cursor, fingerprint, &cursor); err != nil {
+		return NotificationsResponse{}, err
+	}
+	var cursorCreatedAt any
+	var cursorID any
+	if strings.TrimSpace(input.Cursor) != "" {
+		if cursor.CreatedAt.IsZero() || cursor.ID == uuid.Nil {
+			return NotificationsResponse{}, ErrInvalidKeysetCursor
+		}
+		cursorCreatedAt = cursor.CreatedAt.UTC()
+		cursorID = cursor.ID
+	}
 	const query = `
 		SELECT
 			id,
@@ -902,24 +1390,26 @@ func (r *Repository) GetNotifications(ctx context.Context, clientID uuid.UUID) (
 			COALESCE(image_url, ''),
 			COALESCE(icon_name, ''),
 			COALESCE(icon_tone, ''),
+			read_at,
 			created_at
 		FROM notifications
 		WHERE client_id = $1
-		ORDER BY created_at DESC
+		  AND ($2='all' OR ($2='unread' AND read_at IS NULL)
+			OR ($2='action_required' AND severity='urgent'))
+		  AND ($3::timestamptz IS NULL OR (created_at,id)<($3,$4::uuid))
+		ORDER BY created_at DESC,id DESC
+		LIMIT $5
 	`
 
-	rows, err := r.db.Query(ctx, query, clientID)
+	rows, err := r.db.Query(
+		ctx, query, clientID, input.Filter, cursorCreatedAt, cursorID, input.Limit+1,
+	)
 	if err != nil {
 		return NotificationsResponse{}, fmt.Errorf("list notifications: %w", err)
 	}
 	defer rows.Close()
 
-	response := NotificationsResponse{
-		ActionRequired: make([]NotificationItem, 0),
-		Today:          make([]NotificationItem, 0),
-	}
-	now := time.Now().UTC()
-	startOfToday := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	response := NotificationsResponse{Items: make([]NotificationItem, 0, input.Limit+1)}
 
 	for rows.Next() {
 		var item NotificationItem
@@ -935,26 +1425,44 @@ func (r *Repository) GetNotifications(ctx context.Context, clientID uuid.UUID) (
 			&item.ImageURL,
 			&item.IconName,
 			&item.IconTone,
+			&item.ReadAt,
 			&item.CreatedAt,
 		); err != nil {
 			return NotificationsResponse{}, fmt.Errorf("scan notification: %w", err)
 		}
 		item.ID = id.String()
-
-		if item.Severity == "urgent" {
-			response.ActionRequired = append(response.ActionRequired, item)
-			continue
-		}
-
-		if !item.CreatedAt.Before(startOfToday) {
-			response.Today = append(response.Today, item)
-		}
+		response.Items = append(response.Items, item)
 	}
 
 	if err := rows.Err(); err != nil {
 		return NotificationsResponse{}, fmt.Errorf("iterate notifications: %w", err)
 	}
 
+	hasMore := len(response.Items) > input.Limit
+	if hasMore {
+		response.Items = response.Items[:input.Limit]
+		last := response.Items[len(response.Items)-1]
+		lastID, err := uuid.Parse(last.ID)
+		if err != nil {
+			return NotificationsResponse{}, fmt.Errorf("encode notification cursor: %w", err)
+		}
+		response.NextCursor, err = encodeKeysetCursor(fingerprint, notificationListCursor{
+			CreatedAt: last.CreatedAt.UTC(), ID: lastID,
+		})
+		if err != nil {
+			return NotificationsResponse{}, fmt.Errorf("encode notification cursor: %w", err)
+		}
+	}
+	if input.IncludeCounts {
+		if err := r.db.QueryRow(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE read_at IS NULL),
+				COUNT(*) FILTER (WHERE severity='urgent')
+			FROM notifications WHERE client_id=$1
+		`, clientID).Scan(&response.UnreadCount, &response.ActionRequiredCount); err != nil {
+			return NotificationsResponse{}, fmt.Errorf("count notifications: %w", err)
+		}
+	}
 	return response, nil
 }
 
@@ -1031,7 +1539,8 @@ func (r *Repository) GetClientProfile(ctx context.Context, clientID uuid.UUID) (
 			COALESCE(cp.hero_image_url, ''),
 			COALESCE(cp.verified, FALSE),
 			COALESCE(cp.currency_code, ''),
-			(cp.market_configured_at IS NOT NULL)
+			(cp.market_configured_at IS NOT NULL),
+			COALESCE(cp.concurrent_booking_capacity, 1)
 		FROM clients c
 		LEFT JOIN client_profiles cp ON cp.client_id = c.id
 		WHERE c.id = $1
@@ -1060,6 +1569,7 @@ func (r *Repository) GetClientProfile(ctx context.Context, clientID uuid.UUID) (
 		&profile.Verified,
 		&profile.CurrencyCode,
 		&profile.MarketConfigured,
+		&profile.ConcurrentBookingCapacity,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ClientProfileResponse{}, ErrNotFound
@@ -1071,6 +1581,10 @@ func (r *Repository) GetClientProfile(ctx context.Context, clientID uuid.UUID) (
 }
 
 func (r *Repository) UpdateClientProfile(ctx context.Context, clientID uuid.UUID, input UpdateClientProfileInput) error {
+	if input.ConcurrentBookingCapacity < 1 || input.ConcurrentBookingCapacity > 50 {
+		return ErrInvalidConcurrentBookingCapacity
+	}
+
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin profile update: %w", err)
@@ -1109,9 +1623,9 @@ func (r *Repository) UpdateClientProfile(ctx context.Context, clientID uuid.UUID
 	const query = `
 		INSERT INTO client_profiles (
 			client_id, business_name, handle_slug, category, headline, short_bio, public_profile_about, booking_page_intro,
-			public_location_label, city, region, hero_image_url, verified, created_at, updated_at
+			public_location_label, city, region, hero_image_url, concurrent_booking_capacity, verified, created_at, updated_at
 		)
-		VALUES ($1,$2,$12,$10,$4,$3,$5,$6,$7,$8,$9,$11,FALSE,NOW(),NOW())
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,FALSE,NOW(),NOW())
 		ON CONFLICT (client_id) DO UPDATE SET
 			business_name = EXCLUDED.business_name,
 			handle_slug = EXCLUDED.handle_slug,
@@ -1124,6 +1638,7 @@ func (r *Repository) UpdateClientProfile(ctx context.Context, clientID uuid.UUID
 			city = EXCLUDED.city,
 			region = EXCLUDED.region,
 			hero_image_url = EXCLUDED.hero_image_url,
+			concurrent_booking_capacity = EXCLUDED.concurrent_booking_capacity,
 			updated_at = NOW()
 	`
 
@@ -1132,16 +1647,17 @@ func (r *Repository) UpdateClientProfile(ctx context.Context, clientID uuid.UUID
 		query,
 		clientID,
 		strings.TrimSpace(input.BusinessName),
-		strings.TrimSpace(input.ShortBio),
+		handleSlug,
+		strings.TrimSpace(input.Category),
 		strings.TrimSpace(input.Headline),
+		strings.TrimSpace(input.ShortBio),
 		strings.TrimSpace(input.PublicProfileAbout),
 		strings.TrimSpace(input.BookingPageIntro),
 		strings.TrimSpace(input.Location),
 		strings.TrimSpace(input.City),
 		strings.TrimSpace(input.Region),
 		strings.TrimSpace(input.HeroImageURL),
-		strings.TrimSpace(input.Category),
-		handleSlug,
+		input.ConcurrentBookingCapacity,
 	); err != nil {
 		return fmt.Errorf("update client profile: %w", err)
 	}
@@ -1383,7 +1899,7 @@ func claimClientProfileHandle(ctx context.Context, tx pgx.Tx, clientID uuid.UUID
 	return nil
 }
 
-func (r *Repository) GetPublicProfileBySlug(ctx context.Context, slug string) (PublicProfileResponse, error) {
+func (r *Repository) GetPublicProfileBySlug(ctx context.Context, slug string, includeServices bool) (PublicProfileResponse, error) {
 	profile, err := r.getPublicProfile(ctx, slug)
 	if err != nil {
 		return PublicProfileResponse{}, err
@@ -1399,18 +1915,46 @@ func (r *Repository) GetPublicProfileBySlug(ctx context.Context, slug string) (P
 		return PublicProfileResponse{}, err
 	}
 
-	if len(services) > 2 {
-		services = services[:2]
+	featuredServices := services
+	if len(featuredServices) > 2 {
+		featuredServices = featuredServices[:2]
+	}
+	featuredServices = append([]PublicServiceItem(nil), featuredServices...)
+
+	var includedServices []PublicServiceItem
+	if includeServices {
+		includedServices = services
 	}
 
 	return PublicProfileResponse{
 		Profile:          profile,
-		FeaturedServices: services,
+		FeaturedServices: featuredServices,
+		Services:         includedServices,
 		Portfolio:        portfolio,
 	}, nil
 }
 
-func (r *Repository) getDashboardProfile(ctx context.Context, clientID uuid.UUID) (DashboardProfile, error) {
+func (r *Repository) PublicProviderResourceRevisionBySlug(ctx context.Context, slug string) (int64, error) {
+	var revision int64
+	err := r.db.QueryRow(ctx, `
+		SELECT COALESCE(resource.revision, 1)
+		FROM client_profile_handles handle
+		LEFT JOIN public_provider_resource_revisions resource ON resource.client_id = handle.client_id
+		WHERE handle.handle_slug = $1
+	`, strings.TrimSpace(slug)).Scan(&revision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("get public provider resource revision: %w", err)
+	}
+	return revision, nil
+}
+
+func (r *Repository) getDashboardProfile(
+	ctx context.Context,
+	clientID uuid.UUID,
+) (DashboardProfile, string, time.Time, time.Time, error) {
 	const query = `
 		SELECT
 			c.id,
@@ -1422,7 +1966,9 @@ func (r *Repository) getDashboardProfile(ctx context.Context, clientID uuid.UUID
 			cp.public_location_label,
 			cp.review_rating::float8,
 			cp.review_count,
-			cp.verified
+			cp.verified,
+			cp.currency_code,
+			cp.timezone
 		FROM clients c
 		INNER JOIN client_profiles cp ON cp.client_id = c.id
 		WHERE c.id = $1
@@ -1430,6 +1976,7 @@ func (r *Repository) getDashboardProfile(ctx context.Context, clientID uuid.UUID
 
 	var profile DashboardProfile
 	var id uuid.UUID
+	var currencyCode, timezone string
 	if err := r.db.QueryRow(ctx, query, clientID).Scan(
 		&id,
 		&profile.FullName,
@@ -1441,52 +1988,55 @@ func (r *Repository) getDashboardProfile(ctx context.Context, clientID uuid.UUID
 		&profile.ReviewRating,
 		&profile.ReviewCount,
 		&profile.Verified,
+		&currencyCode,
+		&timezone,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return DashboardProfile{}, ErrNotFound
+			return DashboardProfile{}, "", time.Time{}, time.Time{}, ErrNotFound
 		}
-		return DashboardProfile{}, fmt.Errorf("get dashboard profile: %w", err)
+		return DashboardProfile{}, "", time.Time{}, time.Time{}, fmt.Errorf("get dashboard profile: %w", err)
 	}
+	location, err := time.LoadLocation(timezone)
+	if err != nil {
+		return DashboardProfile{}, "", time.Time{}, time.Time{}, fmt.Errorf("load dashboard timezone: %w", err)
+	}
+	now := time.Now().In(location)
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
 	profile.ClientID = id.String()
-	return profile, nil
+	return profile, currencyCode, dayStart, dayStart.AddDate(0, 0, 1), nil
 }
 
-func (r *Repository) getDashboardStats(ctx context.Context, clientID uuid.UUID) (DashboardStats, error) {
-	const query = `
+const dashboardStatsQuery = `
 		SELECT
-			COUNT(booking.id)::int,
-			COALESCE(SUM(booking.total_amount_minor), 0)::bigint,
-			COALESCE(profile.currency_code, ''),
+			COUNT(*)::int,
+			COALESCE(SUM(total_amount_minor), 0)::bigint,
 			COUNT(*) FILTER (
-				WHERE booking.id IS NOT NULL
-				  AND booking.currency_code <> profile.currency_code
+				WHERE currency_code <> $4
 			)::int
-		FROM client_profiles AS profile
-		LEFT JOIN bookings AS booking
-			ON booking.client_id = profile.client_id
-		   AND booking.start_at::date = CURRENT_DATE
-		WHERE profile.client_id = $1
-		GROUP BY profile.currency_code
+		FROM bookings
+		WHERE client_id = $1
+		  AND start_at >= $2
+		  AND start_at < $3
 	`
 
+func scanDashboardStats(row pgx.Row, currencyCode string) (DashboardStats, error) {
 	var stats DashboardStats
 	var mismatchedCurrencyCount int
-	if err := r.db.QueryRow(ctx, query, clientID).Scan(
+	if err := row.Scan(
 		&stats.TodayBookingsCount,
 		&stats.ProjectedRevenue,
-		&stats.CurrencyCode,
 		&mismatchedCurrencyCount,
 	); err != nil {
 		return DashboardStats{}, fmt.Errorf("get dashboard stats: %w", err)
 	}
+	stats.CurrencyCode = currencyCode
 	if mismatchedCurrencyCount > 0 {
 		return DashboardStats{}, fmt.Errorf("dashboard bookings contain mixed currencies")
 	}
 	return stats, nil
 }
 
-func (r *Repository) getTopAttentionItem(ctx context.Context, clientID uuid.UUID) (*NotificationItem, error) {
-	const query = `
+const dashboardAttentionQuery = `
 		SELECT
 			id,
 			type,
@@ -1505,9 +2055,10 @@ func (r *Repository) getTopAttentionItem(ctx context.Context, clientID uuid.UUID
 		LIMIT 1
 	`
 
+func scanDashboardAttention(row pgx.Row) (*NotificationItem, error) {
 	var item NotificationItem
 	var id uuid.UUID
-	err := r.db.QueryRow(ctx, query, clientID).Scan(
+	err := row.Scan(
 		&id,
 		&item.Type,
 		&item.Severity,
@@ -1531,8 +2082,7 @@ func (r *Repository) getTopAttentionItem(ctx context.Context, clientID uuid.UUID
 	return &item, nil
 }
 
-func (r *Repository) getTodayBookings(ctx context.Context, clientID uuid.UUID) ([]DashboardBookingItem, error) {
-	const query = `
+const dashboardTodayBookingsQuery = `
 		SELECT
 			b.id,
 			b.title,
@@ -1545,15 +2095,13 @@ func (r *Repository) getTodayBookings(ctx context.Context, clientID uuid.UUID) (
 		LEFT JOIN customers c ON c.id = b.customer_id
 		LEFT JOIN services s ON s.id = b.service_id
 		WHERE b.client_id = $1
-		  AND b.start_at::date = CURRENT_DATE
+		  AND b.start_at >= $2
+		  AND b.start_at < $3
 		ORDER BY b.start_at ASC
 		LIMIT 6
 	`
 
-	rows, err := r.db.Query(ctx, query, clientID)
-	if err != nil {
-		return nil, fmt.Errorf("get today bookings: %w", err)
-	}
+func scanDashboardBookings(rows pgx.Rows) ([]DashboardBookingItem, error) {
 	defer rows.Close()
 
 	items := make([]DashboardBookingItem, 0)
@@ -1598,16 +2146,27 @@ func (r *Repository) getPublicProfile(ctx context.Context, slug string) (PublicP
 			COALESCE(cp.avatar_url, ''),
 			cp.verified,
 			cp.years_experience,
-			cp.review_rating::float8,
-			cp.review_count,
+			COALESCE(review_summary.rating, 0)::float8,
+			COALESCE(review_summary.count, 0)::int,
 			COALESCE(cp.country_code, ''),
 			COALESCE(cp.currency_code, ''),
 			COALESCE(cp.timezone, ''),
-			COALESCE(cp.locale, '')
+			COALESCE(cp.locale, ''),
+			cp.marketplace_enabled,
+			COALESCE(category.id::text, ''),
+			COALESCE(category.name, ''),
+			(SELECT COUNT(*)::int FROM bookings completed
+			 WHERE completed.client_id = cp.client_id AND completed.status = 'completed')
 		FROM client_profiles cp
 		INNER JOIN client_profile_handles cph
 			ON cph.client_id = cp.client_id
 		   AND cph.handle_slug = $1
+		LEFT JOIN marketplace_categories category ON category.id = cp.marketplace_category_id
+		LEFT JOIN LATERAL (
+			SELECT AVG(review.rating) AS rating, COUNT(*) AS count
+			FROM provider_reviews review
+			WHERE review.client_id = cp.client_id AND review.status = 'approved'
+		) review_summary ON TRUE
 	`
 
 	var profile PublicProfile
@@ -1632,6 +2191,10 @@ func (r *Repository) getPublicProfile(ctx context.Context, slug string) (PublicP
 		&profile.CurrencyCode,
 		&profile.Timezone,
 		&profile.Locale,
+		&profile.MarketplaceEnabled,
+		&profile.MarketplaceCategoryID,
+		&profile.MarketplaceCategoryName,
+		&profile.CompletedBookings,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return PublicProfile{}, ErrNotFound
@@ -1749,6 +2312,9 @@ func firstNonEmpty(values ...string) string {
 }
 
 func initialBookingPaymentState(totalAmountMinor, depositAmountMinor int64) string {
+	if totalAmountMinor <= 0 {
+		return string(payments.BookingPaymentPaidInFull)
+	}
 	if depositAmountMinor > 0 && depositAmountMinor < totalAmountMinor {
 		return string(payments.BookingPaymentDepositPending)
 	}

@@ -34,6 +34,10 @@ func (h *Handler) createBusinessLocation(w http.ResponseWriter, r *http.Request)
 	}
 	item, err := h.repo.CreateBusinessLocation(r.Context(), client.ID, input)
 	if err != nil {
+		if errors.Is(err, ErrBusinessLocationLimitReached) {
+			writeError(w, http.StatusConflict, "business_location_limit_reached", "You can keep up to 20 active business locations.")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "create_business_location_failed", err.Error())
 		return
 	}

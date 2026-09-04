@@ -13,10 +13,47 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func (r *Repository) ListManagedAgreements(ctx context.Context, clientID uuid.UUID, status, search string) ([]ManagedAgreementListItem, error) {
-	status = strings.TrimSpace(status)
+const defaultManagedAgreementListLimit = 40
+
+type ManagedAgreementListInput struct {
+	Status string
+	Search string
+	Cursor string
+	Limit  int
+}
+
+type ManagedAgreementListResponse struct {
+	Items      []ManagedAgreementListItem `json:"items"`
+	NextCursor string                     `json:"next_cursor,omitempty"`
+}
+
+type managedAgreementListCursor struct {
+	CreatedAt time.Time `json:"created_at"`
+	ID        uuid.UUID `json:"id"`
+}
+
+func (r *Repository) ListManagedAgreements(ctx context.Context, clientID uuid.UUID, input ManagedAgreementListInput) (ManagedAgreementListResponse, error) {
+	status := strings.TrimSpace(input.Status)
 	if status != "" && status != "draft" && status != "awaiting_customer" && status != "completed" && status != "expired" && status != "cancelled" {
-		return nil, fmt.Errorf("invalid agreement status")
+		return ManagedAgreementListResponse{}, fmt.Errorf("invalid agreement status")
+	}
+	search := strings.TrimSpace(input.Search)
+	if input.Limit < 1 || input.Limit > defaultManagedAgreementListLimit {
+		return ManagedAgreementListResponse{}, errors.New("agreement list limit is invalid")
+	}
+	fingerprint := keysetFilterFingerprint("provider-agreements", status, search)
+	var cursor managedAgreementListCursor
+	if err := decodeKeysetCursor(input.Cursor, fingerprint, &cursor); err != nil {
+		return ManagedAgreementListResponse{}, err
+	}
+	var cursorCreatedAt any
+	var cursorID any
+	if strings.TrimSpace(input.Cursor) != "" {
+		if cursor.CreatedAt.IsZero() || cursor.ID == uuid.Nil {
+			return ManagedAgreementListResponse{}, ErrInvalidKeysetCursor
+		}
+		cursorCreatedAt = cursor.CreatedAt.UTC()
+		cursorID = cursor.ID
 	}
 	const query = `
 		SELECT
@@ -35,12 +72,13 @@ func (r *Repository) ListManagedAgreements(ctx context.Context, clientID uuid.UU
 			OR COALESCE(c.full_name, '') ILIKE '%' || $3 || '%'
 			OR ai.sent_to_email ILIKE '%' || $3 || '%'
 		  )
+		  AND ($4::timestamptz IS NULL OR (ai.created_at, ai.id) < ($4, $5::uuid))
 		ORDER BY ai.created_at DESC, ai.id DESC
-		LIMIT 100
+		LIMIT $6
 	`
-	rows, err := r.db.Query(ctx, query, clientID, status, strings.TrimSpace(search))
+	rows, err := r.db.Query(ctx, query, clientID, status, search, cursorCreatedAt, cursorID, input.Limit+1)
 	if err != nil {
-		return nil, fmt.Errorf("list agreements: %w", err)
+		return ManagedAgreementListResponse{}, fmt.Errorf("list agreements: %w", err)
 	}
 	defer rows.Close()
 	items := make([]ManagedAgreementListItem, 0)
@@ -52,15 +90,31 @@ func (r *Repository) ListManagedAgreements(ctx context.Context, clientID uuid.UU
 			&item.SentToEmail, &item.PDFStatus, &item.Accepted,
 			&item.SignatureSHA256, &item.CompletedAt, &item.CreatedAt, &item.UpdatedAt,
 		); err != nil {
-			return nil, fmt.Errorf("scan agreement: %w", err)
+			return ManagedAgreementListResponse{}, fmt.Errorf("scan agreement: %w", err)
 		}
 		item.SignaturePresent = item.SignatureSHA256 != ""
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate agreements: %w", err)
+		return ManagedAgreementListResponse{}, fmt.Errorf("iterate agreements: %w", err)
 	}
-	return items, nil
+	hasMore := len(items) > input.Limit
+	if hasMore {
+		items = items[:input.Limit]
+	}
+	response := ManagedAgreementListResponse{Items: items}
+	if hasMore {
+		last := items[len(items)-1]
+		lastID, err := uuid.Parse(last.ID)
+		if err != nil {
+			return ManagedAgreementListResponse{}, fmt.Errorf("encode agreement cursor: %w", err)
+		}
+		response.NextCursor, err = encodeKeysetCursor(fingerprint, managedAgreementListCursor{CreatedAt: last.CreatedAt.UTC(), ID: lastID})
+		if err != nil {
+			return ManagedAgreementListResponse{}, fmt.Errorf("encode agreement cursor: %w", err)
+		}
+	}
+	return response, nil
 }
 
 func (r *Repository) GetManagedAgreementDeliveryToken(ctx context.Context, clientID, agreementID uuid.UUID) (string, error) {

@@ -9,6 +9,12 @@ type BusinessLocationItem struct {
 	Longitude        *float64 `json:"longitude,omitempty"`
 	AddressSource    string   `json:"address_source"`
 	ResolutionStatus string   `json:"resolution_status"`
+	CountryCode      string   `json:"country_code,omitempty"`
+	StateRegionID    string   `json:"state_region_id,omitempty"`
+	StateName        string   `json:"state_name,omitempty"`
+	LGARegionID      string   `json:"lga_region_id,omitempty"`
+	LGAName          string   `json:"lga_name,omitempty"`
+	Locality         string   `json:"locality,omitempty"`
 	Timezone         string   `json:"timezone"`
 	IsPrimary        bool     `json:"is_primary"`
 	IsActive         bool     `json:"is_active"`

@@ -83,6 +83,7 @@ type CreateFinancialPaymentParams struct {
 	CheckoutInitializationLeaseOwner     string
 	CheckoutInitializationLeaseExpiresAt *time.Time
 	NextProviderCheckAt                  *time.Time
+	ExpiresAt                            *time.Time
 }
 
 type PaymentTransitionUpdate struct {
@@ -127,14 +128,15 @@ type LedgerRepository struct {
 }
 
 type BookingPaymentObligation struct {
-	ClientID           uuid.UUID
-	CustomerID         uuid.UUID
-	CountryCode        string
-	CurrencyCode       string
-	Purpose            PaymentPurpose
-	AmountMinor        money.Minor
-	TotalAmountMinor   money.Minor
-	DepositAmountMinor money.Minor
+	ClientID             uuid.UUID
+	CustomerID           uuid.UUID
+	CountryCode          string
+	CurrencyCode         string
+	Purpose              PaymentPurpose
+	AmountMinor          money.Minor
+	TotalAmountMinor     money.Minor
+	DepositAmountMinor   money.Minor
+	ReservationExpiresAt *time.Time
 }
 
 type queryRower interface {
@@ -305,10 +307,10 @@ func (r *LedgerRepository) CreatePayment(ctx context.Context, params CreateFinan
 			country_code, currency_code, amount_minor, price_snapshot, reference,
 			idempotency_key, request_fingerprint, status, checkout_details,
 			checkout_initialization_state, checkout_initialization_lease_owner,
-			checkout_initialization_lease_expires_at, next_provider_check_at, created_at, updated_at
+			checkout_initialization_lease_expires_at, next_provider_check_at, expires_at, created_at, updated_at
 		)
 		VALUES (
-			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'created',$16,$17,$18,$19,$20,NOW(),NOW()
+			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'created',$16,$17,$18,$19,$20,$21,NOW(),NOW()
 		)
 		ON CONFLICT DO NOTHING
 		RETURNING
@@ -342,6 +344,7 @@ func (r *LedgerRepository) CreatePayment(ctx context.Context, params CreateFinan
 		strings.TrimSpace(params.CheckoutInitializationLeaseOwner),
 		params.CheckoutInitializationLeaseExpiresAt,
 		params.NextProviderCheckAt,
+		params.ExpiresAt,
 	))
 	created := err == nil
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -349,6 +352,19 @@ func (r *LedgerRepository) CreatePayment(ctx context.Context, params CreateFinan
 	}
 	if err != nil {
 		return FinancialPayment{}, false, fmt.Errorf("create financial payment: %w", err)
+	}
+	if created {
+		payload, marshalErr := json.Marshal(map[string]string{"payment_token": payment.PublicToken})
+		if marshalErr != nil {
+			return FinancialPayment{}, false, fmt.Errorf("encode payment reconciliation job: %w", marshalErr)
+		}
+		if err := enqueueFinancialJobTx(ctx, tx, FinancialJobParams{
+			ID: uuid.New(), Kind: paymentReconciliationJobKind, AggregateType: "payment",
+			AggregateID: payment.ID, DeduplicationKey: paymentReconciliationDeduplicationKey(payment.ID),
+			Payload: payload,
+		}); err != nil {
+			return FinancialPayment{}, false, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return FinancialPayment{}, false, fmt.Errorf("commit financial payment create: %w", err)
@@ -423,103 +439,37 @@ func (r *LedgerRepository) GetLatestPaymentForBooking(ctx context.Context, booki
 	return payment, nil
 }
 
-func (r *LedgerRepository) ClaimStalePayments(
-	ctx context.Context,
-	workerID string,
-	staleBefore time.Time,
-	limit int,
-	leaseDuration time.Duration,
-) ([]FinancialPayment, error) {
-	workerID = strings.TrimSpace(workerID)
-	if workerID == "" || limit <= 0 || limit > 500 || leaseDuration <= 0 {
-		return nil, errors.New("worker ID, stale payment limit, and lease duration are required")
-	}
-	leaseSeconds := max(int64(leaseDuration/time.Second), 1)
-	const query = `
-		WITH candidates AS (
-			SELECT id
-			FROM payments
-			WHERE status IN ('created', 'pending', 'requires_action')
-			  AND updated_at <= $1
-			  AND (reconciliation_lease_expires_at IS NULL OR reconciliation_lease_expires_at <= NOW())
-			ORDER BY updated_at ASC
-			FOR UPDATE SKIP LOCKED
-			LIMIT $2
-		)
-		UPDATE payments AS payment
-		SET reconciliation_lease_owner = $3,
-			reconciliation_lease_expires_at = NOW() + ($4 * INTERVAL '1 second')
-		FROM candidates
-		WHERE payment.id = candidates.id
-		RETURNING
-			payment.id, payment.public_token, payment.booking_id, payment.client_id, payment.customer_id,
-			payment.purpose, payment.provider, payment.method,
-			payment.country_code, payment.currency_code, payment.amount_minor, payment.price_snapshot, payment.reference,
-				payment.provider_reference, payment.provider_channel, payment.idempotency_key, payment.request_fingerprint, payment.status, payment.provider_status,
-			payment.reconciliation_reason, payment.failure_code, payment.failure_message, payment.checkout_url, payment.expires_at,
-			payment.paid_at, payment.last_reconciled_at, payment.version, payment.created_at, payment.updated_at
-	`
-	rows, err := r.db.Query(ctx, query, staleBefore, limit, workerID, leaseSeconds)
-	if err != nil {
-		return nil, fmt.Errorf("list stale payments: %w", err)
-	}
-	defer rows.Close()
-
-	result := make([]FinancialPayment, 0)
-	for rows.Next() {
-		payment, err := scanFinancialPayment(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan stale payment: %w", err)
-		}
-		result = append(result, payment)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate stale payments: %w", err)
-	}
-	return result, nil
-}
-
-func (r *LedgerRepository) DelayPaymentReconciliation(
-	ctx context.Context,
-	paymentID uuid.UUID,
-	workerID string,
-	retryAt time.Time,
-) error {
-	tag, err := r.db.Exec(ctx, `
-		UPDATE payments
-		SET reconciliation_lease_expires_at = $3
-		WHERE id = $1 AND reconciliation_lease_owner = $2
-	`, paymentID, strings.TrimSpace(workerID), retryAt)
-	if err != nil {
-		return fmt.Errorf("delay payment reconciliation: %w", err)
-	}
-	if tag.RowsAffected() != 1 {
-		return ErrConcurrentUpdate
-	}
-	return nil
-}
-
-func (r *LedgerRepository) WithPaymentReconciliationLock(
+func (r *LedgerRepository) WithPaymentReconciliationLease(
 	ctx context.Context,
 	paymentID uuid.UUID,
 	fn func() (FinancialPayment, error),
 ) (FinancialPayment, error) {
 	if r == nil || r.db == nil || paymentID == uuid.Nil || fn == nil {
-		return FinancialPayment{}, errors.New("invalid payment reconciliation lock")
+		return FinancialPayment{}, errors.New("invalid payment reconciliation lease")
 	}
-	connection, err := r.db.Acquire(ctx)
-	if err != nil {
-		return FinancialPayment{}, fmt.Errorf("acquire payment reconciliation connection: %w", err)
-	}
-	defer connection.Release()
-	lockKey := "payment-reconciliation:" + paymentID.String()
-	if _, err := connection.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, lockKey); err != nil {
-		return FinancialPayment{}, fmt.Errorf("acquire payment reconciliation lock: %w", err)
+	leaseOwner := "payment-reconciliation-" + uuid.NewString()
+	leaseExpiresAt := time.Now().UTC().Add(2 * time.Minute)
+	var acquired bool
+	if err := r.db.QueryRow(ctx, `
+		UPDATE payments
+		SET reconciliation_lease_owner=$2,reconciliation_lease_expires_at=$3
+		WHERE id=$1
+		  AND status IN ('created','pending','requires_action')
+		  AND (reconciliation_lease_expires_at IS NULL OR reconciliation_lease_expires_at<=NOW())
+		RETURNING TRUE
+	`, paymentID, leaseOwner, leaseExpiresAt).Scan(&acquired); errors.Is(err, pgx.ErrNoRows) {
+		return r.GetPaymentByID(ctx, paymentID)
+	} else if err != nil {
+		return FinancialPayment{}, fmt.Errorf("acquire payment reconciliation lease: %w", err)
 	}
 	defer func() {
-		unlockContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		unlockContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 		defer cancel()
-		_, _ = connection.Exec(unlockContext, `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, lockKey)
+		_, _ = r.db.Exec(unlockContext, `
+			UPDATE payments
+			SET reconciliation_lease_owner='',reconciliation_lease_expires_at=NULL
+			WHERE id=$1 AND reconciliation_lease_owner=$2
+		`, paymentID, leaseOwner)
 	}()
 	return fn()
 }
@@ -623,6 +573,16 @@ func (r *LedgerRepository) TransitionPayment(
 			Payload:          json.RawMessage(`{}`),
 		}); err != nil {
 			return FinancialPayment{}, err
+		}
+	}
+	if transitioned.ExpiresAt != nil {
+		if _, err := tx.Exec(ctx, `
+			UPDATE bookings
+			SET reservation_expires_at=GREATEST(reservation_expires_at,$2), updated_at=NOW()
+			WHERE id=$1 AND reservation_expires_at IS NOT NULL
+			  AND reservation_expired_at IS NULL AND status <> 'expired'
+		`, payment.BookingID, transitioned.ExpiresAt); err != nil {
+			return FinancialPayment{}, fmt.Errorf("extend reservation payment window: %w", err)
 		}
 	}
 	if err := recomputeBookingPaymentStateTx(ctx, tx, payment.BookingID); err != nil {
@@ -743,6 +703,8 @@ func loadBookingPaymentObligation(
 			b.currency_code,
 			b.total_amount_minor,
 			b.deposit_amount_minor,
+			b.status,
+			b.reservation_expires_at,
 			COALESCE((
 				SELECT SUM(p.amount_minor)
 				FROM payments p
@@ -760,9 +722,11 @@ func loadBookingPaymentObligation(
 	`
 	var obligation BookingPaymentObligation
 	var totalMinor, depositMinor, grossPaidMinor, adjustmentMinor int64
+	var bookingStatus string
 	if err := querier.QueryRow(ctx, query, bookingID).Scan(
 		&obligation.ClientID, &obligation.CustomerID, &obligation.CountryCode, &obligation.CurrencyCode,
-		&totalMinor, &depositMinor, &grossPaidMinor, &adjustmentMinor,
+		&totalMinor, &depositMinor, &bookingStatus, &obligation.ReservationExpiresAt,
+		&grossPaidMinor, &adjustmentMinor,
 	); errors.Is(err, pgx.ErrNoRows) {
 		return BookingPaymentObligation{}, ErrLedgerRecordNotFound
 	} else if err != nil {
@@ -770,6 +734,11 @@ func loadBookingPaymentObligation(
 	}
 	if totalMinor <= 0 || depositMinor < 0 || depositMinor > totalMinor {
 		return BookingPaymentObligation{}, errors.New("booking has invalid payment amounts")
+	}
+	if bookingStatus == "expired" || bookingStatus == "cancelled" || bookingStatus == "canceled" ||
+		bookingStatus == "declined" || bookingStatus == "completed" || bookingStatus == "no_show" ||
+		(obligation.ReservationExpiresAt != nil && !obligation.ReservationExpiresAt.After(time.Now().UTC())) {
+		return BookingPaymentObligation{}, ErrBookingPaymentClosed
 	}
 	netPaidMinor := grossPaidMinor - adjustmentMinor
 	if netPaidMinor < 0 {
@@ -893,7 +862,15 @@ func recomputeBookingPaymentStateTx(ctx context.Context, tx pgx.Tx, bookingID uu
 	if err != nil {
 		return fmt.Errorf("derive booking payment state: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `UPDATE bookings SET payment_status = $2, updated_at = NOW() WHERE id = $1`, bookingID, string(state)); err != nil {
+	if _, err := tx.Exec(ctx, `
+		UPDATE bookings SET payment_status = $2,
+			reservation_expires_at = CASE
+				WHEN $2 IN ('deposit_paid_balance_due','paid_in_full') AND status <> 'expired' THEN NULL
+				ELSE reservation_expires_at
+			END,
+			updated_at = NOW()
+		WHERE id = $1
+	`, bookingID, string(state)); err != nil {
 		return fmt.Errorf("update booking payment state: %w", err)
 	}
 	return nil

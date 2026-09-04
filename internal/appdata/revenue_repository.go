@@ -47,6 +47,57 @@ func (r *Repository) GetRevenueOverview(
 		Range: rangeName, PeriodStart: periodStart, PeriodEnd: periodEnd,
 		CurrencyCode: currencyCode, RecentCustomerPayments: []RevenuePaymentItem{},
 	}
+	return r.getProjectedRevenuePeriod(ctx, clientID, response)
+}
+
+func (r *Repository) getProjectedRevenuePeriod(
+	ctx context.Context,
+	clientID uuid.UUID,
+	response RevenueOverviewResponse,
+) (RevenueOverviewResponse, error) {
+	if err := r.db.QueryRow(ctx, `
+		SELECT
+			COALESCE((
+				SELECT SUM(wallet.business_net_amount_minor)
+				FROM payment_allocations wallet
+				WHERE wallet.client_id=$1
+				  AND wallet.currency_code=$4
+				  AND wallet.status='eligible'
+				  AND wallet.available_for_payout_at<=NOW()
+			),0)::bigint,
+			COALESCE(SUM(gross_revenue_minor),0)::bigint,
+			COALESCE(SUM(net_revenue_minor),0)::bigint,
+			COALESCE(SUM(payment_count),0)::int
+		FROM provider_daily_metrics
+		WHERE client_id=$1
+		  AND currency_code=$4
+		  AND metric_date >= $2::date
+		  AND metric_date < $3::date
+	`, clientID, response.PeriodStart.Format("2006-01-02"), response.PeriodEnd.Format("2006-01-02"), response.CurrencyCode).Scan(
+		&response.WalletBalanceMinor,
+		&response.GrossRevenueMinor,
+		&response.NetRevenueMinor,
+		&response.PaymentCount,
+	); err != nil {
+		return RevenueOverviewResponse{}, fmt.Errorf("get projected revenue totals: %w", err)
+	}
+	if response.PaymentCount > 0 {
+		response.AveragePaymentMinor = response.NetRevenueMinor / money.Minor(response.PaymentCount)
+	}
+	recent, err := r.listRecentRevenuePayments(ctx, clientID, response)
+	if err != nil {
+		return RevenueOverviewResponse{}, err
+	}
+	response.RecentCustomerPayments = recent
+	return response, nil
+}
+
+func (r *Repository) getRevenuePeriod(
+	ctx context.Context,
+	clientID uuid.UUID,
+	response RevenueOverviewResponse,
+	includeRecent bool,
+) (RevenueOverviewResponse, error) {
 	if err := r.db.QueryRow(ctx, `
 			SELECT
 				COALESCE((
@@ -67,7 +118,7 @@ func (r *Repository) GetRevenueOverview(
 		  AND p.paid_at < $3
 			  AND p.currency_code = $4
 			  AND pa.status <> 'reversed'
-		`, clientID, periodStart, periodEnd, currencyCode).Scan(
+		`, clientID, response.PeriodStart, response.PeriodEnd, response.CurrencyCode).Scan(
 		&response.WalletBalanceMinor,
 		&response.GrossRevenueMinor,
 		&response.NetRevenueMinor,
@@ -78,7 +129,22 @@ func (r *Repository) GetRevenueOverview(
 	if response.PaymentCount > 0 {
 		response.AveragePaymentMinor = response.NetRevenueMinor / money.Minor(response.PaymentCount)
 	}
+	if !includeRecent {
+		return response, nil
+	}
+	recent, err := r.listRecentRevenuePayments(ctx, clientID, response)
+	if err != nil {
+		return RevenueOverviewResponse{}, err
+	}
+	response.RecentCustomerPayments = recent
+	return response, nil
+}
 
+func (r *Repository) listRecentRevenuePayments(
+	ctx context.Context,
+	clientID uuid.UUID,
+	response RevenueOverviewResponse,
+) ([]RevenuePaymentItem, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT
 			p.id,
@@ -101,12 +167,13 @@ func (r *Repository) GetRevenueOverview(
 		  AND pa.status <> 'reversed'
 		ORDER BY p.paid_at DESC, p.id DESC
 		LIMIT 10
-	`, clientID, periodStart, periodEnd, currencyCode)
+	`, clientID, response.PeriodStart, response.PeriodEnd, response.CurrencyCode)
 	if err != nil {
-		return RevenueOverviewResponse{}, fmt.Errorf("list recent revenue: %w", err)
+		return nil, fmt.Errorf("list recent revenue: %w", err)
 	}
 	defer rows.Close()
 
+	items := make([]RevenuePaymentItem, 0, 10)
 	for rows.Next() {
 		var item RevenuePaymentItem
 		if err := rows.Scan(
@@ -119,13 +186,12 @@ func (r *Repository) GetRevenueOverview(
 			&item.Provider,
 			&item.PaidAt,
 		); err != nil {
-			return RevenueOverviewResponse{}, fmt.Errorf("scan recent revenue: %w", err)
+			return nil, fmt.Errorf("scan recent revenue: %w", err)
 		}
-		response.RecentCustomerPayments = append(response.RecentCustomerPayments, item)
+		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return RevenueOverviewResponse{}, fmt.Errorf("iterate recent revenue: %w", err)
+		return nil, fmt.Errorf("iterate recent revenue: %w", err)
 	}
-
-	return response, nil
+	return items, nil
 }

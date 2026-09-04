@@ -11,22 +11,9 @@ import (
 )
 
 func (r *Repository) ListBusinessLocations(ctx context.Context, clientID uuid.UUID) ([]BusinessLocationItem, error) {
-	rows, err := r.db.Query(ctx, `
-		SELECT
-			id,
-			label,
-			formatted_address,
-			COALESCE(provider_place_id, ''),
-			latitude::double precision,
-			longitude::double precision,
-			address_source,
-			resolution_status,
-			timezone,
-			is_primary,
-			is_active
-		FROM business_locations
-		WHERE client_id = $1
-		ORDER BY is_active DESC, is_primary DESC, created_at ASC
+	rows, err := r.db.Query(ctx, businessLocationSelect+`
+		WHERE location.client_id = $1
+		ORDER BY location.is_active DESC, location.is_primary DESC, location.created_at ASC
 	`, clientID)
 	if err != nil {
 		return nil, fmt.Errorf("list business locations: %w", err)
@@ -47,8 +34,36 @@ func (r *Repository) ListBusinessLocations(ctx context.Context, clientID uuid.UU
 	return items, nil
 }
 
+const businessLocationSelect = `
+		SELECT
+			location.id,
+			location.label,
+			location.formatted_address,
+			COALESCE(location.provider_place_id, ''),
+			location.latitude::double precision,
+			location.longitude::double precision,
+			location.address_source,
+			location.resolution_status,
+			COALESCE(location.country_code, ''),
+			COALESCE(location.state_region_id::text, ''),
+			COALESCE(state.name, ''),
+			COALESCE(location.lga_region_id::text, ''),
+			COALESCE(lga.name, ''),
+			location.locality,
+			location.timezone,
+			location.is_primary,
+			location.is_active
+		FROM business_locations location
+		LEFT JOIN administrative_regions state ON state.id = location.state_region_id
+		LEFT JOIN administrative_regions lga ON lga.id = location.lga_region_id
+`
+
 func (r *Repository) CreateBusinessLocation(ctx context.Context, clientID uuid.UUID, input UpsertBusinessLocationInput) (BusinessLocationItem, error) {
 	normalized, err := normalizeBusinessLocationInput(input)
+	if err != nil {
+		return BusinessLocationItem{}, err
+	}
+	normalized, err = r.enrichBusinessLocation(ctx, normalized)
 	if err != nil {
 		return BusinessLocationItem{}, err
 	}
@@ -58,6 +73,16 @@ func (r *Repository) CreateBusinessLocation(ctx context.Context, clientID uuid.U
 		return BusinessLocationItem{}, fmt.Errorf("begin create business location: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := enforceProviderCollectionLimit(
+		ctx,
+		tx,
+		clientID,
+		`SELECT COUNT(*) FROM business_locations WHERE client_id = $1 AND is_active`,
+		MaxProviderBusinessLocations,
+		ErrBusinessLocationLimitReached,
+	); err != nil {
+		return BusinessLocationItem{}, err
+	}
 
 	var hasActiveLocation bool
 	if err := tx.QueryRow(ctx, `
@@ -81,21 +106,24 @@ func (r *Repository) CreateBusinessLocation(ctx context.Context, clientID uuid.U
 	}
 
 	id := uuid.New()
-	item, err := queryBusinessLocation(ctx, tx, `
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO business_locations (
 			id, client_id, label, formatted_address, provider_place_id,
 			latitude, longitude, address_source, resolution_status, timezone,
+			country_code, state_region_id, lga_region_id, locality,
 			is_primary, is_active, created_at, updated_at
 		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,TRUE,NOW(),NOW())
-		RETURNING
-			id, label, formatted_address, COALESCE(provider_place_id, ''),
-			latitude::double precision, longitude::double precision,
-			address_source, resolution_status, timezone, is_primary, is_active
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,TRUE,NOW(),NOW())
 	`, id, clientID, normalized.Label, normalized.FormattedAddress,
 		nullIfBlank(normalized.ProviderPlaceID), normalized.Latitude, normalized.Longitude,
 		normalized.AddressSource, normalized.ResolutionStatus, normalized.Timezone,
-		normalized.IsPrimary)
+		nullIfBlank(normalized.CountryCode), normalized.StateRegionID, normalized.LGARegionID,
+		normalized.Locality, normalized.IsPrimary); err != nil {
+		return BusinessLocationItem{}, fmt.Errorf("create business location: %w", err)
+	}
+	item, err := queryBusinessLocation(ctx, tx, businessLocationSelect+`
+		WHERE location.client_id = $1 AND location.id = $2
+	`, clientID, id)
 	if err != nil {
 		return BusinessLocationItem{}, err
 	}
@@ -108,6 +136,10 @@ func (r *Repository) CreateBusinessLocation(ctx context.Context, clientID uuid.U
 
 func (r *Repository) UpdateBusinessLocation(ctx context.Context, clientID, locationID uuid.UUID, input UpsertBusinessLocationInput) (BusinessLocationItem, error) {
 	normalized, err := normalizeBusinessLocationInput(input)
+	if err != nil {
+		return BusinessLocationItem{}, err
+	}
+	normalized, err = r.enrichBusinessLocation(ctx, normalized)
 	if err != nil {
 		return BusinessLocationItem{}, err
 	}
@@ -143,7 +175,7 @@ func (r *Repository) UpdateBusinessLocation(ctx context.Context, clientID, locat
 		}
 	}
 
-	item, err := queryBusinessLocation(ctx, tx, `
+	commandTag, err := tx.Exec(ctx, `
 		UPDATE business_locations
 		SET
 			label = $3,
@@ -155,16 +187,26 @@ func (r *Repository) UpdateBusinessLocation(ctx context.Context, clientID, locat
 			resolution_status = $9,
 			timezone = $10,
 			is_primary = $11,
+			country_code = $12,
+			state_region_id = $13,
+			lga_region_id = $14,
+			locality = $15,
 			updated_at = NOW()
 		WHERE client_id = $1 AND id = $2 AND is_active
-		RETURNING
-			id, label, formatted_address, COALESCE(provider_place_id, ''),
-			latitude::double precision, longitude::double precision,
-			address_source, resolution_status, timezone, is_primary, is_active
 	`, clientID, locationID, normalized.Label, normalized.FormattedAddress,
 		nullIfBlank(normalized.ProviderPlaceID), normalized.Latitude, normalized.Longitude,
 		normalized.AddressSource, normalized.ResolutionStatus, normalized.Timezone,
-		normalized.IsPrimary)
+		normalized.IsPrimary, nullIfBlank(normalized.CountryCode), normalized.StateRegionID,
+		normalized.LGARegionID, normalized.Locality)
+	if err != nil {
+		return BusinessLocationItem{}, fmt.Errorf("update business location: %w", err)
+	}
+	if commandTag.RowsAffected() == 0 {
+		return BusinessLocationItem{}, ErrNotFound
+	}
+	item, err := queryBusinessLocation(ctx, tx, businessLocationSelect+`
+		WHERE location.client_id = $1 AND location.id = $2
+	`, clientID, locationID)
 	if err != nil {
 		return BusinessLocationItem{}, err
 	}
@@ -244,8 +286,58 @@ type normalizedBusinessLocationInput struct {
 	Longitude        *float64
 	AddressSource    string
 	ResolutionStatus string
+	CountryCode      string
+	StateRegionID    *uuid.UUID
+	LGARegionID      *uuid.UUID
+	Locality         string
 	Timezone         string
 	IsPrimary        bool
+}
+
+func (r *Repository) enrichBusinessLocation(ctx context.Context, input normalizedBusinessLocationInput) (normalizedBusinessLocationInput, error) {
+	var resolved resolvedAddress
+	var err error
+	if input.AddressSource == "google_place" && input.ProviderPlaceID != "" {
+		if r.googleMapsAPIKey == "" {
+			return input, fmt.Errorf("map location resolution is unavailable")
+		}
+		resolved, err = r.googlePlaceDetails(ctx, input.ProviderPlaceID)
+		if err != nil {
+			return input, err
+		}
+	} else if input.Latitude == nil && r.googleMapsAPIKey != "" {
+		resolved, err = r.googleGeocodeAddress(ctx, input.FormattedAddress)
+		if err != nil {
+			return input, nil
+		}
+	} else if input.AddressSource == "current_location" && input.Latitude != nil && r.googleMapsAPIKey != "" {
+		resolved, err = r.googleReverseGeocode(ctx, *input.Latitude, *input.Longitude)
+		if err != nil {
+			resolved = resolvedAddress{}
+		}
+	}
+	if resolved.FormattedAddress != "" {
+		input.FormattedAddress = resolved.FormattedAddress
+		input.Latitude = &resolved.Latitude
+		input.Longitude = &resolved.Longitude
+		input.CountryCode = strings.ToUpper(resolved.CountryCode)
+		input.Locality = resolved.Locality
+		input.ResolutionStatus = "coordinates_resolved"
+	}
+	if input.Latitude == nil || input.Longitude == nil {
+		return input, nil
+	}
+	assignment, err := r.assignAdministrativeRegions(ctx, *input.Latitude, *input.Longitude, input.Locality)
+	if err != nil {
+		return input, err
+	}
+	if assignment.CountryCode != "" {
+		input.CountryCode = assignment.CountryCode
+	}
+	input.StateRegionID = assignment.StateRegionID
+	input.LGARegionID = assignment.LGARegionID
+	input.Locality = assignment.Locality
+	return input, nil
 }
 
 func normalizeBusinessLocationInput(input UpsertBusinessLocationInput) (normalizedBusinessLocationInput, error) {
@@ -316,6 +408,12 @@ func scanBusinessLocation(row businessLocationRow) (BusinessLocationItem, error)
 		&item.Longitude,
 		&item.AddressSource,
 		&item.ResolutionStatus,
+		&item.CountryCode,
+		&item.StateRegionID,
+		&item.StateName,
+		&item.LGARegionID,
+		&item.LGAName,
+		&item.Locality,
 		&item.Timezone,
 		&item.IsPrimary,
 		&item.IsActive,

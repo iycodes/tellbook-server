@@ -1,0 +1,72 @@
+openapi: 3.1.0
+info:
+  title: Tellbook Public Booking API
+  version: 1.0.0
+servers:
+  - url: /v1/public
+paths:
+  /clients/{slug}/bookings:
+    post:
+      operationId: createPublicBooking
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string, minLength: 1 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePublicBookingRequest' }
+      responses:
+        '201':
+          description: Booking created, or an identical consumed-quote replay returned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicBookingCreated' }
+        '409':
+          description: The quote expired, the slot changed, or the consumed quote was replayed with different details.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+components:
+  schemas:
+    CreatePublicBookingRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - quote_token
+        - full_name
+        - email
+        - phone
+        - notes
+        - email_reminder_consent
+        - whatsapp_consent
+      properties:
+        quote_token: { type: string, minLength: 1 }
+        source: { type: string, enum: [direct_public_page, marketplace] }
+        full_name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string }
+        notes: { type: string }
+        agreement_accepted: { type: boolean }
+        agreement_full_name: { type: string }
+        agreement_signature_data_url: { type: string }
+        email_reminder_consent: { type: boolean }
+        whatsapp_consent: { type: boolean }
+        sms_consent: { type: boolean }
+    PublicBookingCreated:
+      type: object
+      required: [booking_token, email_reminder_consent, whatsapp_consent, sms_consent]
+      properties:
+        booking_token: { type: string }
+        email_reminder_consent: { type: boolean }
+        whatsapp_consent: { type: boolean }
+        sms_consent: { type: boolean }
+      additionalProperties: true
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }

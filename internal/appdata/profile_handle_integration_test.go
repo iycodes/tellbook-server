@@ -67,8 +67,24 @@ func TestProfileHandleLifecycle(t *testing.T) {
 	}
 
 	firstHandle := "zenith-studio"
-	if err := repository.UpdateClientProfile(ctx, firstClientID, profileHandleTestInput("Zenith Studio", &firstHandle)); err != nil {
+	firstProfile := profileHandleTestInput("Zenith Studio", &firstHandle)
+	firstProfile.Category = "Lash Technician"
+	firstProfile.HeroImageURL = "https://example.com/cover.webp"
+	firstProfile.ConcurrentBookingCapacity = 3
+	if err := repository.UpdateClientProfile(ctx, firstClientID, firstProfile); err != nil {
 		t.Fatalf("create first profile: %v", err)
+	}
+	var category, heroImageURL string
+	var concurrentBookingCapacity int
+	if err := pool.QueryRow(ctx, `
+		SELECT category, hero_image_url, concurrent_booking_capacity
+		FROM client_profiles
+		WHERE client_id = $1
+	`, firstClientID).Scan(&category, &heroImageURL, &concurrentBookingCapacity); err != nil {
+		t.Fatalf("load saved profile fields: %v", err)
+	}
+	if category != firstProfile.Category || heroImageURL != firstProfile.HeroImageURL || concurrentBookingCapacity != 3 {
+		t.Fatalf("saved profile fields = %q, %q, %d", category, heroImageURL, concurrentBookingCapacity)
 	}
 	if err := repository.UpdateClientMarket(ctx, firstClientID, UpdateClientMarketInput{
 		CountryCode:  "NG",
@@ -165,6 +181,7 @@ func createProfileHandleTestSchema(t *testing.T, ctx context.Context, pool *pgxp
 			country_code TEXT,
 			locale TEXT,
 			market_configured_at TIMESTAMPTZ,
+			concurrent_booking_capacity SMALLINT NOT NULL DEFAULT 1,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			FOREIGN KEY (client_id, handle_slug)
@@ -185,8 +202,9 @@ func createProfileHandleTestSchema(t *testing.T, ctx context.Context, pool *pgxp
 
 func profileHandleTestInput(businessName string, handleSlug *string) UpdateClientProfileInput {
 	return UpdateClientProfileInput{
-		BusinessName: businessName,
-		HandleSlug:   handleSlug,
+		BusinessName:              businessName,
+		HandleSlug:                handleSlug,
+		ConcurrentBookingCapacity: 1,
 	}
 }
 

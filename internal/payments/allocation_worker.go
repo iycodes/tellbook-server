@@ -37,19 +37,22 @@ func NewAllocationWorker(repository *LedgerRepository, registry *capabilities.Re
 	}
 }
 
-func (w *AllocationWorker) Start(ctx context.Context) {
+func (w *AllocationWorker) Start(ctx context.Context, wakes ...<-chan struct{}) {
 	if w == nil || w.repository == nil || w.capabilities == nil {
 		return
 	}
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	wake := firstWorkerWake(wakes)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			w.runOnce(ctx)
+		case <-wake:
+		case <-timer.C:
 		}
+		w.runOnce(ctx)
+		timer.Reset(jitterDuration(25*time.Second, 0.2))
 	}
 }
 

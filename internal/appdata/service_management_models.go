@@ -3,12 +3,13 @@ package appdata
 import "booking/go-server/internal/money"
 
 type ServiceSectionItem struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	Description   string `json:"description"`
-	CoverImageURL string `json:"cover_image_url,omitempty"`
-	ServiceCount  int    `json:"service_count"`
-	UpdatedLabel  string `json:"updated_label"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Description      string `json:"description"`
+	CoverImageURL    string `json:"cover_image_url,omitempty"`
+	ServiceCount     int    `json:"service_count"`
+	UpdatedLabel     string `json:"updated_label"`
+	replacedImageURL string
 }
 
 type ManagedServiceItem struct {
@@ -37,6 +38,7 @@ type ManagedServiceItem struct {
 	AgreementTiming             string                    `json:"agreement_timing,omitempty"`
 	StandaloneSignatureRequired bool                      `json:"standalone_signature_required"`
 	Instructions                string                    `json:"instructions,omitempty"`
+	replacedImageURL            string
 }
 
 type ServicePricingConfig struct {

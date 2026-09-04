@@ -1,0 +1,1208 @@
+openapi: 3.0.3
+info:
+  title: Tellbook Native Inbox API
+  version: 2.3.0
+  description: Native Tellbook messaging, pre-booking conversations, versioned presentations, and AI authority contracts.
+servers:
+  - url: /v1
+paths:
+  /marketplace/conversations:
+    get:
+      operationId: listMarketplaceConversations
+      parameters:
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Query' }
+      responses:
+        '200': { $ref: '#/components/responses/ConversationList' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/bookings/{bookingID}/conversation:
+    post:
+      operationId: getOrCreateMarketplaceBookingConversation
+      parameters: [{ $ref: '#/components/parameters/BookingID' }]
+      responses:
+        '200': { $ref: '#/components/responses/ConversationDetail' }
+        '201': { $ref: '#/components/responses/ConversationDetail' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/providers/{providerID}/conversation:
+    post:
+      operationId: getOrCreateMarketplaceProviderConversation
+      description: Idempotently opens the authenticated customer's Tellbook conversation with a marketplace-enabled provider before a booking exists.
+      parameters: [{ $ref: '#/components/parameters/ProviderID' }]
+      responses:
+        '200': { $ref: '#/components/responses/ConversationDetail' }
+        '201': { $ref: '#/components/responses/ConversationDetail' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/conversations/{conversationID}:
+    get:
+      operationId: getMarketplaceConversation
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }, { $ref: '#/components/parameters/Limit' }]
+      responses:
+        '200': { $ref: '#/components/responses/ConversationDetail' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/conversations/{conversationID}/messages:
+    get:
+      operationId: listOlderMarketplaceMessages
+      parameters:
+        - { $ref: '#/components/parameters/ConversationID' }
+        - { $ref: '#/components/parameters/Before' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200': { $ref: '#/components/responses/MessagePage' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      operationId: sendMarketplaceMessage
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendMessageRequest' }
+      responses:
+        '200':
+          description: Idempotent replay of an already committed message.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendMessageResponse' }
+        '201':
+          description: Message committed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendMessageResponse' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/conversations/{conversationID}/read:
+    post:
+      operationId: markMarketplaceConversationRead
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MarkReadRequest' }
+      responses:
+        '200':
+          description: Authoritative participant state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ParticipantState' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/conversations/{conversationID}/ai-handoff:
+    post:
+      operationId: customerInboxAIHandoff
+      description: Immediately fences automated replies until an explicit provider action resumes the conversation.
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CustomerAIHandoffCommand' }
+      responses:
+        '200':
+          description: Handoff is active. Replays return the original effective time.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomerAIHandoffResult' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/conversations/{conversationID}/ai-booking:
+    get:
+      operationId: getMarketplaceInboxAIBookingWorkflow
+      description: Returns the authenticated customer's current canonical in-chat booking state. No reservation is created by this read.
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      responses:
+        '200':
+          description: Current in-chat booking workflow.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxAIBookingWorkflow' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/conversations/{conversationID}/ai-booking/start:
+    post:
+      operationId: startMarketplaceInboxAIBooking
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartInboxAIBookingRequest' }
+      responses:
+        '200':
+          description: Canonical service choices were committed to the conversation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxAIBookingActionResult' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/conversations/{conversationID}/ai-booking/availability:
+    post:
+      operationId: offerMarketplaceInboxAIAvailability
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OfferInboxAIAvailabilityRequest' }
+      responses:
+        '200':
+          description: Versioned canonical availability choices were committed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxAIBookingActionResult' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/conversations/{conversationID}/ai-booking/proposals:
+    post:
+      operationId: prepareMarketplaceInboxAIBookingProposal
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PrepareInboxAIBookingProposalRequest' }
+      responses:
+        '200':
+          description: An expiring canonical quote and immutable proposal card were committed. No reservation was created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxAIBookingActionResult' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/conversations/{conversationID}/ai-booking/proposals/{proposalID}/agreement:
+    post:
+      operationId: acceptMarketplaceInboxAIBookingAgreement
+      parameters:
+        - { $ref: '#/components/parameters/ConversationID' }
+        - { $ref: '#/components/parameters/ProposalID' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AcceptInboxAIBookingAgreementRequest' }
+      responses:
+        '200':
+          description: Authenticated customer-created agreement evidence was stored.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxAIBookingActionResult' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/conversations/{conversationID}/ai-booking/proposals/{proposalID}/confirm:
+    post:
+      operationId: confirmMarketplaceInboxAIBookingProposal
+      description: Records immutable authenticated evidence and idempotently consumes the exact current proposal through the canonical booking application service.
+      parameters:
+        - { $ref: '#/components/parameters/ConversationID' }
+        - { $ref: '#/components/parameters/ProposalID' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfirmInboxAIBookingProposalRequest' }
+      responses:
+        '200':
+          description: The exact proposal created one reservation, or an identical replay returned that reservation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxAIBookingConfirmationResult' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/conversations/unread-count:
+    get:
+      operationId: getMarketplaceUnreadCount
+      responses:
+        '200': { $ref: '#/components/responses/UnreadCount' }
+        default: { $ref: '#/components/responses/Error' }
+  /marketplace/conversations/events:
+    get:
+      operationId: streamMarketplaceInboxEvents
+      parameters: [{ $ref: '#/components/parameters/After' }]
+      responses:
+        '200': { $ref: '#/components/responses/EventStream' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/conversations:
+    get:
+      operationId: listProviderConversations
+      parameters:
+        - { $ref: '#/components/parameters/Cursor' }
+        - { $ref: '#/components/parameters/Limit' }
+        - name: state
+          in: query
+          schema: { type: string, enum: [all, unread, archived] }
+        - { $ref: '#/components/parameters/Query' }
+      responses:
+        '200': { $ref: '#/components/responses/ConversationList' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/conversations/{conversationID}:
+    get:
+      operationId: getProviderConversation
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }, { $ref: '#/components/parameters/Limit' }]
+      responses:
+        '200': { $ref: '#/components/responses/ConversationDetail' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/conversations/{conversationID}/messages:
+    get:
+      operationId: listOlderProviderMessages
+      parameters:
+        - { $ref: '#/components/parameters/ConversationID' }
+        - { $ref: '#/components/parameters/Before' }
+        - { $ref: '#/components/parameters/Limit' }
+      responses:
+        '200': { $ref: '#/components/responses/MessagePage' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      operationId: sendProviderMessage
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendMessageRequest' }
+      responses:
+        '200':
+          description: Idempotent replay of an already committed message.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendMessageResponse' }
+        '201':
+          description: Message committed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendMessageResponse' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/conversations/{conversationID}/ai-drafts:
+    post:
+      operationId: generateProviderInboxAIDraft
+      description: Queues an auditable draft for provider review. This operation never sends a message or mutates a booking.
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GenerateAIDraftRequest' }
+      responses:
+        '200':
+          description: Idempotent replay of an already completed draft request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AIDraftResponse' }
+        '202':
+          description: AI reply draft accepted for durable background generation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AIDraftResponse' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/ai-policy:
+    get:
+      operationId: getProviderInboxAIPolicy
+      responses:
+        '200':
+          description: Provider policy, rollout availability, and bounded published-service choices.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxAIPolicy' }
+        default: { $ref: '#/components/responses/Error' }
+    put:
+      operationId: updateProviderInboxAIPolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateInboxAIPolicyRequest' }
+      responses:
+        '200':
+          description: Updated provider policy.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxAIPolicy' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/conversations/{conversationID}/ai-control:
+    get:
+      operationId: getProviderInboxAIControl
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      responses:
+        '200':
+          description: Effective per-conversation mode and takeover state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxAIConversationControl' }
+        default: { $ref: '#/components/responses/Error' }
+    put:
+      operationId: updateProviderInboxAIControl
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateInboxAIConversationControlRequest' }
+      responses:
+        '200':
+          description: Updated control. Takeover and pause fence older sessions transactionally.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxAIConversationControl' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/conversations/{conversationID}/ai-session:
+    get:
+      operationId: getProviderInboxAISession
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      responses:
+        '200':
+          description: Current bounded structured workflow state, when one exists.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InboxAISessionResponse' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/conversations/{conversationID}/ai-drafts/{runID}/discard:
+    post:
+      operationId: discardProviderInboxAIDraft
+      description: Records that a provider rejected a draft or that its source conversation became stale.
+      parameters:
+        - { $ref: '#/components/parameters/ConversationID' }
+        - name: runID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DiscardAIDraftRequest' }
+      responses:
+        '204': { description: Draft outcome recorded. }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/conversations/{conversationID}/ai-drafts/{runID}:
+    get:
+      operationId: getProviderInboxAIDraft
+      description: Reads the authoritative status and result of a queued AI reply draft.
+      parameters:
+        - { $ref: '#/components/parameters/ConversationID' }
+        - name: runID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Current AI reply draft state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AIDraftResponse' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/conversations/{conversationID}/read:
+    post:
+      operationId: markProviderConversationRead
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MarkReadRequest' }
+      responses:
+        '200':
+          description: Authoritative participant state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ParticipantState' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/conversations/{conversationID}/archive:
+    post:
+      operationId: archiveProviderConversation
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      responses:
+        '200':
+          description: Authoritative participant state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ParticipantState' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/conversations/{conversationID}/unarchive:
+    post:
+      operationId: unarchiveProviderConversation
+      parameters: [{ $ref: '#/components/parameters/ConversationID' }]
+      responses:
+        '200':
+          description: Authoritative participant state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ParticipantState' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/unread-count:
+    get:
+      operationId: getProviderUnreadCount
+      responses:
+        '200': { $ref: '#/components/responses/UnreadCount' }
+        default: { $ref: '#/components/responses/Error' }
+  /app/inbox/events:
+    get:
+      operationId: streamProviderInboxEvents
+      parameters: [{ $ref: '#/components/parameters/After' }]
+      responses:
+        '200': { $ref: '#/components/responses/EventStream' }
+        default: { $ref: '#/components/responses/Error' }
+components:
+  parameters:
+    ConversationID:
+      name: conversationID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    BookingID:
+      name: bookingID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ProposalID:
+      name: proposalID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ProviderID:
+      name: providerID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    Before:
+      name: before
+      in: query
+      required: true
+      schema: { type: string }
+    After:
+      name: after
+      in: query
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+    Query:
+      name: query
+      in: query
+      schema: { type: string, maxLength: 160 }
+  responses:
+    ConversationList:
+      description: Bounded conversation list snapshot.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ConversationListResponse' }
+    ConversationDetail:
+      description: Authorized bounded conversation snapshot.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ConversationDetailResponse' }
+    MessagePage:
+      description: Bounded message page.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/MessagePageResponse' }
+    UnreadCount:
+      description: Authoritative unread count snapshot.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/UnreadCountResponse' }
+    EventStream:
+      description: Authenticated inbox event stream.
+      content:
+        text/event-stream:
+          schema: { type: string }
+    Error:
+      description: Structured API error.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/APIErrorResponse' }
+  schemas:
+    ActorType: { type: string, enum: [provider, marketplace_customer, ai, system] }
+    Channel: { type: string, enum: [tellbook] }
+    InboxAIMode:
+      type: string
+      description: The provider-controlled inbox mode. Manual is the required default.
+      enum: [manual, semi_pilot, autopilot]
+    InboxAISessionState:
+      type: string
+      enum:
+        - qualifying
+        - service_identified
+        - link_ready
+        - link_sent
+        - collecting_preferences
+        - collecting_customer_details
+        - offering_slots
+        - preparing_proposal
+        - awaiting_before_booking_agreement
+        - awaiting_confirmation
+        - creating_reservation
+        - reservation_created
+        - awaiting_payment
+        - awaiting_after_payment_agreement
+        - awaiting_provider_confirmation
+        - completed
+        - handoff
+        - provider_takeover
+        - expired
+        - failed
+    InboxAIActionName:
+      type: string
+      description: Version-one audited read actions and customer-authorized commands. Reservation confirmation is not a model tool.
+      enum:
+        - list_relevant_services
+        - get_service_details
+        - get_booking_link
+        - search_availability
+        - get_booking_requirements
+        - refresh_booking_proposal
+        - confirm_booking_proposal
+        - customer_handoff
+    InboxAIServiceOption:
+      type: object
+      additionalProperties: false
+      required: [id, title, fulfillment_mode, currency_code, base_amount_minor, enabled, eligible_modes]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        fulfillment_mode: { type: string, enum: [provider_location, customer_location, virtual] }
+        currency_code: { type: string, pattern: '^[A-Z]{3}$' }
+        base_amount_minor: { type: integer, format: int64, minimum: 0 }
+        enabled: { type: boolean }
+        eligible_modes:
+          type: array
+          uniqueItems: true
+          items: { type: string, enum: [semi_pilot, autopilot] }
+        autopilot_block_reason: { type: string }
+    InboxAIPolicy:
+      type: object
+      additionalProperties: false
+      required: [default_mode, enabled_service_ids, paused, max_turns, inactivity_timeout_minutes, revision, automation_available, services]
+      properties:
+        default_mode: { $ref: '#/components/schemas/InboxAIMode' }
+        enabled_service_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        paused: { type: boolean }
+        max_turns: { type: integer, minimum: 1, maximum: 30 }
+        inactivity_timeout_minutes: { type: integer, minimum: 5, maximum: 1440 }
+        revision: { type: integer, format: int64, minimum: 0 }
+        automation_available: { type: boolean }
+        services:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/InboxAIServiceOption' }
+        updated_at: { type: string, format: date-time }
+    UpdateInboxAIPolicyRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_revision, default_mode, enabled_service_ids, paused, max_turns, inactivity_timeout_minutes]
+      properties:
+        expected_revision: { type: integer, format: int64, minimum: 0 }
+        default_mode: { $ref: '#/components/schemas/InboxAIMode' }
+        enabled_service_ids:
+          type: array
+          maxItems: 100
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        paused: { type: boolean }
+        max_turns: { type: integer, minimum: 1, maximum: 30 }
+        inactivity_timeout_minutes: { type: integer, minimum: 5, maximum: 1440 }
+    InboxAIConversationControl:
+      type: object
+      additionalProperties: false
+      required: [conversation_id, configured_mode, effective_mode, state, policy_revision, revision]
+      properties:
+        conversation_id: { type: string, format: uuid }
+        mode_override: { $ref: '#/components/schemas/InboxAIMode' }
+        configured_mode: { $ref: '#/components/schemas/InboxAIMode' }
+        effective_mode: { $ref: '#/components/schemas/InboxAIMode' }
+        state: { type: string, enum: [active, paused, provider_takeover, handoff] }
+        reason: { type: string, maxLength: 500 }
+        policy_revision: { type: integer, format: int64, minimum: 0 }
+        revision: { type: integer, format: int64, minimum: 0 }
+        updated_at: { type: string, format: date-time }
+    UpdateInboxAIConversationControlRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_revision, mode_override, state, reason]
+      properties:
+        expected_revision: { type: integer, format: int64, minimum: 0 }
+        mode_override: { type: string, enum: ['', manual, semi_pilot, autopilot] }
+        state: { type: string, enum: [active, paused, provider_takeover] }
+        reason: { type: string, maxLength: 500 }
+    InboxAISession:
+      type: object
+      additionalProperties: false
+      required: [id, conversation_id, mode, state, last_processed_message_sequence, booking_link_revision, policy_revision, control_revision, turn_count, max_turns, revision, expires_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        conversation_id: { type: string, format: uuid }
+        mode: { type: string, enum: [semi_pilot, autopilot] }
+        state: { $ref: '#/components/schemas/InboxAISessionState' }
+        selected_service_id: { type: string, format: uuid }
+        last_processed_message_sequence: { type: integer, format: int64, minimum: 0 }
+        booking_link_url: { type: string, maxLength: 1000 }
+        booking_link_revision: { type: integer, format: int64, minimum: 0 }
+        policy_revision: { type: integer, format: int64, minimum: 1 }
+        control_revision: { type: integer, format: int64, minimum: 0 }
+        turn_count: { type: integer, minimum: 0 }
+        max_turns: { type: integer, minimum: 1, maximum: 30 }
+        handoff_reason: { type: string, maxLength: 500 }
+        revision: { type: integer, format: int64, minimum: 1 }
+        expires_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    InboxAISessionResponse:
+      type: object
+      additionalProperties: false
+      required: [session]
+      properties:
+        session:
+          allOf: [{ $ref: '#/components/schemas/InboxAISession' }]
+          nullable: true
+    InboxAIBookingRequirements:
+      type: object
+      additionalProperties: false
+      required: [missing_customer_fields, customer_location_required, agreement_required, email_reminder_default, whatsapp_reminder_default]
+      properties:
+        missing_customer_fields:
+          type: array
+          uniqueItems: true
+          items: { type: string, enum: [full_name, email, phone] }
+        customer_location_required: { type: boolean }
+        agreement_required: { type: boolean }
+        email_reminder_default: { type: boolean }
+        whatsapp_reminder_default: { type: boolean }
+        agreement_title: { type: string }
+        agreement_confirmation_method: { type: string, enum: [confirmation, signature] }
+    InboxAIBookingAgreement:
+      type: object
+      additionalProperties: false
+      required: [required, completed]
+      properties:
+        required: { type: boolean }
+        completed: { type: boolean }
+        title: { type: string }
+        confirmation_method: { type: string, enum: [confirmation, signature] }
+        rendered_html: { type: string }
+    InboxAIBookingProposal:
+      type: object
+      additionalProperties: false
+      required: [id, revision, hash, expires_at, service_id, service_title, starts_at, ends_at, timezone, fulfillment_mode, location_label, currency_code, total_amount_minor, price_label, payment_requirement, agreement_requirement, agreement, confirmed]
+      properties:
+        id: { type: string, format: uuid }
+        revision: { type: integer, format: int64, minimum: 1 }
+        hash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        expires_at: { type: string, format: date-time }
+        service_id: { type: string, format: uuid }
+        service_title: { type: string }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        timezone: { type: string }
+        fulfillment_mode: { type: string, enum: [provider_location, customer_location, virtual] }
+        location_label: { type: string }
+        currency_code: { type: string, pattern: '^[A-Z]{3}$' }
+        total_amount_minor: { type: string, pattern: '^(0|[1-9][0-9]*)$' }
+        price_label: { type: string }
+        payment_requirement: { type: string }
+        agreement_requirement: { type: string }
+        agreement: { $ref: '#/components/schemas/InboxAIBookingAgreement' }
+        confirmed: { type: boolean }
+        confirmation_id: { type: string, format: uuid }
+        confirmed_at: { type: string, format: date-time }
+        contact_details_confirmed: { type: boolean }
+        email_reminder_consent: { type: boolean }
+        whatsapp_consent: { type: boolean }
+        sms_consent: { type: boolean }
+    InboxAIBookingWorkflow:
+      type: object
+      additionalProperties: false
+      required: [available, mode, state, revision, services, requirements]
+      properties:
+        available: { type: boolean }
+        mode: { $ref: '#/components/schemas/InboxAIMode' }
+        state: { $ref: '#/components/schemas/InboxAISessionState' }
+        revision: { type: integer, format: int64, minimum: 0 }
+        action_id: { type: string, format: uuid }
+        services:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/InboxAIServiceOption' }
+        requirements: { $ref: '#/components/schemas/InboxAIBookingRequirements' }
+        proposal: { $ref: '#/components/schemas/InboxAIBookingProposal' }
+        reservation: { $ref: '#/components/schemas/InboxAIBookingReservation' }
+    InboxAIBookingReservation:
+      type: object
+      additionalProperties: false
+      required: [booking_id, booking_status, next_step, href]
+      properties:
+        booking_id: { type: string, format: uuid }
+        booking_status: { type: string }
+        next_step: { type: string, enum: [payment, agreement, provider_confirmation, complete] }
+        href: { type: string, maxLength: 2048 }
+        expires_at: { type: string, format: date-time }
+    StartInboxAIBookingRequest:
+      type: object
+      additionalProperties: false
+      required: [idempotency_key]
+      properties:
+        idempotency_key: { type: string, format: uuid }
+    OfferInboxAIAvailabilityRequest:
+      type: object
+      additionalProperties: false
+      required: [idempotency_key, action_id, expected_revision, service_id, from, days]
+      properties:
+        idempotency_key: { type: string, format: uuid }
+        action_id: { type: string, format: uuid }
+        expected_revision: { type: integer, format: int64, minimum: 1 }
+        service_id: { type: string, format: uuid }
+        from: { type: string, format: date }
+        days: { type: integer, minimum: 1, maximum: 14 }
+    PrepareInboxAIBookingProposalRequest:
+      type: object
+      additionalProperties: false
+      required: [idempotency_key, action_id, expected_revision, service_id, starts_at]
+      properties:
+        idempotency_key: { type: string, format: uuid }
+        action_id: { type: string, format: uuid }
+        expected_revision: { type: integer, format: int64, minimum: 1 }
+        service_id: { type: string, format: uuid }
+        starts_at: { type: string, format: date-time }
+        customer_location_token: { type: string }
+    AcceptInboxAIBookingAgreementRequest:
+      type: object
+      additionalProperties: false
+      required: [idempotency_key, proposal_revision, proposal_hash, accepted]
+      properties:
+        idempotency_key: { type: string, format: uuid }
+        proposal_revision: { type: integer, format: int64, minimum: 1 }
+        proposal_hash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        accepted: { type: boolean }
+        full_name: { type: string, maxLength: 160 }
+        signature_data_url: { type: string }
+    ConfirmInboxAIBookingProposalRequest:
+      type: object
+      additionalProperties: false
+      required: [idempotency_key, proposal_revision, proposal_hash, contact_details_confirmed, email_reminder_consent, whatsapp_consent, sms_consent]
+      properties:
+        idempotency_key: { type: string, format: uuid }
+        proposal_revision: { type: integer, format: int64, minimum: 1 }
+        proposal_hash: { type: string, pattern: '^[a-f0-9]{64}$' }
+        contact_details_confirmed: { type: boolean }
+        email_reminder_consent: { type: boolean }
+        whatsapp_consent: { type: boolean }
+        sms_consent: { type: boolean }
+    InboxAIBookingActionResult:
+      type: object
+      additionalProperties: false
+      required: [workflow, replayed]
+      properties:
+        workflow: { $ref: '#/components/schemas/InboxAIBookingWorkflow' }
+        message: { $ref: '#/components/schemas/Message' }
+        conversation: { $ref: '#/components/schemas/ConversationSummary' }
+        replayed: { type: boolean }
+    InboxAIBookingConfirmationResult:
+      type: object
+      additionalProperties: false
+      required: [workflow, messages, confirmation_id, confirmed_at, reservation_created, booking_id, booking_status, next_step, replayed]
+      properties:
+        workflow: { $ref: '#/components/schemas/InboxAIBookingWorkflow' }
+        messages:
+          type: array
+          minItems: 2
+          maxItems: 3
+          items: { $ref: '#/components/schemas/Message' }
+        conversation: { $ref: '#/components/schemas/ConversationSummary' }
+        confirmation_id: { type: string, format: uuid }
+        confirmed_at: { type: string, format: date-time }
+        reservation_created: { type: boolean, enum: [true] }
+        booking_id: { type: string, format: uuid }
+        booking_status: { type: string }
+        next_step: { type: string, enum: [payment, agreement, provider_confirmation, complete] }
+        replayed: { type: boolean }
+    CustomerAIHandoffCommand:
+      type: object
+      description: Reserved authenticated customer command that permanently fences queued automated work until provider action.
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason: { type: string, enum: [talk_to_provider] }
+    CustomerAIHandoffResult:
+      type: object
+      additionalProperties: false
+      required: [conversation_id, status, effective_at]
+      properties:
+        conversation_id: { type: string, format: uuid }
+        status: { type: string, enum: [handoff] }
+        effective_at: { type: string, format: date-time }
+    Counterparty:
+      type: object
+      additionalProperties: false
+      required: [id, kind, name]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string, enum: [provider, marketplace_customer] }
+        name: { type: string }
+        handle: { type: string }
+        avatar_url: { type: string, format: uri }
+    BookingContext:
+      type: object
+      additionalProperties: false
+      required: [id, service_title, status, starts_at, timezone]
+      properties:
+        id: { type: string, format: uuid }
+        service_title: { type: string }
+        status: { type: string }
+        starts_at: { type: string, format: date-time }
+        timezone: { type: string }
+    ConversationSummary:
+      type: object
+      additionalProperties: false
+      required: [id, channel, counterparty, preview, unread_count, provider_handoff_requested, booking_contexts, archived, disabled, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        channel: { $ref: '#/components/schemas/Channel' }
+        counterparty: { $ref: '#/components/schemas/Counterparty' }
+        preview: { type: string }
+        unread_count: { type: integer, minimum: 0 }
+        provider_handoff_requested: { type: boolean }
+        last_message_at: { type: string, format: date-time, nullable: true }
+        last_message_sender_type:
+          allOf: [{ $ref: '#/components/schemas/ActorType' }]
+          nullable: true
+        booking_contexts:
+          type: array
+          maxItems: 10
+          items: { $ref: '#/components/schemas/BookingContext' }
+        archived: { type: boolean }
+        disabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    Message:
+      type: object
+      additionalProperties: false
+      required: [id, conversation_id, sender_type, content, message_type, sent_at]
+      properties:
+        id: { type: string, format: uuid }
+        conversation_id: { type: string, format: uuid }
+        sender_type: { $ref: '#/components/schemas/ActorType' }
+        sender_id: { type: string, format: uuid }
+        client_message_id: { type: string, format: uuid }
+        booking_id: { type: string, format: uuid }
+        content: { type: string, maxLength: 4000 }
+        message_type: { type: string, enum: [text] }
+        presentation:
+          oneOf:
+            - { $ref: '#/components/schemas/BookingLinkPresentation' }
+            - { $ref: '#/components/schemas/ServiceChoicesPresentation' }
+            - { $ref: '#/components/schemas/AvailabilityChoicesPresentation' }
+            - { $ref: '#/components/schemas/BookingProposalPresentation' }
+            - { $ref: '#/components/schemas/ReservationCreatedPresentation' }
+            - { $ref: '#/components/schemas/BookingNextStepPresentation' }
+            - { $ref: '#/components/schemas/ReservationExpiredPresentation' }
+        sent_at: { type: string, format: date-time }
+    PresentationVersion:
+      type: integer
+      enum: [1]
+    BookingLinkPresentation:
+      type: object
+      additionalProperties: false
+      required: [kind, version, data]
+      properties:
+        kind: { type: string, enum: [booking_link] }
+        version: { $ref: '#/components/schemas/PresentationVersion' }
+        data:
+          type: object
+          additionalProperties: false
+          required: [action_id, provider_id, provider_handle, href, label]
+          properties:
+            action_id: { type: string, format: uuid }
+            provider_id: { type: string, format: uuid }
+            provider_handle: { type: string }
+            service_id: { type: string, format: uuid }
+            service_title: { type: string }
+            href: { type: string, maxLength: 2048 }
+            label: { type: string }
+    ServiceChoice:
+      type: object
+      additionalProperties: false
+      required: [service_id, title, duration_minutes, price_label, fulfillment_mode]
+      properties:
+        service_id: { type: string, format: uuid }
+        title: { type: string }
+        duration_minutes: { type: integer, minimum: 1 }
+        price_label: { type: string }
+        fulfillment_mode: { type: string, enum: [provider_location, customer_location, virtual] }
+    ServiceChoicesPresentation:
+      type: object
+      additionalProperties: false
+      required: [kind, version, data]
+      properties:
+        kind: { type: string, enum: [service_choices] }
+        version: { $ref: '#/components/schemas/PresentationVersion' }
+        data:
+          type: object
+          additionalProperties: false
+          required: [action_id, session_revision, choices]
+          properties:
+            action_id: { type: string, format: uuid }
+            session_revision: { type: integer, minimum: 1 }
+            choices:
+              type: array
+              minItems: 1
+              maxItems: 6
+              items: { $ref: '#/components/schemas/ServiceChoice' }
+    AvailabilityChoice:
+      type: object
+      additionalProperties: false
+      required: [slot_id, starts_at, ends_at, label]
+      properties:
+        slot_id: { type: string }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        label: { type: string }
+    AvailabilityChoicesPresentation:
+      type: object
+      additionalProperties: false
+      required: [kind, version, data]
+      properties:
+        kind: { type: string, enum: [availability_choices] }
+        version: { $ref: '#/components/schemas/PresentationVersion' }
+        data:
+          type: object
+          additionalProperties: false
+          required: [action_id, session_revision, service_id, timezone, expires_at, choices]
+          properties:
+            action_id: { type: string, format: uuid }
+            session_revision: { type: integer, minimum: 1 }
+            service_id: { type: string, format: uuid }
+            timezone: { type: string }
+            expires_at: { type: string, format: date-time }
+            choices:
+              type: array
+              minItems: 1
+              maxItems: 12
+              items: { $ref: '#/components/schemas/AvailabilityChoice' }
+    BookingProposalPresentation:
+      type: object
+      additionalProperties: false
+      required: [kind, version, data]
+      properties:
+        kind: { type: string, enum: [booking_proposal] }
+        version: { $ref: '#/components/schemas/PresentationVersion' }
+        data:
+          type: object
+          additionalProperties: false
+          required: [proposal_id, proposal_hash, revision, expires_at, service_id, service_title, starts_at, ends_at, timezone, fulfillment_mode, location_label, price_label, payment_requirement, agreement_requirement, action_label]
+          properties:
+            proposal_id: { type: string, format: uuid }
+            proposal_hash: { type: string, pattern: '^[a-f0-9]{64}$' }
+            revision: { type: integer, minimum: 1 }
+            expires_at: { type: string, format: date-time }
+            service_id: { type: string, format: uuid }
+            service_title: { type: string }
+            starts_at: { type: string, format: date-time }
+            ends_at: { type: string, format: date-time }
+            timezone: { type: string }
+            fulfillment_mode: { type: string, enum: [provider_location, customer_location, virtual] }
+            location_label: { type: string }
+            price_label: { type: string }
+            payment_requirement: { type: string }
+            agreement_requirement: { type: string }
+            action_label: { type: string }
+            confirmed: { type: boolean }
+    ReservationCreatedPresentation:
+      type: object
+      additionalProperties: false
+      required: [kind, version, data]
+      properties:
+        kind: { type: string, enum: [reservation_created] }
+        version: { $ref: '#/components/schemas/PresentationVersion' }
+        data:
+          type: object
+          additionalProperties: false
+          required: [booking_id, status, status_label, service_title, starts_at, ends_at, timezone]
+          properties:
+            booking_id: { type: string, format: uuid }
+            status: { type: string }
+            status_label: { type: string }
+            service_title: { type: string }
+            starts_at: { type: string, format: date-time }
+            ends_at: { type: string, format: date-time }
+            timezone: { type: string }
+            expires_at: { type: string, format: date-time }
+    BookingNextStepPresentation:
+      type: object
+      additionalProperties: false
+      required: [kind, version, data]
+      properties:
+        kind: { type: string, enum: [booking_next_step] }
+        version: { $ref: '#/components/schemas/PresentationVersion' }
+        data:
+          type: object
+          additionalProperties: false
+          required: [booking_id, next_step, label]
+          properties:
+            booking_id: { type: string, format: uuid }
+            next_step: { type: string, enum: [payment, agreement, provider_confirmation, complete] }
+            label: { type: string }
+            href: { type: string, maxLength: 2048 }
+            expires_at: { type: string, format: date-time }
+    ReservationExpiredPresentation:
+      type: object
+      additionalProperties: false
+      required: [kind, version, data]
+      properties:
+        kind: { type: string, enum: [reservation_expired] }
+        version: { $ref: '#/components/schemas/PresentationVersion' }
+        data:
+          type: object
+          additionalProperties: false
+          required: [booking_id, reason, label, expired_at, href]
+          properties:
+            booking_id: { type: string, format: uuid }
+            reason: { type: string, enum: [payment_deadline_elapsed] }
+            label: { type: string }
+            expired_at: { type: string, format: date-time }
+            href: { type: string, maxLength: 2048 }
+    ConversationListResponse:
+      type: object
+      additionalProperties: false
+      required: [items, unread_total, sync_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/ConversationSummary' }
+        unread_total: { type: integer, minimum: 0 }
+        next_cursor: { type: string }
+        sync_cursor: { type: string }
+    ConversationDetailResponse:
+      type: object
+      additionalProperties: false
+      required: [conversation, messages, sync_cursor, ai_drafts_available]
+      properties:
+        conversation: { $ref: '#/components/schemas/ConversationSummary' }
+        messages:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        next_before_cursor: { type: string }
+        sync_cursor: { type: string }
+        ai_drafts_available: { type: boolean }
+    AIWarning:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+    AIDraftResponse:
+      type: object
+      additionalProperties: false
+      required: [run_id, status, draft, needs_provider_input, warnings, replayed, created_at]
+      properties:
+        run_id: { type: string, format: uuid }
+        status: { type: string, enum: [queued, processing, completed, failed] }
+        draft: { type: string, maxLength: 4000 }
+        needs_provider_input: { type: boolean }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/AIWarning' }
+        source_message_id: { type: string, format: uuid }
+        replayed: { type: boolean }
+        created_at: { type: string, format: date-time }
+        error_code: { type: string }
+    GenerateAIDraftRequest:
+      type: object
+      additionalProperties: false
+      required: [client_request_id]
+      properties:
+        client_request_id: { type: string, format: uuid }
+    DiscardAIDraftRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason: { type: string, enum: [discarded, stale] }
+    MessagePageResponse:
+      type: object
+      additionalProperties: false
+      required: [items, sync_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        next_before_cursor: { type: string }
+        sync_cursor: { type: string }
+    SendMessageRequest:
+      type: object
+      additionalProperties: false
+      required: [client_message_id, content]
+      properties:
+        client_message_id: { type: string, format: uuid }
+        content: { type: string, minLength: 1, maxLength: 4000 }
+        booking_id: { type: string, format: uuid }
+        ai_run_id: { type: string, format: uuid }
+    SendMessageResponse:
+      type: object
+      additionalProperties: false
+      required: [message, conversation, replayed]
+      properties:
+        message: { $ref: '#/components/schemas/Message' }
+        conversation: { $ref: '#/components/schemas/ConversationSummary' }
+        replayed: { type: boolean }
+    MarkReadRequest:
+      type: object
+      additionalProperties: false
+      required: [message_id]
+      properties:
+        message_id: { type: string, format: uuid }
+    ParticipantState:
+      type: object
+      additionalProperties: false
+      required: [conversation_id, participant_type, participant_id, last_read_cursor, archived, conversation_unread_count, unread_total, sync_cursor]
+      properties:
+        conversation_id: { type: string, format: uuid }
+        participant_type: { type: string, enum: [provider, marketplace_customer] }
+        participant_id: { type: string, format: uuid }
+        last_read_cursor: { type: string }
+        last_read_at: { type: string, format: date-time, nullable: true }
+        archived: { type: boolean }
+        conversation_unread_count: { type: integer, minimum: 0 }
+        unread_total: { type: integer, minimum: 0 }
+        sync_cursor: { type: string }
+    UnreadCountResponse:
+      type: object
+      additionalProperties: false
+      required: [unread_total, sync_cursor]
+      properties:
+        unread_total: { type: integer, minimum: 0 }
+        sync_cursor: { type: string }
+    RealtimeEvent:
+      type: object
+      additionalProperties: false
+      required: [cursor, type, conversation_id, conversation, unread_total, created_at]
+      properties:
+        cursor: { type: string }
+        type:
+          type: string
+          enum: [conversation.created, conversation.updated, message.created, read.updated, participant.archive_updated, conversation.disabled, ai.control_updated, ai.session_updated]
+        conversation_id: { type: string, format: uuid }
+        conversation: { $ref: '#/components/schemas/ConversationSummary' }
+        message: { $ref: '#/components/schemas/Message' }
+        participant_type: { type: string, enum: [provider, marketplace_customer] }
+        unread_total: { type: integer, minimum: 0 }
+        created_at: { type: string, format: date-time }
+    RealtimeReset:
+      type: object
+      additionalProperties: false
+      required: [cursor, reason]
+      properties:
+        cursor: { type: string }
+        reason: { type: string, enum: [cursor_expired, broker_overflow] }
+    APIError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [invalid_request, invalid_cursor, invalid_content, invalid_booking_context, unauthorized, not_found, not_available, rate_limited, idempotency_conflict, conversation_disabled, revision_conflict, automation_unavailable, automation_blocked, service_unavailable, ai_unavailable, ai_busy, ai_draft_in_progress, ai_draft_closed, ai_draft_stale, ai_generation_failed, stream_unsupported, stream_deadline_failed, server_unavailable]
+        message: { type: string }
+    APIErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error: { $ref: '#/components/schemas/APIError' }

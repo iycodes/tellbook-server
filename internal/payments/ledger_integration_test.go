@@ -108,6 +108,16 @@ func TestLedgerPaymentToPayoutLifecycle(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("CreatePaymentAttempt() created=%v error=%v", created, err)
 	}
+	var initialReconciliationJobCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)::int FROM financial_jobs
+		WHERE kind=$1 AND aggregate_id=$2
+	`, paymentReconciliationJobKind, payment.ID).Scan(&initialReconciliationJobCount); err != nil {
+		t.Fatalf("load initial durable payment reconciliation job: %v", err)
+	}
+	if initialReconciliationJobCount != 1 {
+		t.Fatalf("initial durable payment reconciliation jobs = %d, want 1", initialReconciliationJobCount)
+	}
 	repeated, created, err := service.CreatePaymentAttempt(ctx, input)
 	if err != nil || created || repeated.ID != payment.ID {
 		t.Fatalf("repeated payment = %#v, created=%v error=%v", repeated, created, err)
@@ -153,13 +163,15 @@ func TestLedgerPaymentToPayoutLifecycle(t *testing.T) {
 	if err != nil || !created || balancePayment.Purpose != PaymentPurposeBalance || balancePayment.AmountMinor != 7000 {
 		t.Fatalf("balance payment = %#v, created=%v error=%v", balancePayment, created, err)
 	}
-	claimedPayments, err := repository.ClaimStalePayments(ctx, "integration-payment-reconciler", time.Now().UTC().Add(time.Second), 10, time.Minute)
-	if err != nil || !containsPayment(claimedPayments, balancePayment.ID) {
-		t.Fatalf("claimed payments = %#v, error=%v", claimedPayments, err)
+	var reconciliationJobCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)::int FROM financial_jobs
+		WHERE kind=$1 AND aggregate_id=$2
+	`, paymentReconciliationJobKind, balancePayment.ID).Scan(&reconciliationJobCount); err != nil {
+		t.Fatalf("load durable payment reconciliation job: %v", err)
 	}
-	claimedAgain, err := repository.ClaimStalePayments(ctx, "second-payment-reconciler", time.Now().UTC().Add(time.Second), 10, time.Minute)
-	if err != nil || containsPayment(claimedAgain, balancePayment.ID) {
-		t.Fatalf("second payment claim = %#v, error=%v", claimedAgain, err)
+	if reconciliationJobCount != 1 {
+		t.Fatalf("durable payment reconciliation jobs = %d, want 1", reconciliationJobCount)
 	}
 	balancePayment, err = repository.TransitionPayment(ctx, balancePayment.ID, balancePayment.Version, PaymentStatusPending, PaymentTransitionUpdate{})
 	if err != nil {
@@ -381,6 +393,20 @@ func TestLedgerPaymentToPayoutLifecycle(t *testing.T) {
 	if _, err := payoutService.Reconcile(ctx, payout); err != nil {
 		t.Fatalf("Reconcile(successful) error = %v", err)
 	}
+	summaryNow := time.Now().UTC()
+	summary, err := repository.GetPayoutSummary(
+		ctx, clientID, "NGN", summaryNow.Add(-24*time.Hour), summaryNow.Add(24*time.Hour),
+	)
+	if err != nil || summary.PeriodPayoutCount != 1 || summary.PeriodPaidOutAmountMinor != 2800 ||
+		summary.ActiveDestinationCount != 1 || summary.EligibleAllocationCount != 0 {
+		t.Fatalf("GetPayoutSummary() summary=%#v error=%v", summary, err)
+	}
+	outside, err := repository.GetPayoutSummary(
+		ctx, clientID, "NGN", summaryNow.AddDate(1, 0, 0), summaryNow.AddDate(1, 0, 1),
+	)
+	if err != nil || outside.PeriodPayoutCount != 0 || outside.PeriodPaidOutAmountMinor != 0 {
+		t.Fatalf("GetPayoutSummary(outside period) summary=%#v error=%v", outside, err)
+	}
 	var inFlightDebtStatus string
 	if err := pool.QueryRow(ctx, `SELECT status FROM business_balance_entries WHERE payment_adjustment_id = $1`, inFlightAdjustment.ID).Scan(&inFlightDebtStatus); err != nil || inFlightDebtStatus != "open" {
 		t.Fatalf("in-flight adjustment debt status=%q error=%v", inFlightDebtStatus, err)
@@ -443,15 +469,6 @@ func (p *integrationPayoutProvider) ReconcilePayout(_ context.Context, payout Pa
 func containsClaimedAggregate(jobs []FinancialJob, aggregateID uuid.UUID) bool {
 	for _, job := range jobs {
 		if job.AggregateID == aggregateID {
-			return true
-		}
-	}
-	return false
-}
-
-func containsPayment(payments []FinancialPayment, paymentID uuid.UUID) bool {
-	for _, payment := range payments {
-		if payment.ID == paymentID {
 			return true
 		}
 	}

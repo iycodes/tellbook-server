@@ -1,9 +1,12 @@
 package config
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -11,15 +14,40 @@ import (
 	"time"
 
 	"booking/go-server/internal/secure"
+	"booking/go-server/internal/tessaconfig"
+	"github.com/google/uuid"
 )
 
 type Config struct {
 	AppEnv                                string
+	ProcessRole                           string
 	HTTPAddr                              string
+	SSEMaxConnections                     int
+	SSEMaxConnectionsPerIP                int
+	PaymentSSEMaxConnectionsPerToken      int
 	ClientPublicBaseURL                   string
+	MarketplacePublicBaseURL              string
 	DefaultAIProvider                     string
 	AgreementAIProvider                   string
-	InboxAIProvider                       string
+	InboxAIDraftsEnabled                  bool
+	InboxAIProviderAllowlist              []string
+	InboxAIAutomationEnabled              bool
+	InboxAIAutomationProviderAllowlist    []string
+	InboxAIMaxConcurrency                 int
+	InboxAISemiPilotReplyDelay            time.Duration
+	InboxAIAutopilotPaymentWindow         time.Duration
+	TessaAIEnabled                        bool
+	TessaAIProviderAllowlist              []string
+	TessaAIPrimaryProvider                string
+	TessaAIFallbackProvider               string
+	TessaAIPrimaryRequestTimeout          time.Duration
+	TessaAIFallbackRequestTimeout         time.Duration
+	TessaAITurnTimeout                    time.Duration
+	TessaAIWorkerConcurrency              int
+	TessaAIMaxInputTokens                 int
+	TessaAIMaxOutputTokens                int
+	TessaAINoticeRevision                 string
+	TessaAIExternalProcessingApproved     bool
 	HostedAIProvider                      string
 	LLMBaseURL                            string
 	LLMChatCompletions                    string
@@ -41,15 +69,54 @@ type Config struct {
 	OpenAITimeout                         time.Duration
 	OpenAIMaxOutputTokens                 int64
 	OpenAIResponseLogFile                 string
+	OpenAICompatBaseURL                   string
+	OpenAICompatChatCompletions           string
+	OpenAICompatModel                     string
+	OpenAICompatAPIKey                    string
+	OpenAICompatTimeout                   time.Duration
+	OpenAICompatMaxOutputTokens           int
+	OpenAICompatTokenLimitField           string
+	OpenAICompatTemperature               *float64
+	OpenAICompatTopP                      *float64
 	HTTPRateLimitPerMinute                int
 	HTTPRateLimitBurst                    int
 	AIRateLimitPerMinute                  int
 	AIRateLimitBurst                      int
 	LocationRateLimitPerMinute            int
 	LocationRateLimitBurst                int
+	MarketplaceAuthRateLimitPerMinute     int
+	MarketplaceAuthRateLimitBurst         int
+	RedisURL                              string
+	RedisKeyPrefix                        string
+	RedisKeyHMACSecret                    string
+	RedisPoolSize                         int
+	RedisMinIdleConnections               int
+	RedisDialTimeout                      time.Duration
+	RedisReadTimeout                      time.Duration
+	RedisWriteTimeout                     time.Duration
+	RedisPoolTimeout                      time.Duration
+	RedisMaxPayloadBytes                  int
+	RedisFallbackMaxConcurrency           int
+	RateLimitIPCeilingMultiplier          int
+	MetricsAuthToken                      string
+	HTTPSuccessLogSampleRate              float64
+	HTTPSlowRequestThreshold              time.Duration
 	GoogleMapsServerAPIKey                string
 	DatabaseURL                           string
+	DatabaseDirectURL                     string
+	DatabaseMaxConnections                int32
+	DatabaseMinConnections                int32
+	DatabaseDirectMaxConnections          int32
+	DatabaseMaxConnectionLifetime         time.Duration
+	DatabaseMaxConnectionLifetimeJitter   time.Duration
+	DatabaseMaxConnectionIdleTime         time.Duration
+	DatabaseHealthCheckPeriod             time.Duration
+	DatabaseConnectTimeout                time.Duration
+	DatabaseStatementTimeout              time.Duration
+	DatabaseLockTimeout                   time.Duration
+	DatabaseIdleTransactionTimeout        time.Duration
 	CORSOrigins                           []string
+	TrustedProxyCIDRs                     []string
 	AuthIssuer                            string
 	AuthAccessTokenSecret                 string
 	AuthAccessTokenTTL                    time.Duration
@@ -66,6 +133,21 @@ type Config struct {
 	R2AccessKeyID                         string
 	R2SecretAccessKey                     string
 	R2PublicBucketBaseURL                 string
+	NotificationEmailEnabled              bool
+	NotificationWhatsAppEnabled           bool
+	NotificationPlannerConcurrency        int
+	NotificationDestinationHMACKey        string
+	MetaAppID                             string
+	MetaAppSecret                         string
+	MetaVerifyToken                       string
+	WABAToken                             string
+	WhatsAppBusinessAccountID             string
+	WABAPhoneNumberID                     string
+	WABABusinessPhoneE164                 string
+	WhatsAppGraphBaseURL                  string
+	WhatsAppGraphVersion                  string
+	WhatsAppHTTPTimeout                   time.Duration
+	WhatsAppEnabledTemplateKeys           []string
 	SMTPHost                              string
 	SMTPPort                              int
 	SMTPUsername                          string
@@ -123,19 +205,165 @@ type Config struct {
 }
 
 const (
-	AIProviderSelfHosted = "self_hosted"
-	AIProviderHosted     = "hosted"
-	HostedProviderOpenAI = "openai"
+	ProcessRoleAPI         = "api"
+	ProcessRoleWorker      = "worker"
+	ProcessRoleAIWorker    = "ai-worker"
+	ProcessRoleMaintenance = "maintenance"
+	ProcessRoleAll         = "all"
+
+	AIProviderSelfHosted       = "self_hosted"
+	AIProviderHosted           = "hosted"
+	AIProviderOpenAICompatible = "openai_compatible"
+	HostedProviderOpenAI       = "openai"
+
+	OpenAICompatTokenFieldMaxTokens           = "max_tokens"
+	OpenAICompatTokenFieldMaxCompletionTokens = "max_completion_tokens"
 )
 
+// requiredDirectDatabaseConnections is the exact number of session-bound
+// connections the process can hold concurrently. These connections are kept
+// out of the ordinary query pool so it can safely use transaction pooling.
+func requiredDirectDatabaseConnections(processRole string, tessaEnabled bool) int {
+	switch processRole {
+	case ProcessRoleAPI:
+		connections := 3 // payment, inbox, and booking event listeners
+		if tessaEnabled {
+			connections++
+		}
+		return connections
+	case ProcessRoleWorker, ProcessRoleAIWorker, ProcessRoleMaintenance:
+		return 1 // one wake listener or the maintenance leader connection
+	case ProcessRoleAll:
+		connections := 6 // API listeners + core/AI wakes + maintenance leader
+		if tessaEnabled {
+			connections++
+		}
+		return connections
+	default:
+		return 1
+	}
+}
+
+// InboxAIModelConfigHash fingerprints behavior-affecting model settings without
+// including credentials or endpoint secrets.
+func (cfg Config) InboxAIModelConfigHash() string {
+	settings := struct {
+		Provider            string        `json:"provider"`
+		Model               string        `json:"model"`
+		MaxOutputTokens     int64         `json:"max_output_tokens"`
+		Temperature         float64       `json:"temperature,omitempty"`
+		TopP                float64       `json:"top_p,omitempty"`
+		TopK                int           `json:"top_k,omitempty"`
+		MinP                float64       `json:"min_p,omitempty"`
+		PresencePenalty     float64       `json:"presence_penalty,omitempty"`
+		RepetitionPenalty   float64       `json:"repetition_penalty,omitempty"`
+		Thinking            bool          `json:"thinking,omitempty"`
+		ReasoningEffort     string        `json:"reasoning_effort,omitempty"`
+		Timeout             time.Duration `json:"timeout,omitempty"`
+		BaseURL             string        `json:"base_url,omitempty"`
+		Path                string        `json:"path,omitempty"`
+		TokenLimitField     string        `json:"token_limit_field,omitempty"`
+		OptionalTemperature *float64      `json:"optional_temperature,omitempty"`
+		OptionalTopP        *float64      `json:"optional_top_p,omitempty"`
+	}{Provider: cfg.DefaultAIProvider}
+	switch cfg.DefaultAIProvider {
+	case AIProviderHosted:
+		settings.Model = cfg.OpenAIModel
+		settings.MaxOutputTokens = cfg.OpenAIMaxOutputTokens
+		settings.ReasoningEffort = cfg.OpenAIReasoningEffort
+		settings.Timeout = cfg.OpenAITimeout
+	case AIProviderOpenAICompatible:
+		settings.Model = cfg.OpenAICompatModel
+		settings.MaxOutputTokens = int64(cfg.OpenAICompatMaxOutputTokens)
+		settings.Timeout = cfg.OpenAICompatTimeout
+		settings.BaseURL = cfg.OpenAICompatBaseURL
+		settings.Path = cfg.OpenAICompatChatCompletions
+		settings.TokenLimitField = cfg.OpenAICompatTokenLimitField
+		settings.OptionalTemperature = cfg.OpenAICompatTemperature
+		settings.OptionalTopP = cfg.OpenAICompatTopP
+	default:
+		settings.Model = cfg.LLMModel
+		settings.MaxOutputTokens = int64(cfg.LLMMaxOutputTokens)
+		settings.Timeout = cfg.LLMTimeout
+		settings.Temperature = cfg.LLMTemperature
+		settings.TopP = cfg.LLMTopP
+		settings.TopK = cfg.LLMTopK
+		settings.MinP = cfg.LLMMinP
+		settings.PresencePenalty = cfg.LLMPresencePenalty
+		settings.RepetitionPenalty = cfg.LLMRepetitionPenalty
+		settings.Thinking = cfg.SelfHostedThinking
+	}
+	payload, _ := json.Marshal(settings)
+	hash := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", hash[:])
+}
+
 func Load() (Config, error) {
+	defaultAIProvider := normalizeAIProvider(getEnv("DEFAULT_AI_PROVIDER", AIProviderSelfHosted))
+	agreementAIProvider := normalizeAIProvider(getEnv("AGREEMENT_AI_PROVIDER", AIProviderHosted))
+	usesOpenAICompatible := defaultAIProvider == AIProviderOpenAICompatible ||
+		agreementAIProvider == AIProviderOpenAICompatible
+	openAICompatTimeout, compatTimeoutErr := getEnvDurationStrict("OPENAI_COMPAT_TIMEOUT", 60*time.Second)
+	if compatTimeoutErr != nil && usesOpenAICompatible {
+		return Config{}, compatTimeoutErr
+	}
+	if compatTimeoutErr != nil {
+		openAICompatTimeout = 60 * time.Second
+	}
+	openAICompatMaxOutputTokens, compatTokensErr := getEnvIntStrict("OPENAI_COMPAT_MAX_OUTPUT_TOKENS", 1600)
+	if compatTokensErr != nil && usesOpenAICompatible {
+		return Config{}, compatTokensErr
+	}
+	if compatTokensErr != nil {
+		openAICompatMaxOutputTokens = 1600
+	}
+	openAICompatTemperature, compatTemperatureErr := getOptionalEnvFloat("OPENAI_COMPAT_TEMPERATURE")
+	if compatTemperatureErr != nil && usesOpenAICompatible {
+		return Config{}, compatTemperatureErr
+	}
+	if compatTemperatureErr != nil {
+		openAICompatTemperature = nil
+	}
+	openAICompatTopP, compatTopPErr := getOptionalEnvFloat("OPENAI_COMPAT_TOP_P")
+	if compatTopPErr != nil && usesOpenAICompatible {
+		return Config{}, compatTopPErr
+	}
+	if compatTopPErr != nil {
+		openAICompatTopP = nil
+	}
+	appEnv := strings.ToLower(strings.TrimSpace(getEnv("APP_ENV", "development")))
+	processRole := strings.ToLower(strings.TrimSpace(getEnv("PROCESS_ROLE", ProcessRoleAll)))
+	tessaAIEnabled := getEnvBool("TESSA_AI_ENABLED", false)
 	cfg := Config{
-		AppEnv:                                getEnv("APP_ENV", "development"),
-		HTTPAddr:                              getEnv("HTTP_ADDR", ":8000"),
+		AppEnv:                                appEnv,
+		ProcessRole:                           processRole,
+		HTTPAddr:                              getEnv("HTTP_ADDR", ":8200"),
+		SSEMaxConnections:                     getEnvInt("SSE_MAX_CONNECTIONS", 10000),
+		SSEMaxConnectionsPerIP:                getEnvInt("SSE_MAX_CONNECTIONS_PER_IP", 40),
+		PaymentSSEMaxConnectionsPerToken:      getEnvInt("PAYMENT_SSE_MAX_CONNECTIONS_PER_TOKEN", 6),
 		ClientPublicBaseURL:                   strings.TrimRight(getEnv("CLIENT_PUBLIC_BASE_URL", "http://localhost:5275"), "/"),
-		DefaultAIProvider:                     normalizeAIProvider(getEnv("DEFAULT_AI_PROVIDER", AIProviderSelfHosted)),
-		AgreementAIProvider:                   normalizeAIProvider(getEnv("AGREEMENT_AI_PROVIDER", AIProviderHosted)),
-		InboxAIProvider:                       normalizeAIProvider(getEnv("INBOX_AI_PROVIDER", AIProviderSelfHosted)),
+		MarketplacePublicBaseURL:              strings.TrimRight(getEnv("MARKETPLACE_PUBLIC_BASE_URL", "http://localhost:5375"), "/"),
+		DefaultAIProvider:                     defaultAIProvider,
+		AgreementAIProvider:                   agreementAIProvider,
+		InboxAIDraftsEnabled:                  getEnvBool("INBOX_AI_DRAFTS_ENABLED", false),
+		InboxAIProviderAllowlist:              splitCSV(os.Getenv("INBOX_AI_PROVIDER_ALLOWLIST")),
+		InboxAIAutomationEnabled:              getEnvBool("INBOX_AI_AUTOMATION_ENABLED", false),
+		InboxAIAutomationProviderAllowlist:    splitCSV(os.Getenv("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST")),
+		InboxAIMaxConcurrency:                 getEnvInt("INBOX_AI_MAX_CONCURRENCY", 2),
+		InboxAISemiPilotReplyDelay:            getEnvDuration("INBOX_AI_SEMI_PILOT_REPLY_DELAY", 800*time.Millisecond),
+		InboxAIAutopilotPaymentWindow:         getEnvDuration("INBOX_AI_AUTOPILOT_PAYMENT_WINDOW", 30*time.Minute),
+		TessaAIEnabled:                        tessaAIEnabled,
+		TessaAIProviderAllowlist:              splitCSV(os.Getenv("TESSA_AI_PROVIDER_ALLOWLIST")),
+		TessaAIPrimaryProvider:                normalizeAIProvider(getEnv("TESSA_AI_PRIMARY_PROVIDER", AIProviderSelfHosted)),
+		TessaAIFallbackProvider:               normalizeAIProvider(os.Getenv("TESSA_AI_FALLBACK_PROVIDER")),
+		TessaAIPrimaryRequestTimeout:          getEnvDuration("TESSA_AI_PRIMARY_REQUEST_TIMEOUT", 30*time.Second),
+		TessaAIFallbackRequestTimeout:         getEnvDuration("TESSA_AI_FALLBACK_REQUEST_TIMEOUT", 20*time.Second),
+		TessaAITurnTimeout:                    getEnvDuration("TESSA_AI_TURN_TIMEOUT", 75*time.Second),
+		TessaAIWorkerConcurrency:              getEnvInt("TESSA_AI_WORKER_CONCURRENCY", 2),
+		TessaAIMaxInputTokens:                 getEnvInt("TESSA_AI_MAX_INPUT_TOKENS", 12000),
+		TessaAIMaxOutputTokens:                getEnvInt("TESSA_AI_MAX_OUTPUT_TOKENS", 1600),
+		TessaAINoticeRevision:                 strings.TrimSpace(os.Getenv("TESSA_AI_NOTICE_REVISION")),
+		TessaAIExternalProcessingApproved:     getEnvBool("TESSA_AI_EXTERNAL_PROCESSING_APPROVED", false),
 		HostedAIProvider:                      strings.ToLower(strings.TrimSpace(getEnv("HOSTED_AI_PROVIDER", HostedProviderOpenAI))),
 		LLMBaseURL:                            strings.TrimRight(strings.TrimSpace(os.Getenv("LLM_BASE_URL")), "/"),
 		LLMChatCompletions:                    getEnv("LLM_CHAT_COMPLETIONS_PATH", "/v1/chat/completions"),
@@ -157,15 +385,54 @@ func Load() (Config, error) {
 		OpenAITimeout:                         getEnvDuration("OPENAI_TIMEOUT", 120*time.Second),
 		OpenAIMaxOutputTokens:                 getEnvInt64("OPENAI_MAX_OUTPUT_TOKENS", 16000),
 		OpenAIResponseLogFile:                 strings.TrimSpace(os.Getenv("OPENAI_RESPONSE_LOG_FILE")),
+		OpenAICompatBaseURL:                   strings.TrimRight(strings.TrimSpace(os.Getenv("OPENAI_COMPAT_BASE_URL")), "/"),
+		OpenAICompatChatCompletions:           strings.TrimSpace(getEnv("OPENAI_COMPAT_CHAT_COMPLETIONS_PATH", "/v1/chat/completions")),
+		OpenAICompatModel:                     strings.TrimSpace(os.Getenv("OPENAI_COMPAT_MODEL")),
+		OpenAICompatAPIKey:                    strings.TrimSpace(os.Getenv("OPENAI_COMPAT_API_KEY")),
+		OpenAICompatTimeout:                   openAICompatTimeout,
+		OpenAICompatMaxOutputTokens:           openAICompatMaxOutputTokens,
+		OpenAICompatTokenLimitField:           strings.ToLower(strings.TrimSpace(getEnv("OPENAI_COMPAT_TOKEN_LIMIT_FIELD", OpenAICompatTokenFieldMaxTokens))),
+		OpenAICompatTemperature:               openAICompatTemperature,
+		OpenAICompatTopP:                      openAICompatTopP,
 		HTTPRateLimitPerMinute:                getEnvInt("HTTP_RATE_LIMIT_PER_MINUTE", 300),
 		HTTPRateLimitBurst:                    getEnvInt("HTTP_RATE_LIMIT_BURST", 100),
 		AIRateLimitPerMinute:                  getEnvInt("AI_RATE_LIMIT_PER_MINUTE", 12),
 		AIRateLimitBurst:                      getEnvInt("AI_RATE_LIMIT_BURST", 4),
 		LocationRateLimitPerMinute:            getEnvInt("LOCATION_RATE_LIMIT_PER_MINUTE", 20),
 		LocationRateLimitBurst:                getEnvInt("LOCATION_RATE_LIMIT_BURST", 5),
+		MarketplaceAuthRateLimitPerMinute:     getEnvInt("MARKETPLACE_AUTH_RATE_LIMIT_PER_MINUTE", 20),
+		MarketplaceAuthRateLimitBurst:         getEnvInt("MARKETPLACE_AUTH_RATE_LIMIT_BURST", 6),
+		RedisURL:                              strings.TrimSpace(os.Getenv("REDIS_URL")),
+		RedisKeyPrefix:                        strings.TrimSpace(getEnv("REDIS_KEY_PREFIX", "tellbook:"+appEnv+":v1")),
+		RedisKeyHMACSecret:                    os.Getenv("REDIS_KEY_HMAC_SECRET"),
+		RedisPoolSize:                         getEnvInt("REDIS_POOL_SIZE", 32),
+		RedisMinIdleConnections:               getEnvInt("REDIS_MIN_IDLE_CONNECTIONS", 4),
+		RedisDialTimeout:                      getEnvDuration("REDIS_DIAL_TIMEOUT", 750*time.Millisecond),
+		RedisReadTimeout:                      getEnvDuration("REDIS_READ_TIMEOUT", 250*time.Millisecond),
+		RedisWriteTimeout:                     getEnvDuration("REDIS_WRITE_TIMEOUT", 250*time.Millisecond),
+		RedisPoolTimeout:                      getEnvDuration("REDIS_POOL_TIMEOUT", 500*time.Millisecond),
+		RedisMaxPayloadBytes:                  getEnvInt("REDIS_MAX_PAYLOAD_BYTES", 64*1024),
+		RedisFallbackMaxConcurrency:           getEnvInt("REDIS_FALLBACK_MAX_CONCURRENCY", 32),
+		RateLimitIPCeilingMultiplier:          getEnvInt("RATE_LIMIT_IP_CEILING_MULTIPLIER", 8),
+		MetricsAuthToken:                      strings.TrimSpace(os.Getenv("METRICS_AUTH_TOKEN")),
+		HTTPSuccessLogSampleRate:              getEnvFloat("HTTP_SUCCESS_LOG_SAMPLE_RATE", 0.1),
+		HTTPSlowRequestThreshold:              getEnvDuration("HTTP_SLOW_REQUEST_THRESHOLD", 750*time.Millisecond),
 		GoogleMapsServerAPIKey:                strings.TrimSpace(os.Getenv("GOOGLE_MAPS_SERVER_API_KEY")),
 		DatabaseURL:                           strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		DatabaseDirectURL:                     strings.TrimSpace(os.Getenv("DATABASE_DIRECT_URL")),
+		DatabaseMaxConnections:                int32(getEnvInt("DATABASE_MAX_CONNECTIONS", 14)),
+		DatabaseMinConnections:                int32(getEnvInt("DATABASE_MIN_CONNECTIONS", 2)),
+		DatabaseDirectMaxConnections:          int32(getEnvInt("DATABASE_DIRECT_MAX_CONNECTIONS", requiredDirectDatabaseConnections(processRole, tessaAIEnabled))),
+		DatabaseMaxConnectionLifetime:         getEnvDuration("DATABASE_MAX_CONNECTION_LIFETIME", 30*time.Minute),
+		DatabaseMaxConnectionLifetimeJitter:   getEnvDuration("DATABASE_MAX_CONNECTION_LIFETIME_JITTER", 5*time.Minute),
+		DatabaseMaxConnectionIdleTime:         getEnvDuration("DATABASE_MAX_CONNECTION_IDLE_TIME", 5*time.Minute),
+		DatabaseHealthCheckPeriod:             getEnvDuration("DATABASE_HEALTH_CHECK_PERIOD", 30*time.Second),
+		DatabaseConnectTimeout:                getEnvDuration("DATABASE_CONNECT_TIMEOUT", 5*time.Second),
+		DatabaseStatementTimeout:              getEnvDuration("DATABASE_STATEMENT_TIMEOUT", 30*time.Second),
+		DatabaseLockTimeout:                   getEnvDuration("DATABASE_LOCK_TIMEOUT", 5*time.Second),
+		DatabaseIdleTransactionTimeout:        getEnvDuration("DATABASE_IDLE_TRANSACTION_TIMEOUT", 30*time.Second),
 		CORSOrigins:                           splitCSV(getEnv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")),
+		TrustedProxyCIDRs:                     splitCSV(getEnv("TRUSTED_PROXY_CIDRS", "127.0.0.1/32,::1/128")),
 		AuthIssuer:                            getEnv("AUTH_ISSUER", "booking-api"),
 		AuthAccessTokenSecret:                 strings.TrimSpace(os.Getenv("AUTH_ACCESS_TOKEN_SECRET")),
 		AuthAccessTokenTTL:                    getEnvDuration("AUTH_ACCESS_TOKEN_TTL", 15*time.Minute),
@@ -182,6 +449,21 @@ func Load() (Config, error) {
 		R2AccessKeyID:                         strings.TrimSpace(os.Getenv("R2_ACCESS_KEY_ID")),
 		R2SecretAccessKey:                     strings.TrimSpace(os.Getenv("R2_SECRET_ACCESS_KEY")),
 		R2PublicBucketBaseURL:                 strings.TrimSpace(os.Getenv("R2_PUBLIC_BUCKET_BASE_URL")),
+		NotificationEmailEnabled:              getEnvBool("NOTIFICATION_EMAIL_ENABLED", false),
+		NotificationWhatsAppEnabled:           getEnvBool("NOTIFICATION_WHATSAPP_ENABLED", false),
+		NotificationPlannerConcurrency:        getEnvInt("NOTIFICATION_PLANNER_CONCURRENCY", 4),
+		NotificationDestinationHMACKey:        strings.TrimSpace(os.Getenv("NOTIFICATION_DESTINATION_HMAC_KEY")),
+		MetaAppID:                             strings.TrimSpace(os.Getenv("META_APP_ID")),
+		MetaAppSecret:                         strings.TrimSpace(os.Getenv("META_APP_SECRET")),
+		MetaVerifyToken:                       strings.TrimSpace(os.Getenv("META_VERIFY_TOKEN")),
+		WABAToken:                             strings.TrimSpace(os.Getenv("WABA_TOKEN")),
+		WhatsAppBusinessAccountID:             strings.TrimSpace(os.Getenv("WHATSAPP_BUSINESS_ACCOUNT_ID")),
+		WABAPhoneNumberID:                     strings.TrimSpace(os.Getenv("WABA_PHONE_NUMBER_ID")),
+		WABABusinessPhoneE164:                 strings.TrimSpace(os.Getenv("WABA_BUSINESS_PHONE_E164")),
+		WhatsAppGraphBaseURL:                  strings.TrimRight(getEnv("WHATSAPP_GRAPH_BASE_URL", "https://graph.facebook.com"), "/"),
+		WhatsAppGraphVersion:                  strings.TrimSpace(getEnv("WHATSAPP_GRAPH_VERSION", "v24.0")),
+		WhatsAppHTTPTimeout:                   getEnvDuration("WHATSAPP_HTTP_TIMEOUT", 15*time.Second),
+		WhatsAppEnabledTemplateKeys:           splitCSV(os.Getenv("WHATSAPP_ENABLED_TEMPLATE_KEYS")),
 		SMTPHost:                              getEnv("SMTP_HOST", "smtp.zoho.com"),
 		SMTPPort:                              getEnvInt("SMTP_PORT", 465),
 		SMTPUsername:                          strings.TrimSpace(os.Getenv("SMTP_USERNAME")),
@@ -241,8 +523,187 @@ func Load() (Config, error) {
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("DATABASE_URL is required")
 	}
+	if strings.EqualFold(cfg.AppEnv, "production") && cfg.DatabaseDirectURL == "" {
+		return Config{}, fmt.Errorf("DATABASE_DIRECT_URL is required in production for session-bound connections")
+	}
+	switch cfg.ProcessRole {
+	case ProcessRoleAPI, ProcessRoleWorker, ProcessRoleAIWorker, ProcessRoleMaintenance, ProcessRoleAll:
+	default:
+		return Config{}, fmt.Errorf("PROCESS_ROLE must be api, worker, ai-worker, maintenance, or all")
+	}
+	if strings.EqualFold(cfg.AppEnv, "production") && cfg.ProcessRole == ProcessRoleAll {
+		return Config{}, fmt.Errorf("PROCESS_ROLE=all is restricted to local development")
+	}
+	if cfg.RedisURL == "" && strings.EqualFold(cfg.AppEnv, "production") && cfg.ProcessRole == ProcessRoleAPI {
+		return Config{}, fmt.Errorf("REDIS_URL is required for the production API role")
+	}
+	if cfg.RedisURL != "" {
+		redisURL, err := url.Parse(cfg.RedisURL)
+		if err != nil || (redisURL.Scheme != "redis" && redisURL.Scheme != "rediss") || redisURL.Host == "" {
+			return Config{}, fmt.Errorf("REDIS_URL must be a valid redis:// or rediss:// URL")
+		}
+		if len(cfg.RedisKeyHMACSecret) < 32 {
+			return Config{}, fmt.Errorf("REDIS_KEY_HMAC_SECRET must be at least 32 bytes when Redis is enabled")
+		}
+	}
+	if !validRedisKeyPrefix(cfg.RedisKeyPrefix) {
+		return Config{}, fmt.Errorf("REDIS_KEY_PREFIX must contain only lowercase letters, digits, hyphens, and colon separators")
+	}
+	if cfg.RedisPoolSize < 4 || cfg.RedisPoolSize > 256 {
+		return Config{}, fmt.Errorf("REDIS_POOL_SIZE must be between 4 and 256")
+	}
+	if cfg.RedisMinIdleConnections < 0 || cfg.RedisMinIdleConnections > cfg.RedisPoolSize {
+		return Config{}, fmt.Errorf("REDIS_MIN_IDLE_CONNECTIONS must be between 0 and REDIS_POOL_SIZE")
+	}
+	for name, value := range map[string]time.Duration{
+		"REDIS_DIAL_TIMEOUT":  cfg.RedisDialTimeout,
+		"REDIS_READ_TIMEOUT":  cfg.RedisReadTimeout,
+		"REDIS_WRITE_TIMEOUT": cfg.RedisWriteTimeout,
+		"REDIS_POOL_TIMEOUT":  cfg.RedisPoolTimeout,
+	} {
+		if value < 50*time.Millisecond || value > 5*time.Second {
+			return Config{}, fmt.Errorf("%s must be between 50ms and 5s", name)
+		}
+	}
+	if cfg.RedisMaxPayloadBytes < 1024 || cfg.RedisMaxPayloadBytes > 1024*1024 {
+		return Config{}, fmt.Errorf("REDIS_MAX_PAYLOAD_BYTES must be between 1024 and 1048576")
+	}
+	if cfg.RedisFallbackMaxConcurrency < 1 || cfg.RedisFallbackMaxConcurrency > 256 {
+		return Config{}, fmt.Errorf("REDIS_FALLBACK_MAX_CONCURRENCY must be between 1 and 256")
+	}
+	if cfg.RateLimitIPCeilingMultiplier < 2 || cfg.RateLimitIPCeilingMultiplier > 100 {
+		return Config{}, fmt.Errorf("RATE_LIMIT_IP_CEILING_MULTIPLIER must be between 2 and 100")
+	}
+	if cfg.SSEMaxConnections < 100 || cfg.SSEMaxConnections > 100000 {
+		return Config{}, fmt.Errorf("SSE_MAX_CONNECTIONS must be between 100 and 100000")
+	}
+	if cfg.SSEMaxConnectionsPerIP < 1 || cfg.SSEMaxConnectionsPerIP > cfg.SSEMaxConnections {
+		return Config{}, fmt.Errorf("SSE_MAX_CONNECTIONS_PER_IP must be positive and no greater than SSE_MAX_CONNECTIONS")
+	}
+	if cfg.PaymentSSEMaxConnectionsPerToken < 1 || cfg.PaymentSSEMaxConnectionsPerToken > 100 {
+		return Config{}, fmt.Errorf("PAYMENT_SSE_MAX_CONNECTIONS_PER_TOKEN must be between 1 and 100")
+	}
+	if !finiteFloat(cfg.HTTPSuccessLogSampleRate) || cfg.HTTPSuccessLogSampleRate < 0 || cfg.HTTPSuccessLogSampleRate > 1 {
+		return Config{}, fmt.Errorf("HTTP_SUCCESS_LOG_SAMPLE_RATE must be between 0 and 1")
+	}
+	if cfg.HTTPSlowRequestThreshold <= 0 || cfg.HTTPSlowRequestThreshold > time.Minute {
+		return Config{}, fmt.Errorf("HTTP_SLOW_REQUEST_THRESHOLD must be between 1ns and 1m")
+	}
+	if cfg.InboxAIMaxConcurrency < 1 || cfg.InboxAIMaxConcurrency > 32 {
+		return Config{}, fmt.Errorf("INBOX_AI_MAX_CONCURRENCY must be between 1 and 32")
+	}
+	if cfg.InboxAISemiPilotReplyDelay < 0 || cfg.InboxAISemiPilotReplyDelay > 10*time.Second {
+		return Config{}, fmt.Errorf("INBOX_AI_SEMI_PILOT_REPLY_DELAY must be between 0s and 10s")
+	}
+	if cfg.InboxAIAutopilotPaymentWindow < 5*time.Minute || cfg.InboxAIAutopilotPaymentWindow > 24*time.Hour {
+		return Config{}, fmt.Errorf("INBOX_AI_AUTOPILOT_PAYMENT_WINDOW must be between 5m and 24h")
+	}
+	if cfg.TessaAIWorkerConcurrency < 1 || cfg.TessaAIWorkerConcurrency > 32 {
+		return Config{}, fmt.Errorf("TESSA_AI_WORKER_CONCURRENCY must be between 1 and 32")
+	}
+	if cfg.TessaAIPrimaryRequestTimeout <= 0 || cfg.TessaAIPrimaryRequestTimeout > cfg.TessaAITurnTimeout {
+		return Config{}, fmt.Errorf("TESSA_AI_PRIMARY_REQUEST_TIMEOUT must be positive and no greater than TESSA_AI_TURN_TIMEOUT")
+	}
+	if cfg.TessaAIFallbackRequestTimeout <= 0 || cfg.TessaAIFallbackRequestTimeout > cfg.TessaAITurnTimeout {
+		return Config{}, fmt.Errorf("TESSA_AI_FALLBACK_REQUEST_TIMEOUT must be positive and no greater than TESSA_AI_TURN_TIMEOUT")
+	}
+	if cfg.TessaAITurnTimeout < 5*time.Second || cfg.TessaAITurnTimeout > 5*time.Minute {
+		return Config{}, fmt.Errorf("TESSA_AI_TURN_TIMEOUT must be between 5s and 5m")
+	}
+	if cfg.TessaAIMaxInputTokens < tessaconfig.MinimumInputTokens || cfg.TessaAIMaxInputTokens > 100000 {
+		return Config{}, fmt.Errorf(
+			"TESSA_AI_MAX_INPUT_TOKENS must be between %d and 100000",
+			tessaconfig.MinimumInputTokens,
+		)
+	}
+	if cfg.TessaAIMaxOutputTokens < 100 || cfg.TessaAIMaxOutputTokens > 16000 {
+		return Config{}, fmt.Errorf("TESSA_AI_MAX_OUTPUT_TOKENS must be between 100 and 16000")
+	}
+	if len(cfg.TessaAINoticeRevision) > 80 || (cfg.TessaAIEnabled && cfg.TessaAINoticeRevision == "") {
+		return Config{}, fmt.Errorf("TESSA_AI_NOTICE_REVISION must be explicitly configured with 1 to 80 characters when Tessa is enabled")
+	}
+	for _, rawID := range cfg.InboxAIProviderAllowlist {
+		if _, err := uuid.Parse(rawID); err != nil {
+			return Config{}, fmt.Errorf("INBOX_AI_PROVIDER_ALLOWLIST contains invalid UUID %q", rawID)
+		}
+	}
+	for _, rawID := range cfg.InboxAIAutomationProviderAllowlist {
+		if _, err := uuid.Parse(rawID); err != nil {
+			return Config{}, fmt.Errorf("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST contains invalid UUID %q", rawID)
+		}
+	}
+	for _, rawID := range cfg.TessaAIProviderAllowlist {
+		if _, err := uuid.Parse(rawID); err != nil {
+			return Config{}, fmt.Errorf("TESSA_AI_PROVIDER_ALLOWLIST contains invalid UUID %q", rawID)
+		}
+	}
+	if cfg.InboxAIAutomationEnabled && len(cfg.InboxAIAutomationProviderAllowlist) == 0 {
+		return Config{}, fmt.Errorf("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST is required when automation is enabled")
+	}
+	if cfg.TessaAIEnabled && len(cfg.TessaAIProviderAllowlist) == 0 {
+		return Config{}, fmt.Errorf("TESSA_AI_PROVIDER_ALLOWLIST is required when Tessa is enabled")
+	}
+	if err := validateAIProvider("TESSA_AI_PRIMARY_PROVIDER", cfg.TessaAIPrimaryProvider); err != nil {
+		return Config{}, err
+	}
+	if cfg.TessaAIEnabled && cfg.TessaAIPrimaryProvider != AIProviderSelfHosted {
+		return Config{}, fmt.Errorf("TESSA_AI_PRIMARY_PROVIDER must be self_hosted; external providers are supported only as Tessa fallback")
+	}
+	if cfg.TessaAIFallbackProvider != "" {
+		if err := validateAIProvider("TESSA_AI_FALLBACK_PROVIDER", cfg.TessaAIFallbackProvider); err != nil {
+			return Config{}, err
+		}
+		if cfg.TessaAIFallbackProvider == cfg.TessaAIPrimaryProvider {
+			return Config{}, fmt.Errorf("TESSA_AI_FALLBACK_PROVIDER must differ from TESSA_AI_PRIMARY_PROVIDER")
+		}
+		if cfg.TessaAIEnabled && isExternalAIProvider(cfg.TessaAIFallbackProvider) && !cfg.TessaAIExternalProcessingApproved {
+			return Config{}, fmt.Errorf("TESSA_AI_EXTERNAL_PROCESSING_APPROVED must be true before enabling an external fallback")
+		}
+	}
+	if cfg.DatabaseMaxConnections < 4 {
+		return Config{}, fmt.Errorf("DATABASE_MAX_CONNECTIONS must be at least 4")
+	}
+	if cfg.DatabaseMinConnections < 0 || cfg.DatabaseMinConnections >= cfg.DatabaseMaxConnections {
+		return Config{}, fmt.Errorf("DATABASE_MIN_CONNECTIONS must be non-negative and lower than DATABASE_MAX_CONNECTIONS")
+	}
+	requiredDirectConnections := int32(requiredDirectDatabaseConnections(cfg.ProcessRole, cfg.TessaAIEnabled))
+	if cfg.DatabaseDirectMaxConnections < requiredDirectConnections {
+		return Config{}, fmt.Errorf(
+			"DATABASE_DIRECT_MAX_CONNECTIONS must be at least %d for PROCESS_ROLE=%s",
+			requiredDirectConnections,
+			cfg.ProcessRole,
+		)
+	}
+	if cfg.DatabaseDirectMaxConnections > 32 {
+		return Config{}, fmt.Errorf("DATABASE_DIRECT_MAX_CONNECTIONS must be at most 32")
+	}
+	for name, value := range map[string]time.Duration{
+		"DATABASE_MAX_CONNECTION_LIFETIME":        cfg.DatabaseMaxConnectionLifetime,
+		"DATABASE_MAX_CONNECTION_LIFETIME_JITTER": cfg.DatabaseMaxConnectionLifetimeJitter,
+		"DATABASE_MAX_CONNECTION_IDLE_TIME":       cfg.DatabaseMaxConnectionIdleTime,
+		"DATABASE_HEALTH_CHECK_PERIOD":            cfg.DatabaseHealthCheckPeriod,
+		"DATABASE_CONNECT_TIMEOUT":                cfg.DatabaseConnectTimeout,
+		"DATABASE_STATEMENT_TIMEOUT":              cfg.DatabaseStatementTimeout,
+		"DATABASE_LOCK_TIMEOUT":                   cfg.DatabaseLockTimeout,
+		"DATABASE_IDLE_TRANSACTION_TIMEOUT":       cfg.DatabaseIdleTransactionTimeout,
+	} {
+		if value < time.Millisecond {
+			return Config{}, fmt.Errorf("%s must be at least 1ms", name)
+		}
+	}
+	if cfg.DatabaseMaxConnectionLifetimeJitter >= cfg.DatabaseMaxConnectionLifetime {
+		return Config{}, fmt.Errorf("DATABASE_MAX_CONNECTION_LIFETIME_JITTER must be lower than DATABASE_MAX_CONNECTION_LIFETIME")
+	}
+	if cfg.DatabaseLockTimeout > cfg.DatabaseStatementTimeout {
+		return Config{}, fmt.Errorf("DATABASE_LOCK_TIMEOUT must be no greater than DATABASE_STATEMENT_TIMEOUT")
+	}
 	if cfg.AuthAccessTokenSecret == "" {
 		return Config{}, fmt.Errorf("AUTH_ACCESS_TOKEN_SECRET is required")
+	}
+	for _, cidr := range cfg.TrustedProxyCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return Config{}, fmt.Errorf("TRUSTED_PROXY_CIDRS contains invalid CIDR %q", cidr)
+		}
 	}
 	for _, setting := range []struct {
 		name  string
@@ -250,7 +711,6 @@ func Load() (Config, error) {
 	}{
 		{name: "DEFAULT_AI_PROVIDER", value: cfg.DefaultAIProvider},
 		{name: "AGREEMENT_AI_PROVIDER", value: cfg.AgreementAIProvider},
-		{name: "INBOX_AI_PROVIDER", value: cfg.InboxAIProvider},
 	} {
 		if err := validateAIProvider(setting.name, setting.value); err != nil {
 			return Config{}, err
@@ -278,6 +738,48 @@ func Load() (Config, error) {
 		if cfg.OpenAIMaxOutputTokens <= 0 {
 			return Config{}, fmt.Errorf("OPENAI_MAX_OUTPUT_TOKENS must be greater than zero")
 		}
+	}
+	if cfg.NeedsOpenAICompatible() {
+		if cfg.OpenAICompatBaseURL == "" {
+			return Config{}, fmt.Errorf("OPENAI_COMPAT_BASE_URL is required when a task uses external OpenAI-compatible AI")
+		}
+		if err := validateOpenAICompatibleBaseURL(cfg.OpenAICompatBaseURL); err != nil {
+			return Config{}, fmt.Errorf("OPENAI_COMPAT_BASE_URL: %w", err)
+		}
+		if err := validateOpenAICompatiblePath(cfg.OpenAICompatChatCompletions); err != nil {
+			return Config{}, fmt.Errorf("OPENAI_COMPAT_CHAT_COMPLETIONS_PATH: %w", err)
+		}
+		if cfg.OpenAICompatModel == "" {
+			return Config{}, fmt.Errorf("OPENAI_COMPAT_MODEL is required when a task uses external OpenAI-compatible AI")
+		}
+		if cfg.OpenAICompatAPIKey == "" {
+			return Config{}, fmt.Errorf("OPENAI_COMPAT_API_KEY is required when a task uses external OpenAI-compatible AI")
+		}
+		if cfg.OpenAICompatTimeout <= 0 {
+			return Config{}, fmt.Errorf("OPENAI_COMPAT_TIMEOUT must be greater than zero")
+		}
+		if cfg.OpenAICompatMaxOutputTokens <= 0 {
+			return Config{}, fmt.Errorf("OPENAI_COMPAT_MAX_OUTPUT_TOKENS must be greater than zero")
+		}
+		switch cfg.OpenAICompatTokenLimitField {
+		case OpenAICompatTokenFieldMaxTokens, OpenAICompatTokenFieldMaxCompletionTokens:
+		default:
+			return Config{}, fmt.Errorf("OPENAI_COMPAT_TOKEN_LIMIT_FIELD must be max_tokens or max_completion_tokens")
+		}
+		if cfg.OpenAICompatTemperature != nil &&
+			(!finiteFloat(*cfg.OpenAICompatTemperature) || *cfg.OpenAICompatTemperature < 0 || *cfg.OpenAICompatTemperature > 2) {
+			return Config{}, fmt.Errorf("OPENAI_COMPAT_TEMPERATURE must be between 0 and 2")
+		}
+		if cfg.OpenAICompatTopP != nil &&
+			(!finiteFloat(*cfg.OpenAICompatTopP) || *cfg.OpenAICompatTopP <= 0 || *cfg.OpenAICompatTopP > 1) {
+			return Config{}, fmt.Errorf("OPENAI_COMPAT_TOP_P must be greater than 0 and at most 1")
+		}
+		if cfg.OpenAICompatTemperature != nil && cfg.OpenAICompatTopP != nil {
+			return Config{}, fmt.Errorf("configure only one of OPENAI_COMPAT_TEMPERATURE or OPENAI_COMPAT_TOP_P")
+		}
+	}
+	if !strings.HasPrefix(cfg.OpenAICompatChatCompletions, "/") {
+		cfg.OpenAICompatChatCompletions = "/" + cfg.OpenAICompatChatCompletions
 	}
 	if !strings.HasPrefix(cfg.LLMChatCompletions, "/") {
 		cfg.LLMChatCompletions = "/" + cfg.LLMChatCompletions
@@ -313,6 +815,68 @@ func Load() (Config, error) {
 	}
 	if err := validatePublicBaseURL(cfg.ClientPublicBaseURL); err != nil {
 		return Config{}, fmt.Errorf("CLIENT_PUBLIC_BASE_URL: %w", err)
+	}
+	if err := validatePublicBaseURL(cfg.MarketplacePublicBaseURL); err != nil {
+		return Config{}, fmt.Errorf("MARKETPLACE_PUBLIC_BASE_URL: %w", err)
+	}
+	if (cfg.R2PublicBucketName == "") != (cfg.R2PublicBucketBaseURL == "") {
+		return Config{}, fmt.Errorf("R2_PUBLIC_BUCKET_NAME and R2_PUBLIC_BUCKET_BASE_URL must be configured together")
+	}
+	if cfg.R2PublicBucketBaseURL != "" {
+		if err := validatePublicBaseURL(cfg.R2PublicBucketBaseURL); err != nil {
+			return Config{}, fmt.Errorf("R2_PUBLIC_BUCKET_BASE_URL: %w", err)
+		}
+		if strings.EqualFold(cfg.AppEnv, "production") && !strings.HasPrefix(cfg.R2PublicBucketBaseURL, "https://") {
+			return Config{}, fmt.Errorf("R2_PUBLIC_BUCKET_BASE_URL must use HTTPS in production")
+		}
+	}
+	for name, value := range map[string]string{
+		"META_APP_ID":                  cfg.MetaAppID,
+		"WHATSAPP_BUSINESS_ACCOUNT_ID": cfg.WhatsAppBusinessAccountID,
+		"WABA_PHONE_NUMBER_ID":         cfg.WABAPhoneNumberID,
+	} {
+		if value != "" && !isDecimalIdentifier(value) {
+			return Config{}, fmt.Errorf("%s must contain only decimal digits", name)
+		}
+	}
+	if cfg.MetaAppSecret != "" && len(cfg.MetaAppSecret) < 16 {
+		return Config{}, fmt.Errorf("META_APP_SECRET must be at least 16 characters")
+	}
+	if cfg.MetaVerifyToken != "" && len(cfg.MetaVerifyToken) < 16 {
+		return Config{}, fmt.Errorf("META_VERIFY_TOKEN must be at least 16 characters")
+	}
+	runsAPI := cfg.ProcessRole == ProcessRoleAPI || cfg.ProcessRole == ProcessRoleAll
+	runsNotificationWorkers := cfg.ProcessRole == ProcessRoleWorker || cfg.ProcessRole == ProcessRoleAll
+	webhookRequested := cfg.MetaAppSecret != "" || cfg.MetaVerifyToken != ""
+	if runsAPI && webhookRequested && !cfg.MetaWebhookConfigured() {
+		return Config{}, fmt.Errorf("META_APP_SECRET, META_VERIFY_TOKEN, WHATSAPP_BUSINESS_ACCOUNT_ID, and WABA_PHONE_NUMBER_ID must be configured together for the API webhook")
+	}
+	if runsAPI && webhookRequested && !cfg.NotificationContactFoundationConfigured() {
+		return Config{}, fmt.Errorf("NOTIFICATION_DESTINATION_HMAC_KEY and WABA_BUSINESS_PHONE_E164 are required for WhatsApp verification and control messages")
+	}
+	sendingRequested := cfg.WABAToken != "" || len(cfg.WhatsAppEnabledTemplateKeys) > 0 || cfg.NotificationWhatsAppEnabled
+	if runsNotificationWorkers && sendingRequested && !cfg.WhatsAppSendConfigured() {
+		return Config{}, fmt.Errorf("WABA_TOKEN, WHATSAPP_BUSINESS_ACCOUNT_ID, and WABA_PHONE_NUMBER_ID must be configured together for WhatsApp workers")
+	}
+	if err := validateOpenAICompatibleBaseURL(cfg.WhatsAppGraphBaseURL); err != nil {
+		return Config{}, fmt.Errorf("WHATSAPP_GRAPH_BASE_URL: %w", err)
+	}
+	if !validGraphVersion(cfg.WhatsAppGraphVersion) {
+		return Config{}, fmt.Errorf("WHATSAPP_GRAPH_VERSION must use the form v<major>.<minor>")
+	}
+	if cfg.WhatsAppHTTPTimeout < time.Second || cfg.WhatsAppHTTPTimeout > time.Minute {
+		return Config{}, fmt.Errorf("WHATSAPP_HTTP_TIMEOUT must be between 1s and 1m")
+	}
+	if cfg.NotificationDestinationHMACKey != "" && len(cfg.NotificationDestinationHMACKey) < 32 {
+		return Config{}, fmt.Errorf("NOTIFICATION_DESTINATION_HMAC_KEY must be at least 32 bytes")
+	}
+	if cfg.NotificationPlannerConcurrency < 1 || cfg.NotificationPlannerConcurrency > 32 {
+		return Config{}, fmt.Errorf("NOTIFICATION_PLANNER_CONCURRENCY must be between 1 and 32")
+	}
+	if cfg.NotificationWhatsAppEnabled && runsNotificationWorkers {
+		if len(cfg.NotificationDestinationHMACKey) < 32 {
+			return Config{}, fmt.Errorf("NOTIFICATION_DESTINATION_HMAC_KEY must be at least 32 bytes when WhatsApp notifications are enabled")
+		}
 	}
 	if cfg.PaymentsEnvironment != "" && cfg.PaymentsEnvironment != "test" && cfg.PaymentsEnvironment != "live" {
 		return Config{}, fmt.Errorf("PAYMENTS_ENVIRONMENT must be test or live")
@@ -395,7 +959,8 @@ func Load() (Config, error) {
 	}
 	if cfg.HTTPRateLimitPerMinute <= 0 || cfg.HTTPRateLimitBurst <= 0 ||
 		cfg.AIRateLimitPerMinute <= 0 || cfg.AIRateLimitBurst <= 0 ||
-		cfg.LocationRateLimitPerMinute <= 0 || cfg.LocationRateLimitBurst <= 0 {
+		cfg.LocationRateLimitPerMinute <= 0 || cfg.LocationRateLimitBurst <= 0 ||
+		cfg.MarketplaceAuthRateLimitPerMinute <= 0 || cfg.MarketplaceAuthRateLimitBurst <= 0 {
 		return Config{}, fmt.Errorf("rate-limit values must be positive")
 	}
 
@@ -413,28 +978,151 @@ func (c Config) AnyPaymentCapabilityEnabled() bool {
 		c.PaystackPayoutSandboxVerified || c.PaystackPayoutProductionEnabled
 }
 
+func (c Config) MetaWebhookConfigured() bool {
+	return c.MetaAppSecret != "" && c.MetaVerifyToken != "" &&
+		c.WhatsAppBusinessAccountID != "" && c.WABAPhoneNumberID != ""
+}
+
+func (c Config) WhatsAppSendConfigured() bool {
+	return c.WABAToken != "" && c.WhatsAppBusinessAccountID != "" && c.WABAPhoneNumberID != ""
+}
+
+func (c Config) NotificationContactFoundationConfigured() bool {
+	return len(c.NotificationDestinationHMACKey) >= 32 && validE164(c.WABABusinessPhoneE164)
+}
+
+func validE164(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 9 || len(value) > 16 || value[0] != '+' || value[1] == '0' {
+		return false
+	}
+	for _, character := range value[1:] {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// MetaWhatsAppConfigured reports whether this process has both independent
+// webhook-ingress and outbound-send credentials plus the app identity used by
+// operational subscription checks.
+func (c Config) MetaWhatsAppConfigured() bool {
+	return c.MetaAppID != "" && c.MetaWebhookConfigured() && c.WhatsAppSendConfigured()
+}
+
 func (c Config) NeedsSelfHosted() bool {
 	return c.DefaultAIProvider == AIProviderSelfHosted ||
 		c.AgreementAIProvider == AIProviderSelfHosted ||
-		c.InboxAIProvider == AIProviderSelfHosted
+		(c.TessaAIEnabled && (c.TessaAIPrimaryProvider == AIProviderSelfHosted ||
+			c.TessaAIFallbackProvider == AIProviderSelfHosted))
 }
 
 func (c Config) NeedsHosted() bool {
 	return c.DefaultAIProvider == AIProviderHosted ||
 		c.AgreementAIProvider == AIProviderHosted ||
-		c.InboxAIProvider == AIProviderHosted
+		(c.TessaAIEnabled && (c.TessaAIPrimaryProvider == AIProviderHosted ||
+			c.TessaAIFallbackProvider == AIProviderHosted))
+}
+
+func (c Config) NeedsOpenAICompatible() bool {
+	return c.DefaultAIProvider == AIProviderOpenAICompatible ||
+		c.AgreementAIProvider == AIProviderOpenAICompatible ||
+		(c.TessaAIEnabled && (c.TessaAIPrimaryProvider == AIProviderOpenAICompatible ||
+			c.TessaAIFallbackProvider == AIProviderOpenAICompatible))
+}
+
+func (c Config) AIModelName(provider string) string {
+	switch provider {
+	case "":
+		return ""
+	case AIProviderHosted:
+		return c.OpenAIModel
+	case AIProviderOpenAICompatible:
+		return c.OpenAICompatModel
+	default:
+		return c.LLMModel
+	}
+}
+
+func (c Config) TessaAIConfigHash() string {
+	type providerSettings struct {
+		Provider        string   `json:"provider"`
+		Model           string   `json:"model"`
+		Path            string   `json:"path,omitempty"`
+		Temperature     float64  `json:"temperature,omitempty"`
+		TopP            float64  `json:"top_p,omitempty"`
+		TopK            int      `json:"top_k,omitempty"`
+		MinP            float64  `json:"min_p,omitempty"`
+		PresencePenalty float64  `json:"presence_penalty,omitempty"`
+		RepeatPenalty   float64  `json:"repeat_penalty,omitempty"`
+		Thinking        bool     `json:"thinking,omitempty"`
+		Reasoning       string   `json:"reasoning,omitempty"`
+		TokenLimitField string   `json:"token_limit_field,omitempty"`
+		OptionalTemp    *float64 `json:"optional_temperature,omitempty"`
+		OptionalTopP    *float64 `json:"optional_top_p,omitempty"`
+	}
+	providerConfig := func(provider string) providerSettings {
+		settings := providerSettings{Provider: provider, Model: c.AIModelName(provider)}
+		switch provider {
+		case AIProviderSelfHosted:
+			settings.Path = c.LLMChatCompletions
+			settings.Temperature = c.LLMTemperature
+			settings.TopP = c.LLMTopP
+			settings.TopK = c.LLMTopK
+			settings.MinP = c.LLMMinP
+			settings.PresencePenalty = c.LLMPresencePenalty
+			settings.RepeatPenalty = c.LLMRepetitionPenalty
+			settings.Thinking = c.SelfHostedThinking
+		case AIProviderHosted:
+			settings.Reasoning = c.OpenAIReasoningEffort
+		case AIProviderOpenAICompatible:
+			settings.Path = c.OpenAICompatChatCompletions
+			settings.TokenLimitField = c.OpenAICompatTokenLimitField
+			settings.OptionalTemp = c.OpenAICompatTemperature
+			settings.OptionalTopP = c.OpenAICompatTopP
+		}
+		return settings
+	}
+	settings := struct {
+		Primary         providerSettings  `json:"primary"`
+		Fallback        *providerSettings `json:"fallback,omitempty"`
+		PrimaryTimeout  time.Duration     `json:"primary_timeout"`
+		FallbackTimeout time.Duration     `json:"fallback_timeout,omitempty"`
+		TurnTimeout     time.Duration     `json:"turn_timeout"`
+		MaxInputTokens  int               `json:"max_input_tokens"`
+		MaxOutputTokens int               `json:"max_output_tokens"`
+		NoticeRevision  string            `json:"notice_revision"`
+		SchemaRevision  string            `json:"schema_revision"`
+	}{
+		Primary:         providerConfig(c.TessaAIPrimaryProvider),
+		PrimaryTimeout:  c.TessaAIPrimaryRequestTimeout,
+		TurnTimeout:     c.TessaAITurnTimeout,
+		MaxInputTokens:  c.TessaAIMaxInputTokens,
+		MaxOutputTokens: c.TessaAIMaxOutputTokens,
+		NoticeRevision:  c.TessaAINoticeRevision,
+		SchemaRevision:  tessaconfig.SchemaRevision,
+	}
+	if c.TessaAIFallbackProvider != "" {
+		fallback := providerConfig(c.TessaAIFallbackProvider)
+		settings.Fallback = &fallback
+		settings.FallbackTimeout = c.TessaAIFallbackRequestTimeout
+	}
+	payload, _ := json.Marshal(settings)
+	hash := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", hash[:])
+}
+
+func (c Config) DefaultAIModelName() string {
+	return c.AIModelName(c.DefaultAIProvider)
 }
 
 func (c Config) SynchronousAIRouteTimeout() time.Duration {
-	timeout := time.Duration(0)
-	for _, provider := range []string{c.DefaultAIProvider, c.InboxAIProvider} {
-		providerTimeout := c.LLMTimeout
-		if provider == AIProviderHosted {
-			providerTimeout = c.OpenAITimeout
-		}
-		if providerTimeout > timeout {
-			timeout = providerTimeout
-		}
+	timeout := c.LLMTimeout
+	if c.DefaultAIProvider == AIProviderHosted {
+		timeout = c.OpenAITimeout
+	} else if c.DefaultAIProvider == AIProviderOpenAICompatible {
+		timeout = c.OpenAICompatTimeout
 	}
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -448,11 +1136,15 @@ func normalizeAIProvider(value string) string {
 
 func validateAIProvider(name, value string) error {
 	switch value {
-	case AIProviderSelfHosted, AIProviderHosted:
+	case AIProviderSelfHosted, AIProviderHosted, AIProviderOpenAICompatible:
 		return nil
 	default:
-		return fmt.Errorf("%s must be one of self_hosted or hosted", name)
+		return fmt.Errorf("%s must be one of self_hosted, hosted, or openai_compatible", name)
 	}
+}
+
+func isExternalAIProvider(value string) bool {
+	return value == AIProviderHosted || value == AIProviderOpenAICompatible
 }
 
 func validReasoningEffort(value string) bool {
@@ -471,6 +1163,61 @@ func validatePublicBaseURL(value string) error {
 		return fmt.Errorf("must be an absolute HTTP(S) URL without credentials, query, or fragment")
 	}
 	return nil
+}
+
+func validateOpenAICompatibleBaseURL(value string) error {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("must be an absolute HTTP(S) URL without credentials, query, or fragment")
+	}
+	if parsed.Scheme == "https" {
+		return nil
+	}
+	if parsed.Scheme != "http" {
+		return fmt.Errorf("must use HTTPS outside loopback development")
+	}
+	host := strings.TrimSpace(parsed.Hostname())
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	if address := net.ParseIP(host); address != nil && address.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("must use HTTPS outside loopback development")
+}
+
+func validateOpenAICompatiblePath(value string) error {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.IsAbs() || parsed.Host != "" || parsed.RawQuery != "" ||
+		parsed.Fragment != "" || parsed.Path == "" {
+		return fmt.Errorf("must be a path without scheme, host, query, or fragment")
+	}
+	return nil
+}
+
+func isDecimalIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func validGraphVersion(value string) bool {
+	parts := strings.Split(strings.TrimPrefix(value, "v"), ".")
+	if !strings.HasPrefix(value, "v") || len(parts) != 2 {
+		return false
+	}
+	for _, part := range parts {
+		if !isDecimalIdentifier(part) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c Config) PaystackEnabled() bool {
@@ -586,6 +1333,46 @@ func getEnvFloat(key string, fallback float64) float64 {
 	return parsed
 }
 
+func getOptionalEnvFloat(key string) (*float64, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return nil, nil
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be a number", key)
+	}
+	return &parsed, nil
+}
+
+func finiteFloat(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func getEnvDurationStrict(key string, fallback time.Duration) (time.Duration, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a valid duration", key)
+	}
+	return parsed, nil
+}
+
+func getEnvIntStrict(key string, fallback int) (int, error) {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer", key)
+	}
+	return parsed, nil
+}
+
 func getEnvInt64(key string, fallback int64) int64 {
 	value := strings.TrimSpace(os.Getenv(key))
 	if value == "" {
@@ -635,6 +1422,24 @@ func isSixDigitPIN(value string) bool {
 	for _, char := range value {
 		if char < '0' || char > '9' {
 			return false
+		}
+	}
+	return true
+}
+
+func validRedisKeyPrefix(value string) bool {
+	if len(value) < 3 || len(value) > 96 || strings.HasPrefix(value, ":") || strings.HasSuffix(value, ":") {
+		return false
+	}
+	for _, part := range strings.Split(value, ":") {
+		if part == "" {
+			return false
+		}
+		for _, character := range part {
+			if (character < 'a' || character > 'z') &&
+				(character < '0' || character > '9') && character != '-' {
+				return false
+			}
 		}
 	}
 	return true

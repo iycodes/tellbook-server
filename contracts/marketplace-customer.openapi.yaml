@@ -1,0 +1,209 @@
+openapi: 3.1.0
+info:
+  title: Tellbook Marketplace Customer Data API
+  version: 1.0.0
+servers:
+  - url: /v1/marketplace
+security:
+  - marketplaceSession: []
+paths:
+  /saved-providers:
+    get:
+      operationId: listMarketplaceSavedProviders
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Saved marketplace providers joined to current discovery data.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SavedProviderList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /saved-providers/{providerID}:
+    parameters:
+      - $ref: '#/components/parameters/ProviderID'
+    get:
+      operationId: getMarketplaceProviderSaved
+      responses:
+        '200':
+          description: Current customer's saved state for the provider.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [saved]
+                properties: { saved: { type: boolean } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      operationId: saveMarketplaceProvider
+      responses:
+        '204': { description: Provider is saved; repeated requests are idempotent. }
+        '404': { description: Provider does not exist or is not marketplace-visible. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    delete:
+      operationId: removeMarketplaceSavedProvider
+      responses:
+        '204': { description: Provider is not saved; repeated requests are idempotent. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /notifications:
+    get:
+      operationId: listMarketplaceNotifications
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: kind
+          in: query
+          schema: { $ref: '#/components/schemas/NotificationKind' }
+        - name: unread_only
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Cursor-paged customer notifications and the total unread count.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /notifications/read-all:
+    post:
+      operationId: markAllMarketplaceNotificationsRead
+      responses:
+        '204': { description: Every current unread notification was marked read. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /notifications/{notificationID}/read:
+    parameters:
+      - name: notificationID
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      operationId: markMarketplaceNotificationRead
+      responses:
+        '204': { description: Notification was marked read. }
+        '404': { description: Notification does not belong to this customer. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+components:
+  securitySchemes:
+    marketplaceSession:
+      type: apiKey
+      in: cookie
+      name: tellbook_marketplace_session
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 50, default: 24 }
+    ProviderID:
+      name: providerID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Unauthorized:
+      description: Marketplace customer session is missing or invalid.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+    NotificationKind:
+      type: string
+      enum: [booking, message, offer, system]
+    SavedProvider:
+      type: object
+      required:
+        - id
+        - handle_slug
+        - public_booking_url
+        - business_name
+        - headline
+        - category_id
+        - category_name
+        - verified
+        - review_rating
+        - review_count
+        - location_label
+        - service_id
+        - service_slug
+        - service_title
+        - duration_minutes
+        - price_amount_minor
+        - currency_code
+        - fulfillment_mode
+        - completed_bookings
+        - badges
+        - saved_at
+      properties:
+        id: { type: string, format: uuid }
+        handle_slug: { type: string }
+        public_booking_url: { type: string }
+        business_name: { type: string }
+        headline: { type: string }
+        category_id: { type: string, format: uuid }
+        category_name: { type: string }
+        avatar_url: { type: string }
+        hero_image_url: { type: string }
+        verified: { type: boolean }
+        review_rating: { type: number }
+        review_count: { type: integer }
+        location_label: { type: string }
+        service_id: { type: string, format: uuid }
+        service_slug: { type: string }
+        service_title: { type: string }
+        duration_minutes: { type: integer }
+        price_amount_minor: { type: string, pattern: '^-?[0-9]+$' }
+        currency_code: { type: string, pattern: '^[A-Z]{3}$' }
+        fulfillment_mode:
+          type: string
+          enum: [provider_location, customer_location, virtual]
+        completed_bookings: { type: integer }
+        next_available_at: { type: string, format: date-time }
+        badges:
+          type: array
+          items: { type: string }
+        saved_at: { type: string, format: date-time }
+    SavedProviderList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/SavedProvider' }
+        next_cursor: { type: string }
+    Notification:
+      type: object
+      required: [id, kind, event_type, title, body, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/NotificationKind' }
+        event_type: { type: string }
+        title: { type: string }
+        body: { type: string }
+        provider_id: { type: string, format: uuid }
+        booking_id: { type: string, format: uuid }
+        conversation_id: { type: string, format: uuid }
+        read_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+    NotificationList:
+      type: object
+      required: [items, unread_count]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Notification' }
+        unread_count: { type: integer, minimum: 0 }
+        next_cursor: { type: string }

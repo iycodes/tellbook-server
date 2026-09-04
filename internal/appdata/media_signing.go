@@ -45,11 +45,8 @@ func (h *Handler) signCustomerDetailsResponse(ctx context.Context, response Cust
 }
 
 func (h *Handler) signNotificationsResponse(ctx context.Context, response NotificationsResponse) NotificationsResponse {
-	for index := range response.ActionRequired {
-		response.ActionRequired[index].ImageURL = h.signedMediaURL(ctx, response.ActionRequired[index].ImageURL)
-	}
-	for index := range response.Today {
-		response.Today[index].ImageURL = h.signedMediaURL(ctx, response.Today[index].ImageURL)
+	for index := range response.Items {
+		response.Items[index].ImageURL = h.signedMediaURL(ctx, response.Items[index].ImageURL)
 	}
 	return response
 }
@@ -58,28 +55,6 @@ func (h *Handler) signClientProfileResponse(ctx context.Context, response Client
 	response.AvatarURL = h.signedMediaURL(ctx, response.AvatarURL)
 	response.HeroImageURL = h.signedMediaURL(ctx, response.HeroImageURL)
 	return response
-}
-
-func (h *Handler) signPublicProfileResponse(ctx context.Context, response PublicProfileResponse) PublicProfileResponse {
-	response.Profile.AvatarURL = h.signedMediaURL(ctx, response.Profile.AvatarURL)
-	response.Profile.HeroImageURL = h.signedMediaURL(ctx, response.Profile.HeroImageURL)
-
-	for index := range response.FeaturedServices {
-		response.FeaturedServices[index].ImageURL = h.signedMediaURL(ctx, response.FeaturedServices[index].ImageURL)
-	}
-
-	for index := range response.Portfolio {
-		response.Portfolio[index].ImageURL = h.signedMediaURL(ctx, response.Portfolio[index].ImageURL)
-	}
-
-	return response
-}
-
-func (h *Handler) signPublicServices(ctx context.Context, items []PublicServiceItem) []PublicServiceItem {
-	for index := range items {
-		items[index].ImageURL = h.signedMediaURL(ctx, items[index].ImageURL)
-	}
-	return items
 }
 
 func (h *Handler) signPublicBookingSummaryResponse(ctx context.Context, response PublicBookingSummaryResponse) PublicBookingSummaryResponse {

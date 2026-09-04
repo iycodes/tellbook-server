@@ -339,6 +339,7 @@ type FinancialJob struct {
 	Attempts         int
 	LeaseOwner       string
 	LeaseExpiresAt   time.Time
+	CreatedAt        time.Time
 }
 
 func (r *LedgerRepository) ClaimFinancialJobs(
@@ -376,7 +377,7 @@ func (r *LedgerRepository) ClaimFinancialJobs(
 		RETURNING
 			job.id, job.kind, job.aggregate_type, job.aggregate_id,
 			job.deduplication_key, job.payload, job.attempts,
-			job.lease_owner, job.lease_expires_at
+			job.lease_owner, job.lease_expires_at, job.created_at
 	`
 	rows, err := r.db.Query(ctx, query, limit, workerID, leaseSeconds)
 	if err != nil {
@@ -390,7 +391,7 @@ func (r *LedgerRepository) ClaimFinancialJobs(
 		if err := rows.Scan(
 			&job.ID, &job.Kind, &job.AggregateType, &job.AggregateID,
 			&job.DeduplicationKey, &job.Payload, &job.Attempts,
-			&job.LeaseOwner, &job.LeaseExpiresAt,
+			&job.LeaseOwner, &job.LeaseExpiresAt, &job.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan financial job: %w", err)
 		}
@@ -433,7 +434,8 @@ func (r *LedgerRepository) ClaimFinancialJobsByKind(
 			lease_owner = $3, lease_expires_at = NOW() + ($4 * INTERVAL '1 second'), updated_at = NOW()
 		FROM candidates WHERE job.id = candidates.id
 		RETURNING job.id, job.kind, job.aggregate_type, job.aggregate_id,
-			job.deduplication_key, job.payload, job.attempts, job.lease_owner, job.lease_expires_at
+			job.deduplication_key, job.payload, job.attempts, job.lease_owner, job.lease_expires_at,
+			job.created_at
 	`
 	rows, err := r.db.Query(ctx, query, kind, limit, workerID, leaseSeconds)
 	if err != nil {
@@ -446,7 +448,7 @@ func (r *LedgerRepository) ClaimFinancialJobsByKind(
 		if err := rows.Scan(
 			&job.ID, &job.Kind, &job.AggregateType, &job.AggregateID,
 			&job.DeduplicationKey, &job.Payload, &job.Attempts,
-			&job.LeaseOwner, &job.LeaseExpiresAt,
+			&job.LeaseOwner, &job.LeaseExpiresAt, &job.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan %s financial job: %w", kind, err)
 		}
@@ -499,7 +501,7 @@ func (r *LedgerRepository) ClaimCollectionWebhookJobs(
 		RETURNING
 			job.id, job.kind, job.aggregate_type, job.aggregate_id,
 			job.deduplication_key, job.payload, job.attempts,
-			job.lease_owner, job.lease_expires_at
+			job.lease_owner, job.lease_expires_at, job.created_at
 	`
 	rows, err := r.db.Query(ctx, query, limit, workerID, leaseSeconds)
 	if err != nil {
@@ -512,7 +514,7 @@ func (r *LedgerRepository) ClaimCollectionWebhookJobs(
 		if err := rows.Scan(
 			&job.ID, &job.Kind, &job.AggregateType, &job.AggregateID,
 			&job.DeduplicationKey, &job.Payload, &job.Attempts,
-			&job.LeaseOwner, &job.LeaseExpiresAt,
+			&job.LeaseOwner, &job.LeaseExpiresAt, &job.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan collection webhook job: %w", err)
 		}
@@ -568,7 +570,7 @@ func (r *LedgerRepository) ClaimPayoutWebhookJobs(
 		RETURNING
 			job.id, job.kind, job.aggregate_type, job.aggregate_id,
 			job.deduplication_key, job.payload, job.attempts,
-			job.lease_owner, job.lease_expires_at
+			job.lease_owner, job.lease_expires_at, job.created_at
 	`
 	rows, err := r.db.Query(ctx, query, limit, workerID, leaseSeconds)
 	if err != nil {
@@ -581,7 +583,7 @@ func (r *LedgerRepository) ClaimPayoutWebhookJobs(
 		if err := rows.Scan(
 			&job.ID, &job.Kind, &job.AggregateType, &job.AggregateID,
 			&job.DeduplicationKey, &job.Payload, &job.Attempts,
-			&job.LeaseOwner, &job.LeaseExpiresAt,
+			&job.LeaseOwner, &job.LeaseExpiresAt, &job.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan payout webhook job: %w", err)
 		}
@@ -631,6 +633,28 @@ func (r *LedgerRepository) FailFinancialJob(
 	tag, err := r.db.Exec(ctx, query, jobID, strings.TrimSpace(workerID), retryAt, strings.TrimSpace(reason))
 	if err != nil {
 		return fmt.Errorf("fail financial job: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConcurrentUpdate
+	}
+	return nil
+}
+
+func (r *LedgerRepository) DeadLetterFinancialJob(
+	ctx context.Context,
+	jobID uuid.UUID,
+	workerID string,
+	reason string,
+) error {
+	const query = `
+		UPDATE financial_jobs
+		SET status='dead_letter', lease_owner='', lease_expires_at=NULL,
+			last_error=$3, updated_at=NOW()
+		WHERE id=$1 AND status='processing' AND lease_owner=$2
+	`
+	tag, err := r.db.Exec(ctx, query, jobID, strings.TrimSpace(workerID), strings.TrimSpace(reason))
+	if err != nil {
+		return fmt.Errorf("dead-letter financial job: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrConcurrentUpdate

@@ -1,0 +1,454 @@
+package notifications
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"booking/go-server/internal/whatsapp"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+)
+
+type bookingEvent struct {
+	ID       uuid.UUID
+	Sequence int64
+	Type     string
+	Payload  eventPayload
+}
+
+type eventPayload struct {
+	Status                  string    `json:"status"`
+	PreviousStatus          string    `json:"previous_status"`
+	PaymentStatus           string    `json:"payment_status"`
+	PreviousPaymentStatus   string    `json:"previous_payment_status"`
+	AgreementStatus         string    `json:"agreement_status"`
+	PreviousAgreementStatus string    `json:"previous_agreement_status"`
+	StartsAt                time.Time `json:"starts_at"`
+	PreviousStartsAt        time.Time `json:"previous_starts_at"`
+}
+
+type bookingState struct {
+	ID                          uuid.UUID
+	ClientID                    uuid.UUID
+	MarketplaceCustomerID       *uuid.UUID
+	Status                      string
+	PaymentStatus               string
+	AgreementStatus             string
+	StartAt                     time.Time
+	ReservationExpiredAt        *time.Time
+	AgreementRequired           bool
+	CustomerEmail               string
+	CustomerWhatsApp            string
+	EmailReminderConsent        bool
+	WhatsAppConsent             bool
+	ConsentPolicyRevision       int
+	MarketplaceBookingEmail     bool
+	MarketplaceBookingWhatsApp  bool
+	ProviderEmail               string
+	ProviderEmailVerified       bool
+	ProviderBookingEmail        bool
+	ProviderBookingWhatsApp     bool
+	ProviderReminderEnabled     bool
+	ProviderReminderMinutes     int
+	ProviderWhatsApp            string
+	ProviderWhatsAppVerified    bool
+	ProviderPreferenceRevision  int64
+	CurrentBookingEventSequence int64
+}
+
+type deliveryCandidate struct {
+	audience           string
+	channel            string
+	notificationType   string
+	templateKey        string
+	scheduledFor       time.Time
+	reminderOccurrence *time.Time
+	reminderMinutes    *int
+	destination        string
+	preferenceRevision int64
+	eventSequence      int64
+	idempotencyKey     string
+}
+
+func (r *Repository) PlanEventJob(ctx context.Context, job EventJob) error {
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin notification event planning: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	var event bookingEvent
+	var payload []byte
+	if err := tx.QueryRow(ctx, `
+		SELECT event.id,event.sequence,event.event_type,event.payload
+		FROM notification_event_jobs job
+		JOIN booking_domain_events event ON event.id=job.booking_event_id
+		WHERE job.booking_event_id=$1 AND job.status='processing' AND job.lease_owner=$2
+		FOR UPDATE OF job
+	`, job.BookingEventID, job.LeaseOwner).Scan(
+		&event.ID, &event.Sequence, &event.Type, &payload,
+	); errors.Is(err, pgx.ErrNoRows) {
+		return errors.New("notification event lease was lost")
+	} else if err != nil {
+		return fmt.Errorf("lock notification event job: %w", err)
+	}
+	if err := json.Unmarshal(payload, &event.Payload); err != nil {
+		return fmt.Errorf("decode notification event payload: %w", err)
+	}
+	state, err := loadBookingStateTx(ctx, tx, event.ID)
+	if err != nil {
+		return err
+	}
+	if err := r.reconcileBookingTx(ctx, tx, state, &event); err != nil {
+		return err
+	}
+	if err := completeEventJobTx(ctx, tx, job); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit notification event planning: %w", err)
+	}
+	return nil
+}
+
+func loadBookingStateTx(ctx context.Context, tx pgx.Tx, eventID uuid.UUID) (bookingState, error) {
+	var state bookingState
+	var marketplaceCustomerID uuid.NullUUID
+	err := tx.QueryRow(ctx, `
+		SELECT booking.id,booking.client_id,booking.marketplace_customer_id,
+			booking.status,booking.payment_status,booking.agreement_status,booking.start_at,
+			booking.reservation_expired_at,
+			(booking.agreement_template_family_id_snapshot IS NOT NULL
+			 OR booking.standalone_signature_required_snapshot),
+			COALESCE(booking.customer_email_snapshot,''),
+			COALESCE(booking.customer_whatsapp_e164_snapshot,''),
+			booking.email_reminder_consent,booking.whatsapp_consent,
+			booking.notification_consent_policy_revision,
+			COALESCE(customer_preference.booking_email,TRUE),
+			COALESCE(customer_preference.booking_whatsapp,FALSE),
+			lower(btrim(client.email)),client.email_verified_at IS NOT NULL,
+			COALESCE(provider_preference.booking_email,TRUE),
+			COALESCE(provider_preference.booking_whatsapp,FALSE),
+			COALESCE(provider_preference.appointment_reminder_enabled,TRUE),
+			COALESCE(provider_preference.appointment_reminder_minutes,1440),
+			COALESCE(provider_preference.whatsapp_e164,''),
+			provider_preference.whatsapp_verified_at IS NOT NULL,
+			COALESCE(provider_preference.preference_revision,1),
+			(SELECT COALESCE(MAX(sequence),0) FROM booking_domain_events latest
+			 WHERE latest.booking_id=booking.id)
+		FROM booking_domain_events event
+		JOIN bookings booking ON booking.id=event.booking_id
+		JOIN clients client ON client.id=booking.client_id
+		LEFT JOIN provider_notification_preferences provider_preference
+			ON provider_preference.client_id=booking.client_id
+		LEFT JOIN marketplace_notification_preferences customer_preference
+			ON customer_preference.marketplace_customer_id=booking.marketplace_customer_id
+		WHERE event.id=$1
+	`, eventID).Scan(
+		&state.ID, &state.ClientID, &marketplaceCustomerID,
+		&state.Status, &state.PaymentStatus, &state.AgreementStatus, &state.StartAt,
+		&state.ReservationExpiredAt, &state.AgreementRequired,
+		&state.CustomerEmail, &state.CustomerWhatsApp,
+		&state.EmailReminderConsent, &state.WhatsAppConsent, &state.ConsentPolicyRevision,
+		&state.MarketplaceBookingEmail, &state.MarketplaceBookingWhatsApp,
+		&state.ProviderEmail, &state.ProviderEmailVerified,
+		&state.ProviderBookingEmail, &state.ProviderBookingWhatsApp,
+		&state.ProviderReminderEnabled, &state.ProviderReminderMinutes,
+		&state.ProviderWhatsApp, &state.ProviderWhatsAppVerified,
+		&state.ProviderPreferenceRevision, &state.CurrentBookingEventSequence,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return bookingState{}, errors.New("notification booking no longer exists")
+	}
+	if err != nil {
+		return bookingState{}, fmt.Errorf("load notification booking state: %w", err)
+	}
+	if marketplaceCustomerID.Valid {
+		id := marketplaceCustomerID.UUID
+		state.MarketplaceCustomerID = &id
+	}
+	return state, nil
+}
+
+func (r *Repository) reconcileBookingTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	state bookingState,
+	event *bookingEvent,
+) error {
+	now := r.now()
+	candidates := make([]deliveryCandidate, 0, 10)
+	desiredProviderNewKeys := make([]string, 0, 2)
+	if event != nil && event.Type == "booking_created" && state.ConsentPolicyRevision == 1 &&
+		state.CustomerEmail != "" && state.MarketplaceBookingEmail {
+		candidates = append(candidates, deliveryCandidate{
+			audience: "customer", channel: "email", notificationType: "customer_booking_received",
+			templateKey: "customer_booking_received", scheduledFor: now,
+			destination: state.CustomerEmail, idempotencyKey: "customer_booking_received:" + state.ID.String(),
+		})
+	}
+	secured := bookingSecured(state)
+	providerLifecycleEligible := providerBookingStatusEligible(state.Status) && secured
+	if providerLifecycleEligible {
+		if state.ProviderBookingEmail && state.ProviderEmailVerified && state.ProviderEmail != "" {
+			candidate := deliveryCandidate{
+				audience: "provider", channel: "email", notificationType: "provider_new_booking",
+				templateKey: "provider_new_booking", scheduledFor: now, destination: state.ProviderEmail,
+				preferenceRevision: state.ProviderPreferenceRevision,
+				idempotencyKey:     "provider_new_booking:" + state.ID.String() + ":email",
+			}
+			candidates = append(candidates, candidate)
+			desiredProviderNewKeys = append(desiredProviderNewKeys, candidate.idempotencyKey)
+		}
+		if state.ProviderBookingWhatsApp && state.ProviderWhatsAppVerified && state.ProviderWhatsApp != "" &&
+			r.templateEnabled(whatsapp.TemplateProviderNewBooking) {
+			candidate := deliveryCandidate{
+				audience: "provider", channel: "whatsapp", notificationType: "provider_new_booking",
+				templateKey: string(whatsapp.TemplateProviderNewBooking), scheduledFor: now,
+				destination: state.ProviderWhatsApp, preferenceRevision: state.ProviderPreferenceRevision,
+				idempotencyKey: "provider_new_booking:" + state.ID.String() + ":whatsapp",
+			}
+			candidates = append(candidates, candidate)
+			desiredProviderNewKeys = append(desiredProviderNewKeys, candidate.idempotencyKey)
+		}
+	}
+	if event != nil {
+		candidates = append(candidates, r.eventCandidates(state, *event, now)...)
+	}
+	candidates = append(candidates, r.reminderCandidates(state, now)...)
+	desiredReminderKeys := make([]string, 0, 4)
+	for _, candidate := range candidates {
+		if candidate.notificationType == "appointment_reminder" {
+			desiredReminderKeys = append(desiredReminderKeys, candidate.idempotencyKey)
+		}
+		if err := r.insertDeliveryTx(ctx, tx, state, event, candidate); err != nil {
+			return err
+		}
+	}
+	if err := cancelUndesiredRemindersTx(ctx, tx, state.ID, desiredReminderKeys); err != nil {
+		return err
+	}
+	if err := r.reconcileInAppTx(ctx, tx, state, event); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE notification_deliveries SET status='cancelled',lease_owner='',lease_expires_at=NULL,
+			completed_at=NOW(),last_error_code='provider_delivery_no_longer_eligible',updated_at=NOW()
+		WHERE booking_id=$1 AND notification_type='provider_new_booking'
+		  AND status IN ('pending','retry','processing')
+		  AND NOT (idempotency_key=ANY($2::text[]))
+	`, state.ID, desiredProviderNewKeys); err != nil {
+		return fmt.Errorf("cancel ineligible provider booking deliveries: %w", err)
+	}
+	return nil
+}
+
+func (r *Repository) eventCandidates(state bookingState, event bookingEvent, now time.Time) []deliveryCandidate {
+	typeName := eventNotificationType(state, event)
+	if typeName == "" || typeName == "booking_completed" {
+		return nil
+	}
+	keySuffix := strconv.FormatInt(event.Sequence, 10)
+	items := make([]deliveryCandidate, 0, 2)
+	if state.ProviderBookingEmail && state.ProviderEmailVerified && state.ProviderEmail != "" {
+		items = append(items, deliveryCandidate{
+			audience: "provider", channel: "email", notificationType: typeName,
+			templateKey: typeName, scheduledFor: now, destination: state.ProviderEmail,
+			preferenceRevision: state.ProviderPreferenceRevision,
+			eventSequence:      event.Sequence,
+			idempotencyKey:     typeName + ":" + state.ID.String() + ":provider:email:" + keySuffix,
+		})
+	}
+	if state.ConsentPolicyRevision == 1 && state.CustomerEmail != "" && state.MarketplaceBookingEmail {
+		items = append(items, deliveryCandidate{
+			audience: "customer", channel: "email", notificationType: typeName,
+			templateKey: typeName, scheduledFor: now, destination: state.CustomerEmail,
+			eventSequence:  event.Sequence,
+			idempotencyKey: typeName + ":" + state.ID.String() + ":customer:email:" + keySuffix,
+		})
+	}
+	return items
+}
+
+func eventNotificationType(state bookingState, event bookingEvent) string {
+	switch {
+	case isTerminalBookingStatus(state.Status) && event.Payload.PreviousStatus != state.Status:
+		switch state.Status {
+		case "completed":
+			return "booking_completed"
+		case "expired":
+			return "booking_expired"
+		default:
+			return "booking_cancelled"
+		}
+	case !event.Payload.PreviousStartsAt.IsZero() && !event.Payload.PreviousStartsAt.Equal(state.StartAt):
+		return "booking_rescheduled"
+	case event.Payload.PreviousPaymentStatus != "" && event.Payload.PreviousPaymentStatus != state.PaymentStatus:
+		switch state.PaymentStatus {
+		case "deposit_paid_balance_due", "paid_in_full":
+			return "payment_satisfied"
+		case "payment_failed":
+			return "payment_failed"
+		case "refunded":
+			return "payment_refunded"
+		case "disputed":
+			return "payment_action_required"
+		}
+	}
+	return ""
+}
+
+func (r *Repository) reminderCandidates(state bookingState, now time.Time) []deliveryCandidate {
+	if !bookingSecured(state) || isTerminalBookingStatus(state.Status) || !state.StartAt.After(now) {
+		return nil
+	}
+	scheduledFor := state.StartAt.Add(-appointmentReminderMins * time.Minute)
+	if !scheduledFor.After(now) {
+		if state.StartAt.Sub(now) < 2*time.Hour {
+			return nil
+		}
+		scheduledFor = now
+	}
+	occurrence := state.StartAt.UTC()
+	offset := appointmentReminderMins
+	occurrenceKey := strconv.FormatInt(occurrence.Unix(), 10)
+	items := make([]deliveryCandidate, 0, 4)
+	if state.ProviderReminderEnabled && providerBookingStatusEligible(state.Status) {
+		if state.ProviderBookingEmail && state.ProviderEmailVerified && state.ProviderEmail != "" {
+			items = append(items, deliveryCandidate{
+				audience: "provider", channel: "email", notificationType: "appointment_reminder",
+				templateKey: "provider_booking_reminder", scheduledFor: scheduledFor,
+				reminderOccurrence: &occurrence, reminderMinutes: &offset,
+				destination: state.ProviderEmail, preferenceRevision: state.ProviderPreferenceRevision,
+				idempotencyKey: "appointment_reminder:" + state.ID.String() + ":provider:email:" + occurrenceKey,
+			})
+		}
+		if state.ProviderBookingWhatsApp && state.ProviderWhatsAppVerified && state.ProviderWhatsApp != "" &&
+			r.templateEnabled(whatsapp.TemplateProviderBookingReminder) {
+			items = append(items, deliveryCandidate{
+				audience: "provider", channel: "whatsapp", notificationType: "appointment_reminder",
+				templateKey: string(whatsapp.TemplateProviderBookingReminder), scheduledFor: scheduledFor,
+				reminderOccurrence: &occurrence, reminderMinutes: &offset,
+				destination: state.ProviderWhatsApp, preferenceRevision: state.ProviderPreferenceRevision,
+				idempotencyKey: "appointment_reminder:" + state.ID.String() + ":provider:whatsapp:" + occurrenceKey,
+			})
+		}
+	}
+	if state.Status == "confirmed" && state.ConsentPolicyRevision == 1 {
+		if state.EmailReminderConsent && state.MarketplaceBookingEmail && state.CustomerEmail != "" {
+			items = append(items, deliveryCandidate{
+				audience: "customer", channel: "email", notificationType: "appointment_reminder",
+				templateKey: "customer_booking_reminder", scheduledFor: scheduledFor,
+				reminderOccurrence: &occurrence, reminderMinutes: &offset,
+				destination:    state.CustomerEmail,
+				idempotencyKey: "appointment_reminder:" + state.ID.String() + ":customer:email:" + occurrenceKey,
+			})
+		}
+		if state.WhatsAppConsent && state.MarketplaceBookingWhatsApp && state.CustomerWhatsApp != "" &&
+			r.templateEnabled(whatsapp.TemplateUserReminder) {
+			items = append(items, deliveryCandidate{
+				audience: "customer", channel: "whatsapp", notificationType: "appointment_reminder",
+				templateKey: string(whatsapp.TemplateUserReminder), scheduledFor: scheduledFor,
+				reminderOccurrence: &occurrence, reminderMinutes: &offset,
+				destination:    state.CustomerWhatsApp,
+				idempotencyKey: "appointment_reminder:" + state.ID.String() + ":customer:whatsapp:" + occurrenceKey,
+			})
+		}
+	}
+	return items
+}
+
+func (r *Repository) insertDeliveryTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	state bookingState,
+	event *bookingEvent,
+	candidate deliveryCandidate,
+) error {
+	destinationHMAC := r.destinationFingerprint(candidate.channel, candidate.destination)
+	var suppressed bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM notification_contact_suppressions
+		 WHERE channel=$1 AND destination_hmac=$2)
+	`, candidate.channel, destinationHMAC).Scan(&suppressed); err != nil {
+		return fmt.Errorf("check notification suppression: %w", err)
+	}
+	if suppressed {
+		return nil
+	}
+	var eventID any
+	eventSequence := state.CurrentBookingEventSequence
+	if event != nil {
+		eventID = event.ID
+	}
+	if candidate.eventSequence > 0 {
+		eventSequence = candidate.eventSequence
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO notification_deliveries (
+			id,idempotency_key,client_id,marketplace_customer_id,booking_id,booking_event_id,
+			booking_event_sequence,audience_type,channel,notification_type,template_key,
+			reminder_occurrence_at,reminder_offset_minutes,scheduled_for,destination_hmac,
+			preference_revision,status,next_attempt_at,created_at,updated_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$14,NOW(),NOW())
+		ON CONFLICT (idempotency_key) DO UPDATE SET
+			booking_event_id=EXCLUDED.booking_event_id,
+			booking_event_sequence=EXCLUDED.booking_event_sequence,
+			scheduled_for=EXCLUDED.scheduled_for,next_attempt_at=EXCLUDED.next_attempt_at,
+			destination_hmac=EXCLUDED.destination_hmac,
+			preference_revision=EXCLUDED.preference_revision,status='pending',
+			last_error_code='',completed_at=NULL,updated_at=NOW()
+		WHERE notification_deliveries.status IN ('pending','retry','cancelled','failed')
+		  AND notification_deliveries.dispatch_authorized_at IS NULL
+	`, uuid.New(), candidate.idempotencyKey, state.ClientID, state.MarketplaceCustomerID,
+		state.ID, eventID, eventSequence, candidate.audience, candidate.channel,
+		candidate.notificationType, candidate.templateKey, candidate.reminderOccurrence,
+		candidate.reminderMinutes, candidate.scheduledFor, destinationHMAC, candidate.preferenceRevision)
+	if err != nil {
+		return fmt.Errorf("upsert notification delivery: %w", err)
+	}
+	return nil
+}
+
+func cancelUndesiredRemindersTx(ctx context.Context, tx pgx.Tx, bookingID uuid.UUID, desired []string) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE notification_deliveries SET status='cancelled',lease_owner='',lease_expires_at=NULL,
+			completed_at=NOW(),last_error_code='reminder_no_longer_eligible',updated_at=NOW()
+		WHERE booking_id=$1 AND notification_type='appointment_reminder'
+		  AND status IN ('pending','retry','processing')
+		  AND NOT (idempotency_key=ANY($2::text[]))
+	`, bookingID, desired)
+	if err != nil {
+		return fmt.Errorf("cancel stale appointment reminders: %w", err)
+	}
+	return nil
+}
+
+func bookingSecured(state bookingState) bool {
+	paymentSatisfied := state.PaymentStatus == "deposit_paid_balance_due" || state.PaymentStatus == "paid_in_full"
+	agreementSatisfied := !state.AgreementRequired || state.AgreementStatus == "accepted" || state.AgreementStatus == "signed"
+	return paymentSatisfied && agreementSatisfied && state.ReservationExpiredAt == nil
+}
+
+func providerBookingStatusEligible(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "booked", "pending", "confirmed":
+		return true
+	default:
+		return false
+	}
+}
+
+func isTerminalBookingStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "cancelled", "canceled", "declined", "completed", "no_show", "expired":
+		return true
+	default:
+		return false
+	}
+}

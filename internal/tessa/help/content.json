@@ -1,0 +1,47 @@
+{
+  "revision": "2026-08-30",
+  "sections": [
+    {
+      "id": "bookings-overview",
+      "title": "View and manage bookings",
+      "tags": ["booking", "schedule", "confirm", "decline", "complete", "no-show"],
+      "content": "Providers can review bookings from the Bookings and Schedule screens. Booking details show the canonical status, date, time, service, payment status and the actions currently allowed by Tellbook. Available provider actions can include confirm, decline, complete and mark as no-show; the exact actions depend on the booking's current state.",
+      "route_id": "bookings"
+    },
+    {
+      "id": "services-management",
+      "title": "Manage services",
+      "tags": ["service", "price", "duration", "visibility", "section"],
+      "content": "Providers manage service titles, descriptions, prices, durations, fulfillment details and visibility from Services. Services may be arranged into sections. A service must meet Tellbook's publishing requirements before customers can book it from the public or marketplace surfaces.",
+      "route_id": "services"
+    },
+    {
+      "id": "availability-basics",
+      "title": "How availability is calculated",
+      "tags": ["availability", "free", "business hours", "calendar", "capacity"],
+      "content": "Tellbook calculates availability from configured business hours, service duration, fulfillment and location rules, existing bookings and the provider's concurrent booking capacity. The booking flow revalidates a selected slot before creating a booking, so an earlier availability result is not a reservation.",
+      "route_id": "business-hours"
+    },
+    {
+      "id": "native-inbox",
+      "title": "Tellbook inbox",
+      "tags": ["inbox", "message", "conversation", "customer", "social"],
+      "content": "The Tellbook inbox contains native conversations between providers and marketplace customers. Connected social channels are not included until their connector is enabled. Providers can open a conversation, send messages, mark it read and archive it without changing the related booking.",
+      "route_id": "inbox"
+    },
+    {
+      "id": "payments-and-payouts",
+      "title": "Payments and payouts",
+      "tags": ["payment", "paid", "payout", "settlement", "balance"],
+      "content": "Booking payment status comes from Tellbook's stored payment records. A successful collection is not automatically the same as an available payout: settlement evidence, allocation eligibility and the provider balance determine whether funds can be paid out. Providers can review payment and payout state from the corresponding Tellbook screens.",
+      "route_id": "payments"
+    },
+    {
+      "id": "tessa-scope",
+      "title": "What Tessa can help with",
+      "tags": ["tessa", "assistant", "help", "scope", "privacy"],
+      "content": "Tessa is a private assistant for authenticated Tellbook service providers. It answers questions about supported Tellbook functionality and the provider's authorized business data. In the first release Tessa is read-only: it cannot create, reschedule, cancel or refund a booking, send a customer message, edit services or initiate a payment or payout.",
+      "route_id": "home"
+    }
+  ]
+}

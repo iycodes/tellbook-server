@@ -1,0 +1,13 @@
+{
+  "base_url": "https://staging-api.example.com/v1",
+  "duration_seconds": 300,
+  "ramp_seconds": 60,
+  "streams_per_identity": 1,
+  "reconnect_each_stream": false,
+  "reconnect_after_seconds": 30,
+  "message_rate_per_second": 0,
+  "max_in_flight_messages": 200,
+  "read_probe_rate_per_second": 0,
+  "max_in_flight_reads": 200,
+  "identities_file": "./inbox-load.identities.ndjson"
+}

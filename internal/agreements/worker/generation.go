@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -19,6 +20,10 @@ type GenerationJobStore interface {
 	ClaimGenerationJobs(context.Context, string, int, time.Duration) ([]domain.TemplateGenerationJob, error)
 	CompleteGenerationJob(context.Context, repository.CompleteGenerationJobParams) error
 	FailGenerationJob(context.Context, uuid.UUID, string, string, string, time.Time, bool) error
+}
+
+type generationJobScheduleStore interface {
+	NextGenerationJobDelay(context.Context, time.Duration) time.Duration
 }
 
 type AgreementDocumentGenerator interface {
@@ -89,20 +94,31 @@ func NewGenerationWorker(
 	}, nil
 }
 
-func (w *GenerationWorker) Start(ctx context.Context) {
+func (w *GenerationWorker) Start(ctx context.Context, wakes ...<-chan struct{}) {
 	if w == nil {
 		return
 	}
-	ticker := time.NewTicker(w.pollInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	wake := firstWake(wakes)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			w.RunOnce(ctx)
+		case <-wake:
+		case <-timer.C:
 		}
+		w.RunOnce(ctx)
+		timer.Reset(w.nextWakeDelay(ctx))
 	}
+}
+
+func (w *GenerationWorker) nextWakeDelay(ctx context.Context) time.Duration {
+	fallback := time.Duration(float64(w.pollInterval) * (0.8 + rand.Float64()*0.4))
+	if scheduler, ok := w.store.(generationJobScheduleStore); ok {
+		return scheduler.NextGenerationJobDelay(ctx, fallback)
+	}
+	return fallback
 }
 
 func (w *GenerationWorker) RunOnce(ctx context.Context) {

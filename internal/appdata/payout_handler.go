@@ -233,6 +233,8 @@ func (h *Handler) createPayout(w http.ResponseWriter, r *http.Request) {
 			})
 		case errors.Is(err, payments.ErrIdempotencyConflict):
 			writeError(w, http.StatusConflict, "idempotency_conflict", "That idempotency key was already used for different payout details.")
+		case errors.Is(err, payments.ErrPayoutInitiationBusy):
+			writeError(w, http.StatusConflict, "payout_in_progress", "Another payout is being initiated. Please try again shortly.")
 		case errors.Is(err, payments.ErrLedgerRecordNotFound):
 			writeError(w, http.StatusNotFound, "payout_source_not_found", "The payout allocation or destination was not found.")
 		case errors.Is(err, capabilities.ErrCapabilityNotReady), errors.Is(err, capabilities.ErrUnsupportedCapability):

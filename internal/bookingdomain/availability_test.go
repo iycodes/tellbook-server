@@ -9,12 +9,13 @@ func TestGenerateAvailableSlotsFitsPrepAndBufferInsideWindow(t *testing.T) {
 	location := time.FixedZone("WAT", 60*60)
 	date := time.Date(2026, time.August, 10, 0, 0, 0, 0, location)
 	slots, err := GenerateAvailableSlots(AvailabilityRequest{
-		Date:              date,
-		Now:               date.Add(-24 * time.Hour),
-		Location:          location,
-		DurationMinutes:   60,
-		PrepTimeMinutes:   15,
-		BufferTimeMinutes: 15,
+		Date:               date,
+		Now:                date.Add(-24 * time.Hour),
+		Location:           location,
+		DurationMinutes:    60,
+		PrepTimeMinutes:    15,
+		BufferTimeMinutes:  15,
+		ConcurrentCapacity: 1,
 		Windows: []AvailabilityWindow{{
 			DayOfWeek:           time.Monday,
 			StartMinuteOfDay:    9 * 60,
@@ -40,10 +41,11 @@ func TestGenerateAvailableSlotsUsesOccupiedRanges(t *testing.T) {
 	location := time.UTC
 	date := time.Date(2026, time.August, 10, 0, 0, 0, 0, location)
 	slots, err := GenerateAvailableSlots(AvailabilityRequest{
-		Date:            date,
-		Now:             date.Add(-time.Hour),
-		Location:        location,
-		DurationMinutes: 60,
+		Date:               date,
+		Now:                date.Add(-time.Hour),
+		Location:           location,
+		DurationMinutes:    60,
+		ConcurrentCapacity: 1,
 		Windows: []AvailabilityWindow{{
 			DayOfWeek:           time.Monday,
 			StartMinuteOfDay:    9 * 60,
@@ -61,6 +63,30 @@ func TestGenerateAvailableSlotsUsesOccupiedRanges(t *testing.T) {
 	if len(slots) != 1 || slots[0].Start.Hour() != 11 {
 		t.Fatalf("slots = %#v, want only 11:00", slots)
 	}
+
+	slots, err = GenerateAvailableSlots(AvailabilityRequest{
+		Date:               date,
+		Now:                date.Add(-time.Hour),
+		Location:           location,
+		DurationMinutes:    60,
+		ConcurrentCapacity: 2,
+		Windows: []AvailabilityWindow{{
+			DayOfWeek:           time.Monday,
+			StartMinuteOfDay:    9 * 60,
+			EndMinuteOfDay:      12 * 60,
+			SlotIntervalMinutes: 60,
+		}},
+		BusyRanges: []OccupiedRange{{
+			Start: date.Add(9*time.Hour + 45*time.Minute),
+			End:   date.Add(10*time.Hour + 15*time.Minute),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(slots) != 3 {
+		t.Fatalf("slots with capacity 2 = %#v, want all three slots", slots)
+	}
 }
 
 func TestGenerateAvailableSlotsHonorsMinimumNoticeAndDailyLimit(t *testing.T) {
@@ -73,6 +99,7 @@ func TestGenerateAvailableSlotsHonorsMinimumNoticeAndDailyLimit(t *testing.T) {
 		MinimumNoticeMinutes: 120,
 		MaxBookingsPerDay:    2,
 		ExistingServiceCount: 1,
+		ConcurrentCapacity:   1,
 		Windows: []AvailabilityWindow{{
 			DayOfWeek:           time.Monday,
 			StartMinuteOfDay:    9 * 60,

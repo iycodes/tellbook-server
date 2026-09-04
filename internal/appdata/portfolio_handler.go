@@ -2,7 +2,6 @@ package appdata
 
 import (
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -49,6 +48,10 @@ func (h *Handler) createPortfolioItem(w http.ResponseWriter, r *http.Request) {
 
 	item, err := h.repo.CreatePortfolioItem(r.Context(), authedClient.ID, input)
 	if err != nil {
+		if errors.Is(err, ErrPortfolioItemLimitReached) {
+			writeError(w, http.StatusConflict, "portfolio_item_limit_reached", "You can add up to 50 gallery photos.")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "create_portfolio_item_failed", err.Error())
 		return
 	}
@@ -115,11 +118,7 @@ func (h *Handler) deletePortfolioItem(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) isOwnedPortfolioImage(clientID uuid.UUID, imageURL string) bool {
-	if h.storage == nil {
-		return false
-	}
-	parsed, ok := h.storage.ParseStorageURL(strings.TrimSpace(imageURL))
-	return ok && parsed.BucketName == h.storage.PrivateBucketName() && strings.HasPrefix(parsed.ObjectKey, fmt.Sprintf("clients/%s/portfolio/", clientID))
+	return h.isOwnedPublicImage(clientID, imageURL, "portfolio")
 }
 
 func (h *Handler) deleteOwnedPortfolioImage(r *http.Request, clientID uuid.UUID, imageURL string) {

@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	agreementJobPollInterval = 2 * time.Second
+	agreementJobPollInterval = 25 * time.Second
 	agreementJobLease        = 2 * time.Minute
 )
 
@@ -68,9 +68,10 @@ func NewLifecycleWorker(
 	}, nil
 }
 
-func (w *LifecycleWorker) Start(ctx context.Context) {
+func (w *LifecycleWorker) Start(ctx context.Context, wakes ...<-chan struct{}) {
 	ticker := time.NewTicker(agreementJobPollInterval)
 	defer ticker.Stop()
+	wake := firstWake(wakes)
 	for {
 		processed, err := w.ProcessOne(ctx)
 		if err != nil && !errors.Is(err, context.Canceled) {
@@ -85,9 +86,17 @@ func (w *LifecycleWorker) Start(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-wake:
 		case <-ticker.C:
 		}
 	}
+}
+
+func firstWake(wakes []<-chan struct{}) <-chan struct{} {
+	if len(wakes) == 0 {
+		return nil
+	}
+	return wakes[0]
 }
 
 func (w *LifecycleWorker) ProcessOne(ctx context.Context) (bool, error) {

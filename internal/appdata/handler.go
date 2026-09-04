@@ -1,11 +1,14 @@
 package appdata
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,64 +17,220 @@ import (
 	"booking/go-server/internal/auth"
 	"booking/go-server/internal/bookingdomain"
 	"booking/go-server/internal/mailer"
+	"booking/go-server/internal/marketplaceauth"
 	"booking/go-server/internal/markets"
+	"booking/go-server/internal/observability"
 	"booking/go-server/internal/payments"
+	"booking/go-server/internal/redisstore"
 	"booking/go-server/internal/storage"
+	"booking/go-server/internal/whatsapp"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
 
 var (
-	ErrNotFound              = errors.New("resource not found")
-	ErrHandleSlugTaken       = errors.New("public handle is already taken")
-	ErrInvalidHandleSlug     = errors.New("public handle is invalid")
-	ErrMarketLocked          = errors.New("profile market is locked by existing business data")
-	ErrMarketNotConfigured   = errors.New("profile market is not configured")
-	ErrLocationInUse         = errors.New("business location is used by a published service")
-	ErrQuoteExpired          = errors.New("booking quote has expired")
-	ErrSlotUnavailable       = errors.New("selected slot is no longer available")
-	ErrLocationNotAllowed    = errors.New("service is unavailable at this location")
-	ErrPromotionUnavailable  = errors.New("promotion is no longer available")
-	ErrLocationRequired      = errors.New("customer location is required")
-	ErrDiscountInvalid       = errors.New("discount code is invalid")
-	ErrOutsideServiceArea    = errors.New("location is outside the service area")
-	ErrInvalidPortfolioOrder = errors.New("portfolio order must include every photo exactly once")
+	ErrNotFound                         = errors.New("resource not found")
+	ErrHandleSlugTaken                  = errors.New("public handle is already taken")
+	ErrInvalidHandleSlug                = errors.New("public handle is invalid")
+	ErrInvalidConcurrentBookingCapacity = errors.New("concurrent booking capacity is invalid")
+	ErrMarketLocked                     = errors.New("profile market is locked by existing business data")
+	ErrMarketNotConfigured              = errors.New("profile market is not configured")
+	ErrLocationInUse                    = errors.New("business location is used by a published service")
+	ErrQuoteExpired                     = errors.New("booking quote has expired")
+	ErrBookingReplayConflict            = errors.New("booking quote was already consumed with different booking details")
+	ErrSlotUnavailable                  = errors.New("selected slot is no longer available")
+	ErrLocationNotAllowed               = errors.New("service is unavailable at this location")
+	ErrPromotionUnavailable             = errors.New("promotion is no longer available")
+	ErrLocationRequired                 = errors.New("customer location is required")
+	ErrDiscountInvalid                  = errors.New("discount code is invalid")
+	ErrOutsideServiceArea               = errors.New("location is outside the service area")
+	ErrInvalidPortfolioOrder            = errors.New("portfolio order must include every photo exactly once")
+	ErrMarketplaceNotReady              = errors.New("marketplace profile is not ready to publish")
+	ErrMarketplaceCategory              = errors.New("marketplace category is unavailable")
+	ErrMarketplaceRegion                = errors.New("marketplace region selection is invalid")
+	ErrMarketplaceCountry               = errors.New("marketplace country is unsupported")
+	ErrMarketplaceAvailabilityRange     = errors.New("marketplace availability date is outside the discovery horizon")
+	ErrInvalidContact                   = errors.New("booking contact details are invalid")
+	ErrInvalidQuoteRequest              = errors.New("booking quote request is invalid")
+	ErrIdempotencyConflict              = errors.New("idempotency key was already used for another quote request")
+	ErrInboxIdempotencyConflict         = errors.New("inbox idempotency key was already used for another message")
+	ErrInboxConversationDisabled        = errors.New("inbox conversation is disabled")
+	ErrInboxBookingContext              = errors.New("inbox booking context does not belong to the conversation")
+	ErrInboxInvalidContent              = errors.New("inbox message content is invalid")
+	ErrInboxInvalidPresentation         = errors.New("inbox message presentation is invalid")
+	ErrInboxInvalidCursor               = errors.New("inbox cursor is invalid")
+	ErrInboxAIDraftStale                = errors.New("inbox ai draft context is stale")
+	ErrInboxAIDraftInvalid              = errors.New("inbox ai draft is invalid")
+	ErrInboxAIDraftInProgress           = errors.New("inbox ai draft is already being generated")
+	ErrInboxAIAutomationUnavailable     = errors.New("inbox ai automation is unavailable")
+	ErrInboxAIRevisionConflict          = errors.New("inbox ai state revision conflict")
+	ErrInboxAIServiceUnavailable        = errors.New("inbox ai service is unavailable")
+	ErrInboxAIControlBlocked            = errors.New("inbox ai conversation control blocks automation")
+	ErrInboxAIInvalidState              = errors.New("inbox ai state is invalid")
 )
 
 type Handler struct {
-	repo           *Repository
-	agreements     *agreementrepo.Repository
-	auth           *auth.Handler
-	destinations   *payments.DestinationService
-	storage        *storage.R2Service
-	mailer         mailer.Sender
-	ai             *aisvc.Client
-	checkout       *payments.CheckoutService
-	payoutService  *payments.PayoutService
-	paymentEvents  *payments.PaymentEventBroker
-	activePayments *payments.ActivePaymentReconciler
-	publicBaseURL  string
+	repo                     *Repository
+	agreements               *agreementrepo.Repository
+	auth                     *auth.Handler
+	destinations             *payments.DestinationService
+	storage                  *storage.R2Service
+	mailer                   mailer.Sender
+	ai                       *aisvc.Client
+	checkout                 *payments.CheckoutService
+	payoutService            *payments.PayoutService
+	paymentEvents            *payments.PaymentEventBroker
+	paymentReconciliations   *payments.PaymentReconciliationScheduler
+	inboxEvents              *InboxEventBroker
+	bookingEvents            *BookingEventBroker
+	inboxCommands            *InboxCommandLimiter
+	inboxMetrics             *InboxMetrics
+	operationalMetrics       *observability.Metrics
+	streamBudget             *StreamBudget
+	paymentStreamBudget      *StreamBudget
+	publicBaseURL            string
+	marketplaceBaseURL       string
+	marketplaceAuth          *marketplaceauth.Handler
+	inboxAIDraftsEnabled     bool
+	inboxAIModelProvider     string
+	inboxAIModelName         string
+	inboxAIModelConfigHash   string
+	inboxAIProviderAllowlist map[uuid.UUID]struct{}
+	inboxAIGenerationLimiter *InboxAIGenerationLimiter
+	tessaEnabled             bool
+	tessaProviderAllowlist   map[uuid.UUID]struct{}
+	tessaNoticeRevision      string
+	tessaPrimaryProvider     string
+	tessaPrimaryModel        string
+	tessaConfigHash          string
+	tessaEvents              *TessaEventBroker
+	notificationContacts     *whatsapp.ContactFoundationRepository
 }
 
-func NewHandler(repo *Repository, authHandler *auth.Handler, destinationService *payments.DestinationService, storageService *storage.R2Service, mailerSender mailer.Sender, aiClient *aisvc.Client, checkoutService *payments.CheckoutService, payoutService *payments.PayoutService, paymentEvents *payments.PaymentEventBroker, activePayments *payments.ActivePaymentReconciler, publicBaseURL string) *Handler {
+func (h *Handler) ConfigureMarketplaceAuthentication(handler *marketplaceauth.Handler) {
+	h.marketplaceAuth = handler
+}
+
+func (h *Handler) ConfigureInboxEvents(broker *InboxEventBroker) {
+	h.inboxEvents = broker
+}
+
+func (h *Handler) ConfigureBookingEvents(broker *BookingEventBroker) {
+	h.bookingEvents = broker
+}
+
+func (h *Handler) ConfigureNotificationContacts(repository *whatsapp.ContactFoundationRepository) {
+	h.notificationContacts = repository
+}
+
+func (h *Handler) ConfigureStreamBudgets(maxTotal, maxRemote, maxPaymentToken int) {
+	h.streamBudget = NewStreamBudget(maxTotal, maxRemote, 0)
+	h.paymentStreamBudget = NewStreamBudget(0, 0, maxPaymentToken)
+}
+
+func (h *Handler) ConfigureOperationalMetrics(metrics *observability.Metrics) {
+	h.operationalMetrics = metrics
+}
+
+func (h *Handler) ConfigureInboxCommandLimiter(shared interface {
+	AllowTokenBuckets(context.Context, ...redisstore.TokenBucketRequest) (bool, time.Duration, error)
+}) {
+	h.inboxCommands = NewInboxCommandLimiter(shared)
+}
+
+func (h *Handler) ConfigureTessa(
+	enabled bool,
+	providerAllowlist []string,
+	noticeRevision, primaryProvider, primaryModel, configHash string,
+	broker *TessaEventBroker,
+) {
+	h.tessaEnabled = enabled
+	h.tessaNoticeRevision = strings.TrimSpace(noticeRevision)
+	h.tessaPrimaryProvider = strings.TrimSpace(primaryProvider)
+	h.tessaPrimaryModel = strings.TrimSpace(primaryModel)
+	h.tessaConfigHash = strings.TrimSpace(configHash)
+	h.tessaEvents = broker
+	h.tessaProviderAllowlist = make(map[uuid.UUID]struct{}, len(providerAllowlist))
+	for _, rawID := range providerAllowlist {
+		if id, err := uuid.Parse(strings.TrimSpace(rawID)); err == nil {
+			h.tessaProviderAllowlist[id] = struct{}{}
+		}
+	}
+}
+
+func (h *Handler) tessaAvailable(clientID uuid.UUID) bool {
+	if !h.tessaEnabled || h.repo == nil || h.tessaEvents == nil {
+		return false
+	}
+	_, allowed := h.tessaProviderAllowlist[clientID]
+	return allowed
+}
+
+func (h *Handler) ConfigureInboxAIDrafts(enabled bool, modelProvider, modelName, modelConfigHash string, providerAllowlist []string, limiter *InboxAIGenerationLimiter) {
+	h.inboxAIDraftsEnabled = enabled
+	h.inboxAIModelProvider = strings.TrimSpace(modelProvider)
+	h.inboxAIModelName = strings.TrimSpace(modelName)
+	h.inboxAIModelConfigHash = strings.TrimSpace(modelConfigHash)
+	h.inboxAIProviderAllowlist = make(map[uuid.UUID]struct{}, len(providerAllowlist))
+	for _, rawID := range providerAllowlist {
+		if id, err := uuid.Parse(strings.TrimSpace(rawID)); err == nil {
+			h.inboxAIProviderAllowlist[id] = struct{}{}
+		}
+	}
+	h.inboxAIGenerationLimiter = limiter
+}
+
+func (h *Handler) ConfigureInboxAIAutomation(
+	enabled bool,
+	providerAllowlist []string,
+	replyDelays ...time.Duration,
+) {
+	if h.repo != nil {
+		h.repo.ConfigureInboxAIAutomation(enabled, providerAllowlist, replyDelays...)
+	}
+}
+
+func (h *Handler) inboxAIDraftsAvailable(clientID uuid.UUID) bool {
+	if !h.inboxAIDraftsEnabled {
+		return false
+	}
+	if len(h.inboxAIProviderAllowlist) == 0 {
+		return true
+	}
+	_, allowed := h.inboxAIProviderAllowlist[clientID]
+	return allowed
+}
+
+func (h *Handler) InboxMetrics() *InboxMetrics { return h.inboxMetrics }
+
+func NewHandler(repo *Repository, authHandler *auth.Handler, destinationService *payments.DestinationService, storageService *storage.R2Service, mailerSender mailer.Sender, aiClient *aisvc.Client, checkoutService *payments.CheckoutService, payoutService *payments.PayoutService, paymentEvents *payments.PaymentEventBroker, paymentReconciliations *payments.PaymentReconciliationScheduler, publicBaseURL string, marketplaceBaseURLs ...string) *Handler {
 	var agreements *agreementrepo.Repository
 	if repo != nil {
 		agreements = agreementrepo.New(repo.db)
 	}
+	marketplaceBaseURL := strings.TrimRight(strings.TrimSpace(publicBaseURL), "/")
+	if len(marketplaceBaseURLs) > 0 && strings.TrimSpace(marketplaceBaseURLs[0]) != "" {
+		marketplaceBaseURL = strings.TrimRight(strings.TrimSpace(marketplaceBaseURLs[0]), "/")
+	}
 	return &Handler{
-		repo:           repo,
-		agreements:     agreements,
-		auth:           authHandler,
-		destinations:   destinationService,
-		storage:        storageService,
-		mailer:         mailerSender,
-		ai:             aiClient,
-		checkout:       checkoutService,
-		payoutService:  payoutService,
-		paymentEvents:  paymentEvents,
-		activePayments: activePayments,
-		publicBaseURL:  strings.TrimRight(strings.TrimSpace(publicBaseURL), "/"),
+		repo:                   repo,
+		agreements:             agreements,
+		auth:                   authHandler,
+		destinations:           destinationService,
+		storage:                storageService,
+		mailer:                 mailerSender,
+		ai:                     aiClient,
+		checkout:               checkoutService,
+		payoutService:          payoutService,
+		paymentEvents:          paymentEvents,
+		paymentReconciliations: paymentReconciliations,
+		inboxCommands:          NewInboxCommandLimiter(),
+		inboxMetrics:           NewInboxMetrics(),
+		streamBudget:           NewStreamBudget(10_000, 40, 0),
+		paymentStreamBudget:    NewStreamBudget(0, 0, 6),
+		publicBaseURL:          strings.TrimRight(strings.TrimSpace(publicBaseURL), "/"),
+		marketplaceBaseURL:     marketplaceBaseURL,
 	}
 }
 
@@ -85,19 +244,43 @@ func (h *Handler) Routes(r chi.Router) {
 		r.Get("/stats", h.getStatsOverview)
 		r.Get("/revenue", h.getRevenueOverview)
 		r.Get("/bookings", h.listBookings)
+		r.Get("/bookings/events", h.streamProviderBookingEvents)
 		r.Get("/bookings/optimization-insight", h.getBookingOptimizationInsight)
 		r.Get("/bookings/{bookingID}", h.getBookingDetails)
-		r.Get("/inbox/ws", h.streamInboxListWebSocket)
-		r.Get("/inbox/conversations", h.listInboxConversations)
-		r.Get("/inbox/conversations/{conversationID}", h.getInboxConversationDetails)
-		r.Get("/inbox/conversations/{conversationID}/ws", h.streamInboxConversationWebSocket)
-		r.Patch("/inbox/conversations/{conversationID}/compose-state", h.updateInboxConversationComposeState)
-		r.Post("/inbox/conversations/{conversationID}/suggest-reply", h.suggestInboxConversationReply)
-		r.Patch("/inbox/conversations/{conversationID}/controls", h.updateInboxConversationControls)
-		r.Post("/inbox/conversations/{conversationID}/messages", h.sendInboxConversationMessage)
+		r.Post("/bookings/{bookingID}/confirm", h.confirmProviderBooking)
+		r.Post("/bookings/{bookingID}/decline", h.declineProviderBooking)
+		r.Post("/bookings/{bookingID}/complete", h.completeProviderBooking)
+		r.Post("/bookings/{bookingID}/mark-no-show", h.markProviderBookingNoShow)
 		r.Get("/customers", h.listCustomers)
 		r.Get("/customers/{customerID}", h.getCustomerDetails)
+		r.Get("/inbox/conversations", h.listProviderConversations)
+		r.Get("/inbox/unread-count", h.getProviderInboxUnreadCount)
+		r.Get("/inbox/events", h.streamProviderInboxEvents)
+		r.Get("/inbox/conversations/{conversationID}", h.getProviderConversation)
+		r.Get("/tessa/bootstrap", h.getTessaBootstrap)
+		r.Post("/tessa/introduction/complete", h.completeTessaIntroduction)
+		r.Post("/tessa/threads", h.createTessaThread)
+		r.Get("/tessa/threads/{threadID}/messages", h.listOlderTessaMessages)
+		r.Post("/tessa/threads/{threadID}/messages", h.sendTessaMessage)
+		r.Post("/tessa/runs/{runID}/cancel", h.cancelTessaRun)
+		r.Get("/tessa/events", h.streamTessaEvents)
+		r.Get("/inbox/ai-policy", h.getProviderInboxAIPolicy)
+		r.Put("/inbox/ai-policy", h.updateProviderInboxAIPolicy)
+		r.Get("/inbox/conversations/{conversationID}/ai-control", h.getProviderInboxAIControl)
+		r.Put("/inbox/conversations/{conversationID}/ai-control", h.updateProviderInboxAIControl)
+		r.Get("/inbox/conversations/{conversationID}/ai-session", h.getProviderInboxAISession)
+		r.Get("/inbox/conversations/{conversationID}/messages", h.listOlderProviderMessages)
+		r.Post("/inbox/conversations/{conversationID}/messages", h.sendProviderMessage)
+		r.Post("/inbox/conversations/{conversationID}/ai-drafts", h.generateProviderInboxAIDraft)
+		r.Get("/inbox/conversations/{conversationID}/ai-drafts/{runID}", h.getProviderInboxAIDraft)
+		r.Post("/inbox/conversations/{conversationID}/ai-drafts/{runID}/discard", h.discardProviderInboxAIDraft)
+		r.Post("/inbox/conversations/{conversationID}/read", h.markProviderConversationRead)
+		r.Post("/inbox/conversations/{conversationID}/archive", h.archiveProviderConversation)
+		r.Post("/inbox/conversations/{conversationID}/unarchive", h.unarchiveProviderConversation)
 		r.Get("/notifications", h.getNotifications)
+		r.Get("/notification-preferences", h.getProviderNotificationPreferences)
+		r.Patch("/notification-preferences", h.updateProviderNotificationPreferences)
+		r.Post("/notification-preferences/whatsapp-verification", h.startProviderWhatsAppVerification)
 		r.Get("/automation-settings", h.listAutomationSettings)
 		r.Patch("/automation-settings/{key}", h.updateAutomationSetting)
 		r.Get("/agreement-templates", h.listAgreementTemplateFamilies)
@@ -162,6 +345,8 @@ func (h *Handler) Routes(r chi.Router) {
 		r.Get("/profile/handle-availability", h.checkHandleSlugAvailability)
 		r.Get("/profile", h.getClientProfile)
 		r.Put("/profile", h.updateClientProfile)
+		r.Get("/profile/marketplace", h.getMarketplaceProfileSettings)
+		r.Patch("/profile/marketplace", h.updateMarketplaceProfileSettings)
 		r.Patch("/profile/market", h.updateClientMarket)
 		r.Get("/portfolio", h.listPortfolioItems)
 		r.Post("/portfolio", h.createPortfolioItem)
@@ -184,11 +369,61 @@ func (h *Handler) Routes(r chi.Router) {
 		r.Post("/uploads/document", h.uploadDocument)
 	})
 
+	r.Route("/marketplace", func(r chi.Router) {
+		if h.marketplaceAuth != nil {
+			h.marketplaceAuth.Routes(r)
+		}
+		r.Get("/categories", h.listMarketplaceCategories)
+		r.Get("/regions", h.listMarketplaceRegions)
+		r.Get("/home", h.getMarketplaceHome)
+		r.Get("/providers", h.searchMarketplaceProviders)
+		if h.marketplaceAuth != nil {
+			r.Group(func(r chi.Router) {
+				r.Use(h.marketplaceAuth.AuthMiddleware())
+				r.Get("/saved-providers", h.listMarketplaceSavedProviders)
+				r.Get("/saved-providers/{providerID}", h.getMarketplaceProviderSaved)
+				r.Put("/saved-providers/{providerID}", h.saveMarketplaceProvider)
+				r.Delete("/saved-providers/{providerID}", h.removeMarketplaceSavedProvider)
+				r.Get("/notifications", h.listMarketplaceNotifications)
+				r.Post("/notifications/read-all", h.markAllMarketplaceNotificationsRead)
+				r.Post("/notifications/{notificationID}/read", h.markMarketplaceNotificationRead)
+				r.Get("/bookings", h.listMarketplaceCustomerBookings)
+				r.Post("/bookings/claims", h.claimMarketplaceCustomerBooking)
+				r.Get("/bookings/{bookingID}", h.getMarketplaceCustomerBooking)
+				r.Post("/bookings/{bookingID}/conversation", h.getOrCreateMarketplaceBookingConversation)
+				r.Post("/providers/{providerID}/conversation", h.getOrCreateMarketplaceProviderConversation)
+				r.Get("/conversations", h.listMarketplaceConversations)
+				r.Get("/conversations/unread-count", h.getMarketplaceInboxUnreadCount)
+				r.Get("/conversations/events", h.streamMarketplaceInboxEvents)
+				r.Get("/conversations/{conversationID}", h.getMarketplaceConversation)
+				r.Get("/conversations/{conversationID}/ai-booking", h.getMarketplaceInboxAIBookingWorkflow)
+				r.Post("/conversations/{conversationID}/ai-booking/start", h.startMarketplaceInboxAIBooking)
+				r.Post("/conversations/{conversationID}/ai-booking/availability", h.offerMarketplaceInboxAIAvailability)
+				r.Post("/conversations/{conversationID}/ai-booking/proposals", h.prepareMarketplaceInboxAIBookingProposal)
+				r.Post("/conversations/{conversationID}/ai-booking/proposals/{proposalID}/agreement", h.acceptMarketplaceInboxAIBookingAgreement)
+				r.Post("/conversations/{conversationID}/ai-booking/proposals/{proposalID}/confirm", h.confirmMarketplaceInboxAIBookingProposal)
+				r.Get("/conversations/{conversationID}/messages", h.listOlderMarketplaceMessages)
+				r.Post("/conversations/{conversationID}/messages", h.sendMarketplaceMessage)
+				r.Post("/conversations/{conversationID}/read", h.markMarketplaceConversationRead)
+				r.Post("/conversations/{conversationID}/ai-handoff", h.customerInboxAIHandoff)
+				r.Get("/bookings/{bookingID}/calendar", h.getMarketplaceCustomerBookingCalendar)
+				r.Get("/bookings/{bookingID}/receipt", h.getMarketplaceCustomerBookingReceipt)
+				r.Post("/bookings/{bookingID}/cancellation-quotes", h.createMarketplaceCancellationQuote)
+				r.Post("/bookings/{bookingID}/cancel", h.cancelMarketplaceBooking)
+				r.Post("/bookings/{bookingID}/reschedule-quotes", h.createMarketplaceRescheduleQuote)
+				r.Get("/bookings/{bookingID}/reschedule-availability", h.getMarketplaceRescheduleAvailability)
+				r.Post("/bookings/{bookingID}/reschedule", h.rescheduleMarketplaceBooking)
+			})
+		}
+	})
+
 	r.Route("/public", func(r chi.Router) {
 		r.Post("/locations/resolve", h.resolvePublicLocation)
 		r.Get("/clients/{slug}", h.getPublicProfile)
 		r.Get("/clients/{slug}/services", h.listPublicServices)
+		r.Get("/clients/{slug}/reviews", h.listPublicReviews)
 		r.Get("/clients/{slug}/availability", h.getPublicAvailability)
+		r.Get("/clients/{slug}/availability-range", h.getPublicAvailabilityRange)
 		r.Post("/clients/{slug}/booking-quotes", h.createPublicBookingQuote)
 		r.Post("/clients/{slug}/bookings", h.createPublicBooking)
 		r.Get("/agreements/{token}", h.getPublicAgreement)
@@ -234,13 +469,68 @@ func (h *Handler) listBookings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items, err := h.repo.ListBookings(r.Context(), authedClient.ID)
+	input, err := bookingListWindow(r, time.Now())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_booking_window", err.Error())
+		return
+	}
+	// Read the cursor first. An event committed after this read is intentionally
+	// observed by the next sync check, even if its booking enters this snapshot.
+	cursor, err := h.repo.LatestBookingEventCursor(r.Context(), authedClient.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "bookings_failed", "Could not load bookings.")
 		return
 	}
+	response, err := h.repo.ListBookingsWindow(r.Context(), authedClient.ID, input)
+	if errors.Is(err, ErrInvalidKeysetCursor) {
+		writeError(w, http.StatusBadRequest, "invalid_booking_cursor", "Booking cursor does not match this view.")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "bookings_failed", "Could not load bookings.")
+		return
+	}
+	response.SyncCursor = strconv.FormatInt(cursor, 10)
+	writeJSON(w, http.StatusOK, response)
+}
 
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+func bookingListWindow(r *http.Request, now time.Time) (BookingListInput, error) {
+	if strings.TrimSpace(r.URL.Query().Get("offset")) != "" {
+		return BookingListInput{}, errors.New("offset pagination is not supported; use cursor")
+	}
+	windowStart, windowEnd := defaultBookingListWindow(now)
+	parseBoundary := func(name string, fallback time.Time) (time.Time, error) {
+		raw := strings.TrimSpace(r.URL.Query().Get(name))
+		if raw == "" {
+			return fallback, nil
+		}
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("%s must be an RFC3339 timestamp", name)
+		}
+		return parsed.UTC(), nil
+	}
+	var err error
+	if windowStart, err = parseBoundary("from", windowStart); err != nil {
+		return BookingListInput{}, err
+	}
+	if windowEnd, err = parseBoundary("to", windowEnd); err != nil {
+		return BookingListInput{}, err
+	}
+	if !windowEnd.After(windowStart) || windowEnd.Sub(windowStart) > 2*365*24*time.Hour {
+		return BookingListInput{}, fmt.Errorf("booking window must be positive and no longer than two years")
+	}
+	limit := defaultBookingListLimit
+	if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+		limit, err = strconv.Atoi(rawLimit)
+		if err != nil || limit < 1 || limit > defaultBookingListLimit {
+			return BookingListInput{}, fmt.Errorf("limit must be between 1 and %d", defaultBookingListLimit)
+		}
+	}
+	return BookingListInput{
+		WindowStart: windowStart, WindowEnd: windowEnd,
+		Cursor: strings.TrimSpace(r.URL.Query().Get("cursor")), Limit: limit,
+	}, nil
 }
 
 func (h *Handler) getBookingDetails(w http.ResponseWriter, r *http.Request) {
@@ -293,14 +583,40 @@ func (h *Handler) listCustomers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items, err := h.repo.ListCustomers(r.Context(), authedClient.ID)
+	input, err := customerListInput(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_customer_list", err.Error())
+		return
+	}
+	response, err := h.repo.ListCustomers(r.Context(), authedClient.ID, input)
+	if errors.Is(err, ErrInvalidKeysetCursor) {
+		writeError(w, http.StatusBadRequest, "invalid_customer_cursor", "Customer cursor does not match these filters.")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "customers_failed", "Could not load customers.")
 		return
 	}
 
-	items = h.signCustomerItems(r.Context(), items)
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	response.Items = h.signCustomerItems(r.Context(), response.Items)
+	writeJSON(w, http.StatusOK, response)
+}
+
+func customerListInput(r *http.Request) (CustomerListInput, error) {
+	cursor := strings.TrimSpace(r.URL.Query().Get("cursor"))
+	limit, err := boundedListLimit(r, defaultCustomerListLimit, defaultCustomerListLimit)
+	if err != nil {
+		return CustomerListInput{}, err
+	}
+	includeCounts, err := listIncludeCounts(r, cursor == "")
+	if err != nil {
+		return CustomerListInput{}, err
+	}
+	return CustomerListInput{
+		Query:  strings.TrimSpace(r.URL.Query().Get("query")),
+		Filter: strings.TrimSpace(r.URL.Query().Get("filter")),
+		Cursor: cursor, Limit: limit, IncludeCounts: includeCounts,
+	}, nil
 }
 
 func (h *Handler) getCustomerDetails(w http.ResponseWriter, r *http.Request) {
@@ -337,7 +653,16 @@ func (h *Handler) getNotifications(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := h.repo.GetNotifications(r.Context(), authedClient.ID)
+	input, err := notificationListInput(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_notification_list", err.Error())
+		return
+	}
+	response, err := h.repo.GetNotifications(r.Context(), authedClient.ID, input)
+	if errors.Is(err, ErrInvalidKeysetCursor) {
+		writeError(w, http.StatusBadRequest, "invalid_notification_cursor", "Notification cursor does not match this filter.")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "notifications_failed", "Could not load notifications.")
 		return
@@ -345,6 +670,46 @@ func (h *Handler) getNotifications(w http.ResponseWriter, r *http.Request) {
 
 	response = h.signNotificationsResponse(r.Context(), response)
 	writeJSON(w, http.StatusOK, response)
+}
+
+func notificationListInput(r *http.Request) (NotificationListInput, error) {
+	cursor := strings.TrimSpace(r.URL.Query().Get("cursor"))
+	limit, err := boundedListLimit(r, defaultNotificationListLimit, defaultNotificationListLimit)
+	if err != nil {
+		return NotificationListInput{}, err
+	}
+	includeCounts, err := listIncludeCounts(r, cursor == "")
+	if err != nil {
+		return NotificationListInput{}, err
+	}
+	return NotificationListInput{
+		Filter: strings.TrimSpace(r.URL.Query().Get("filter")), Cursor: cursor,
+		Limit: limit, IncludeCounts: includeCounts,
+	}, nil
+}
+
+func boundedListLimit(r *http.Request, fallback, maximum int) (int, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get("limit"))
+	if raw == "" {
+		return fallback, nil
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit < 1 || limit > maximum {
+		return 0, fmt.Errorf("limit must be between 1 and %d", maximum)
+	}
+	return limit, nil
+}
+
+func listIncludeCounts(r *http.Request, fallback bool) (bool, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get("include_counts"))
+	if raw == "" {
+		return fallback, nil
+	}
+	include, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, errors.New("include_counts must be true or false")
+	}
+	return include, nil
 }
 
 func (h *Handler) listAutomationSettings(w http.ResponseWriter, r *http.Request) {
@@ -427,6 +792,19 @@ func (h *Handler) updateClientProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	if !h.validOptionalOwnedPublicImage(authedClient.ID, input.HeroImageURL, "profiles") {
+		writeError(w, http.StatusBadRequest, "invalid_profile_image", "Upload the profile image before saving it.")
+		return
+	}
+
+	previousHeroImageURL := ""
+	currentProfile, err := h.repo.GetClientProfile(r.Context(), authedClient.ID)
+	if err == nil {
+		previousHeroImageURL = currentProfile.HeroImageURL
+	} else if !errors.Is(err, ErrNotFound) {
+		writeError(w, http.StatusInternalServerError, "profile_failed", "Could not load the current client profile.")
+		return
+	}
 
 	if err := h.repo.UpdateClientProfile(r.Context(), authedClient.ID, input); err != nil {
 		writeProfileUpdateError(w, err)
@@ -438,6 +816,7 @@ func (h *Handler) updateClientProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "profile_failed", "Could not load updated client profile.")
 		return
 	}
+	h.deleteReplacedPublicImage(r.Context(), authedClient.ID, previousHeroImageURL, profile.HeroImageURL, "profiles")
 
 	profile = h.signClientProfileResponse(r.Context(), profile)
 	writeJSON(w, http.StatusOK, profile)
@@ -495,6 +874,8 @@ func writeProfileUpdateError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "invalid_handle_slug", "Public handle must contain letters, numbers, or hyphens and be 64 characters or fewer.")
 	case errors.Is(err, ErrHandleSlugTaken):
 		writeError(w, http.StatusConflict, "handle_slug_taken", "That public handle is already taken.")
+	case errors.Is(err, ErrInvalidConcurrentBookingCapacity):
+		writeError(w, http.StatusBadRequest, "invalid_concurrent_booking_capacity", "Concurrent booking capacity must be between 1 and 50.")
 	default:
 		writeError(w, http.StatusInternalServerError, "profile_update_failed", "Could not update client profile.")
 	}
@@ -534,7 +915,25 @@ func (h *Handler) getPublicProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := h.repo.GetPublicProfileBySlug(r.Context(), slug)
+	revision := int64(0)
+	if anonymousPublicCacheRequest(r) {
+		var err error
+		revision, err = h.repo.PublicProviderResourceRevisionBySlug(r.Context(), slug)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				writeError(w, http.StatusNotFound, "public_profile_not_found", "Client profile was not found.")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "public_profile_failed", "Could not load client profile.")
+			return
+		}
+		if writeKnownRevisionNotModified(w, r, "public-profile", publicProviderRevisionPart(revision), publicProviderCacheControl) {
+			return
+		}
+	}
+
+	includeServices := r.URL.Query().Get("include") == "services"
+	response, err := h.repo.GetPublicProfileBySlug(r.Context(), slug, includeServices)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "public_profile_not_found", "Client profile was not found.")
@@ -544,8 +943,10 @@ func (h *Handler) getPublicProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response = h.signPublicProfileResponse(r.Context(), response)
-	writeJSON(w, http.StatusOK, response)
+	response.Profile.PublicBookingURL = h.publicBaseURL + "/p/" + url.PathEscape(response.Profile.HandleSlug)
+	if err := writeKnownRevisionPublicJSON(w, r, response, "public-profile", publicProviderRevisionPart(revision), publicProviderCacheControl); err != nil {
+		writeError(w, http.StatusInternalServerError, "public_profile_failed", "Could not load client profile.")
+	}
 }
 
 func (h *Handler) listPublicServices(w http.ResponseWriter, r *http.Request) {
@@ -553,6 +954,23 @@ func (h *Handler) listPublicServices(w http.ResponseWriter, r *http.Request) {
 	if slug == "" {
 		writeError(w, http.StatusBadRequest, "invalid_slug", "Client slug is required.")
 		return
+	}
+
+	revision := int64(0)
+	if anonymousPublicCacheRequest(r) {
+		var err error
+		revision, err = h.repo.PublicProviderResourceRevisionBySlug(r.Context(), slug)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				writeError(w, http.StatusNotFound, "services_not_found", "Client services were not found.")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "services_failed", "Could not load services.")
+			return
+		}
+		if writeKnownRevisionNotModified(w, r, "public-services", publicProviderRevisionPart(revision), publicProviderCacheControl) {
+			return
+		}
 	}
 
 	items, err := h.repo.ListPublicServicesBySlug(r.Context(), slug)
@@ -565,8 +983,9 @@ func (h *Handler) listPublicServices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items = h.signPublicServices(r.Context(), items)
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	if err := writeKnownRevisionPublicJSON(w, r, map[string]any{"items": items}, "public-services", publicProviderRevisionPart(revision), publicProviderCacheControl); err != nil {
+		writeError(w, http.StatusInternalServerError, "services_failed", "Could not load services.")
+	}
 }
 
 func (h *Handler) getPublicAvailability(w http.ResponseWriter, r *http.Request) {
@@ -607,6 +1026,47 @@ func (h *Handler) getPublicAvailability(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, response)
 }
 
+func (h *Handler) getPublicAvailabilityRange(w http.ResponseWriter, r *http.Request) {
+	slug := strings.TrimSpace(chi.URLParam(r, "slug"))
+	if slug == "" {
+		writeError(w, http.StatusBadRequest, "invalid_slug", "Client slug is required.")
+		return
+	}
+	serviceID, err := uuidFromQueryParam("service_id", r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_service_id", "Service ID is invalid.")
+		return
+	}
+	days := 14
+	if rawDays := strings.TrimSpace(r.URL.Query().Get("days")); rawDays != "" {
+		parsedDays, parseErr := strconv.Atoi(rawDays)
+		if parseErr != nil || parsedDays < 1 || parsedDays > 31 {
+			writeError(w, http.StatusBadRequest, "invalid_days", "Days must be between 1 and 31.")
+			return
+		}
+		days = parsedDays
+	}
+	var from *time.Time
+	if rawFrom := strings.TrimSpace(r.URL.Query().Get("from")); rawFrom != "" {
+		parsedFrom, parseErr := time.Parse("2006-01-02", rawFrom)
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid_from", "From must use YYYY-MM-DD.")
+			return
+		}
+		from = &parsedFrom
+	}
+	response, err := h.repo.GetPublicAvailabilityRange(r.Context(), slug, serviceID, from, days)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "availability_not_found", "Availability was not found.")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "availability_failed", "Could not load availability.")
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 func (h *Handler) createPublicBooking(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 	if slug == "" {
@@ -618,6 +1078,12 @@ func (h *Handler) createPublicBooking(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
+	}
+	if input.Source == "marketplace" && h.marketplaceAuth != nil {
+		if customer, authErr := h.marketplaceAuth.CustomerFromRequest(r); authErr == nil &&
+			marketplaceauth.CustomerMatchesBookingContact(customer, input.Email, input.Phone) {
+			input.MarketplaceCustomerID = &customer.ID
+		}
 	}
 
 	response, err := h.repo.CreatePublicBooking(r.Context(), slug, input)
@@ -632,6 +1098,10 @@ func (h *Handler) createPublicBooking(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, ErrQuoteExpired) {
 			writeError(w, http.StatusConflict, "quote_expired", "Refresh the booking price before continuing.")
+			return
+		}
+		if errors.Is(err, ErrBookingReplayConflict) {
+			writeError(w, http.StatusConflict, "booking_replay_conflict", "This quote was already used with different booking or reminder details.")
 			return
 		}
 		if errors.Is(err, ErrSlotUnavailable) {
@@ -678,12 +1148,22 @@ func (h *Handler) createPublicBookingQuote(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusBadRequest, "discount_invalid", err.Error())
 		case errors.Is(err, ErrPromotionUnavailable):
 			writeError(w, http.StatusConflict, "quote_unavailable", "The selected discount was just claimed. Refresh the price and try again.")
+		case errors.Is(err, ErrInvalidContact):
+			writeError(w, http.StatusUnprocessableEntity, "invalid_contact", err.Error())
+		case errors.Is(err, ErrInvalidQuoteRequest):
+			writeError(w, http.StatusBadRequest, "invalid_quote_request", err.Error())
+		case errors.Is(err, ErrIdempotencyConflict):
+			writeError(w, http.StatusConflict, "idempotency_conflict", "Refresh the quote before trying again.")
 		default:
-			writeError(w, http.StatusBadRequest, "quote_failed", err.Error())
+			writeError(w, http.StatusInternalServerError, "quote_failed", "Could not calculate the quote.")
 		}
 		return
 	}
-	writeJSON(w, http.StatusCreated, response)
+	status := http.StatusCreated
+	if response.IdempotentReplay {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, response)
 }
 
 func (h *Handler) requireClientMarket(w http.ResponseWriter, r *http.Request, clientID uuid.UUID) bool {
@@ -765,7 +1245,11 @@ func (h *Handler) createPublicBookingCheckout(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "booking_checkout_failed", err.Error())
 		return
 	}
-	returnURLTemplate := h.publicBaseURL + "/p/" + url.PathEscape(paymentContext.HandleSlug) + "/booking/payment/return?payment={payment_token}"
+	returnURLTemplate, err := h.publicCheckoutReturnURLTemplate(input.ReturnSurface, paymentContext.HandleSlug)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_return_surface", err.Error())
+		return
+	}
 	attempt, err := h.checkout.Initialize(r.Context(), payments.BookingCheckoutInput{
 		BookingID: paymentContext.BookingID, ClientID: paymentContext.ClientID,
 		CustomerID: paymentContext.CustomerID, BookingToken: paymentContext.BookingToken,
@@ -778,7 +1262,6 @@ func (h *Handler) createPublicBookingCheckout(w http.ResponseWriter, r *http.Req
 		var initializationErr *payments.CheckoutInitializationError
 		if errors.As(err, &initializationErr) {
 			response := buildPublicCheckoutResponse(paymentContext.BookingToken, attempt)
-			h.trackActiveCheckout(attempt.Payment)
 			status := http.StatusOK
 			if initializationErr.Ambiguous {
 				status = http.StatusAccepted
@@ -802,6 +1285,10 @@ func (h *Handler) createPublicBookingCheckout(w http.ResponseWriter, r *http.Req
 			writeError(w, http.StatusConflict, "payment_already_complete", "This booking has no outstanding payment balance.")
 			return
 		}
+		if errors.Is(err, payments.ErrBookingPaymentClosed) {
+			writeError(w, http.StatusGone, "booking_payment_window_closed", "This reservation expired before payment was completed.")
+			return
+		}
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "booking_not_found", "Booking was not found.")
 			return
@@ -815,13 +1302,17 @@ func (h *Handler) createPublicBookingCheckout(w http.ResponseWriter, r *http.Req
 	if attempt.Resumed {
 		status = http.StatusOK
 	}
-	h.trackActiveCheckout(attempt.Payment)
 	writeJSON(w, status, buildPublicCheckoutResponse(paymentContext.BookingToken, attempt))
 }
 
-func (h *Handler) trackActiveCheckout(payment payments.FinancialPayment) {
-	if h.activePayments != nil && !isTerminalPaymentStatus(payment.Status) && strings.TrimSpace(payment.PublicToken) != "" {
-		h.activePayments.TrackCheckout(payment.PublicToken)
+func (h *Handler) publicCheckoutReturnURLTemplate(surface, handleSlug string) (string, error) {
+	switch strings.TrimSpace(surface) {
+	case "", "direct_public_page":
+		return h.publicBaseURL + "/p/" + url.PathEscape(handleSlug) + "/booking/payment/return?payment={payment_token}", nil
+	case "marketplace":
+		return h.marketplaceBaseURL + "/booking/payment/return?payment={payment_token}", nil
+	default:
+		return "", fmt.Errorf("return_surface must be direct_public_page or marketplace")
 	}
 }
 
@@ -846,6 +1337,8 @@ func buildPublicCheckoutResponse(bookingToken string, attempt payments.CheckoutA
 	}
 	if attempt.Session.ExpiresAt != nil {
 		response.ExpiresAt = attempt.Session.ExpiresAt.UTC().Format(time.RFC3339)
+	} else if attempt.Payment.ExpiresAt != nil {
+		response.ExpiresAt = attempt.Payment.ExpiresAt.UTC().Format(time.RFC3339)
 	}
 	return response
 }
@@ -870,6 +1363,10 @@ func (h *Handler) getPublicBookingCheckoutState(w http.ResponseWriter, r *http.R
 		r.Context(), paymentContext.BookingID, paymentContext.CountryCode, paymentContext.CurrencyCode,
 	)
 	if err != nil {
+		if errors.Is(err, payments.ErrBookingPaymentClosed) {
+			writeError(w, http.StatusGone, "booking_payment_window_closed", "This reservation expired before payment was completed.")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "checkout_state_failed", "Could not load payment options.")
 		return
 	}
@@ -949,7 +1446,7 @@ func (h *Handler) getPublicPaymentStatus(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) requestPublicPaymentVerification(w http.ResponseWriter, r *http.Request) {
 	setPublicFinancialHeaders(w)
-	if h.checkout == nil || h.activePayments == nil {
+	if h.checkout == nil || h.paymentReconciliations == nil {
 		writeError(w, http.StatusServiceUnavailable, "payment_verification_unavailable", "Payment verification is currently unavailable.")
 		return
 	}
@@ -964,7 +1461,10 @@ func (h *Handler) requestPublicPaymentVerification(w http.ResponseWriter, r *htt
 		return
 	}
 	if !isTerminalPaymentStatus(payment.Status) && !recentlyReconciled(payment.LastReconciledAt, 2*time.Second) {
-		h.activePayments.Nudge(token)
+		if err := h.paymentReconciliations.Nudge(r.Context(), payment); err != nil {
+			writeError(w, http.StatusServiceUnavailable, "payment_verification_unavailable", "Payment verification is currently unavailable.")
+			return
+		}
 	}
 	writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
 }
@@ -993,8 +1493,25 @@ func (h *Handler) streamPublicPaymentStatus(w http.ResponseWriter, r *http.Reque
 	}
 
 	token := chi.URLParam(r, "paymentToken")
+	releaseGlobal, budgetErr := h.streamBudget.Acquire(inboxRemoteIP(r), "")
+	if errors.Is(budgetErr, ErrStreamBudgetExceeded) {
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many realtime streams are open.")
+		return
+	}
+	defer releaseGlobal()
+	releasePayment, budgetErr := h.paymentStreamBudget.Acquire("", token)
+	if errors.Is(budgetErr, ErrStreamBudgetExceeded) {
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many streams are watching this payment.")
+		return
+	}
+	defer releasePayment()
 	updates, unsubscribe := h.paymentEvents.Subscribe(token)
 	defer unsubscribe()
+	if h.operationalMetrics != nil {
+		defer h.operationalMetrics.SSEConnectionOpened("payment")()
+	}
 	initial, err := h.checkout.GetPaymentByPublicToken(r.Context(), token)
 	if err != nil {
 		if errors.Is(err, payments.ErrLedgerRecordNotFound) {
@@ -1030,6 +1547,9 @@ func (h *Handler) streamPublicPaymentStatus(w http.ResponseWriter, r *http.Reque
 			return "", err
 		}
 		flusher.Flush()
+		if h.operationalMetrics != nil {
+			h.operationalMetrics.ObserveSSEEventLag("payment", payment.UpdatedAt)
+		}
 		lastVersion = payment.Version
 		return payment.Status, nil
 	}
@@ -1048,13 +1568,10 @@ func (h *Handler) streamPublicPaymentStatus(w http.ResponseWriter, r *http.Reque
 	if isTerminalPaymentStatus(status) {
 		return
 	}
-	stopActiveReconciliation := func() {}
-	if h.activePayments != nil {
-		stopActiveReconciliation = h.activePayments.Watch(token)
-	}
-	defer stopActiveReconciliation()
 	heartbeatTicker := time.NewTicker(15 * time.Second)
 	defer heartbeatTicker.Stop()
+	maximumAge := time.NewTimer(inboxMaximumStreamAge)
+	defer maximumAge.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
@@ -1065,14 +1582,12 @@ func (h *Handler) streamPublicPaymentStatus(w http.ResponseWriter, r *http.Reque
 				return
 			}
 		case <-heartbeatTicker.C:
-			status, err = sendCurrent()
-			if err != nil || isTerminalPaymentStatus(status) {
-				return
-			}
 			if _, err := w.Write([]byte(": heartbeat\n\n")); err != nil {
 				return
 			}
 			flusher.Flush()
+		case <-maximumAge.C:
+			return
 		}
 	}
 }

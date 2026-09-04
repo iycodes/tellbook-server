@@ -2,8 +2,6 @@ package payments
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,7 +14,10 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-var ErrInsufficientProviderLiquidity = errors.New("provider payout balance is insufficient")
+var (
+	ErrInsufficientProviderLiquidity = errors.New("provider payout balance is insufficient")
+	ErrPayoutInitiationBusy          = errors.New("payout initiation is already in progress")
+)
 
 type PayoutService struct {
 	ledger       *LedgerService
@@ -56,6 +57,20 @@ type PayoutOverview struct {
 	PaidOutAmountMinor           money.Minor
 	EligibleAllocations          []EligiblePayoutAllocation
 	RecentPayouts                []FinancialPayout
+}
+
+// PayoutSummary separates current ledger balances from activity in a requested
+// reporting period. It intentionally contains counts rather than loading the
+// allocation and payout rows used by the management screen.
+type PayoutSummary struct {
+	CurrencyCode                 string
+	AvailableAmountMinor         money.Minor
+	PendingSettlementAmountMinor money.Minor
+	PayoutInProgressAmountMinor  money.Minor
+	PeriodPaidOutAmountMinor     money.Minor
+	EligibleAllocationCount      int
+	PeriodPayoutCount            int
+	ActiveDestinationCount       int
 }
 
 type PayoutInitializationError struct {
@@ -104,7 +119,7 @@ func (s *PayoutService) Initiate(ctx context.Context, input InitiatePayoutInput)
 		return FinancialPayout{}, err
 	}
 	var result FinancialPayout
-	err = s.repository.WithPayoutInitiationLock(ctx, destination.Provider, allocation.CurrencyCode, func() error {
+	err = s.repository.WithPayoutInitiationLease(ctx, destination.Provider, allocation.CurrencyCode, func() error {
 		recipient, recipientErr := s.providerRecipient(ctx, destination)
 		if recipientErr != nil {
 			return recipientErr
@@ -211,33 +226,58 @@ func (s *PayoutService) failPayoutBeforeInitiation(
 	return transitioned, &PayoutInitializationError{Payout: transitioned, Ambiguous: false, Cause: cause}
 }
 
-func (r *LedgerRepository) WithPayoutInitiationLock(ctx context.Context, provider, currencyCode string, fn func() error) error {
+func (r *LedgerRepository) WithPayoutInitiationLease(ctx context.Context, provider, currencyCode string, fn func() error) error {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	currencyCode = strings.ToUpper(strings.TrimSpace(currencyCode))
 	if r == nil || r.db == nil || provider == "" || !isUpperASCII(currencyCode, 3) || fn == nil {
-		return errors.New("invalid payout initiation lock")
+		return errors.New("invalid payout initiation lease")
 	}
-	hash := sha256.Sum256([]byte(provider + ":" + currencyCode))
-	lockKey := int64(binary.BigEndian.Uint64(hash[:8]))
-	connection, err := r.db.Acquire(ctx)
+	leaseKey := "payout-initiation:" + provider + ":" + currencyCode
+	leaseOwner := uuid.NewString()
+	leaseExpiresAt := time.Now().UTC().Add(2 * time.Minute)
+	tx, err := r.db.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("acquire payout initiation lock connection: %w", err)
+		return fmt.Errorf("begin payout initiation lease: %w", err)
 	}
-	locked := false
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO payment_provider_request_budgets (
+			provider,next_allowed_at,lease_owner,lease_expires_at,updated_at
+		) VALUES ($1,NOW(),'',NULL,NOW()) ON CONFLICT (provider) DO NOTHING
+	`, leaseKey); err != nil {
+		return fmt.Errorf("initialize payout initiation lease: %w", err)
+	}
+	var currentLeaseExpiresAt *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT lease_expires_at
+		FROM payment_provider_request_budgets
+		WHERE provider=$1
+		FOR UPDATE
+	`, leaseKey).Scan(&currentLeaseExpiresAt); err != nil {
+		return fmt.Errorf("load payout initiation lease: %w", err)
+	}
+	if currentLeaseExpiresAt != nil && currentLeaseExpiresAt.After(time.Now().UTC()) {
+		return ErrPayoutInitiationBusy
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE payment_provider_request_budgets
+		SET lease_owner=$2,lease_expires_at=$3,updated_at=NOW()
+		WHERE provider=$1
+	`, leaseKey, leaseOwner, leaseExpiresAt); err != nil {
+		return fmt.Errorf("reserve payout initiation lease: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit payout initiation lease: %w", err)
+	}
 	defer func() {
-		if locked {
-			unlockContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if _, unlockErr := connection.Exec(unlockContext, `SELECT pg_advisory_unlock($1)`, lockKey); unlockErr != nil {
-				_ = connection.Conn().Close(unlockContext)
-			}
-		}
-		connection.Release()
+		releaseContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		_, _ = r.db.Exec(releaseContext, `
+			UPDATE payment_provider_request_budgets
+			SET lease_owner='',lease_expires_at=NULL,updated_at=NOW()
+			WHERE provider=$1 AND lease_owner=$2
+		`, leaseKey, leaseOwner)
 	}()
-	if _, err := connection.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockKey); err != nil {
-		return fmt.Errorf("acquire payout initiation lock: %w", err)
-	}
-	locked = true
 	return fn()
 }
 
@@ -515,7 +555,9 @@ func (r *LedgerRepository) GetPayoutOverview(ctx context.Context, clientID uuid.
 	overview := PayoutOverview{CurrencyCode: currencyCode, EligibleAllocations: []EligiblePayoutAllocation{}, RecentPayouts: []FinancialPayout{}}
 	if err := r.db.QueryRow(ctx, `
 		SELECT
-			COALESCE((SELECT SUM(business_net_amount_minor) FROM payment_allocations WHERE client_id = $1 AND currency_code = $2 AND status = 'eligible'), 0),
+			COALESCE((SELECT SUM(business_net_amount_minor) FROM payment_allocations
+				WHERE client_id = $1 AND currency_code = $2 AND status = 'eligible'
+				AND available_for_payout_at <= NOW()), 0),
 			COALESCE((SELECT SUM(business_net_amount_minor) FROM payment_allocations WHERE client_id = $1 AND currency_code = $2 AND status = 'pending'), 0),
 			COALESCE((SELECT SUM(amount_minor) FROM payouts WHERE client_id = $1 AND currency_code = $2 AND status IN ('created','pending','requires_action','unknown')), 0),
 			COALESCE((SELECT SUM(amount_minor) FROM payouts WHERE client_id = $1 AND currency_code = $2 AND status = 'successful'), 0)
@@ -554,4 +596,49 @@ func (r *LedgerRepository) GetPayoutOverview(ctx context.Context, clientID uuid.
 		return PayoutOverview{}, err
 	}
 	return overview, nil
+}
+
+func (r *LedgerRepository) GetPayoutSummary(
+	ctx context.Context,
+	clientID uuid.UUID,
+	currencyCode string,
+	from, to time.Time,
+) (PayoutSummary, error) {
+	currencyCode = strings.ToUpper(strings.TrimSpace(currencyCode))
+	if clientID == uuid.Nil || len(currencyCode) != 3 || from.IsZero() || !to.After(from) {
+		return PayoutSummary{}, errors.New("invalid payout summary scope")
+	}
+	result := PayoutSummary{CurrencyCode: currencyCode}
+	if err := r.db.QueryRow(ctx, `
+		SELECT
+			COALESCE((SELECT SUM(business_net_amount_minor) FROM payment_allocations
+				WHERE client_id=$1 AND currency_code=$2 AND status='eligible'
+				AND available_for_payout_at<=NOW()),0)::bigint,
+			COALESCE((SELECT SUM(business_net_amount_minor) FROM payment_allocations
+				WHERE client_id=$1 AND currency_code=$2 AND status='pending'),0)::bigint,
+			COALESCE((SELECT SUM(amount_minor) FROM payouts
+				WHERE client_id=$1 AND currency_code=$2
+				AND status IN ('created','pending','requires_action','unknown')),0)::bigint,
+			COALESCE((SELECT SUM(amount_minor) FROM payouts
+				WHERE client_id=$1 AND currency_code=$2 AND status='successful'
+				AND COALESCE(completed_at,updated_at,created_at)>=$3
+				AND COALESCE(completed_at,updated_at,created_at)<$4),0)::bigint,
+			(SELECT COUNT(*)::int FROM payment_allocations
+				WHERE client_id=$1 AND currency_code=$2 AND status='eligible'
+				AND available_for_payout_at<=NOW()),
+			(SELECT COUNT(*)::int FROM payouts
+				WHERE client_id=$1 AND currency_code=$2 AND status='successful'
+				AND COALESCE(completed_at,updated_at,created_at)>=$3
+				AND COALESCE(completed_at,updated_at,created_at)<$4),
+			(SELECT COUNT(*)::int FROM payout_destinations
+				WHERE client_id=$1 AND currency_code=$2 AND status='active')
+	`, clientID, currencyCode, from.UTC(), to.UTC()).Scan(
+		&result.AvailableAmountMinor, &result.PendingSettlementAmountMinor,
+		&result.PayoutInProgressAmountMinor, &result.PeriodPaidOutAmountMinor,
+		&result.EligibleAllocationCount, &result.PeriodPayoutCount,
+		&result.ActiveDestinationCount,
+	); err != nil {
+		return PayoutSummary{}, fmt.Errorf("get payout summary: %w", err)
+	}
+	return result, nil
 }

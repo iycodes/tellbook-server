@@ -10,31 +10,37 @@ import (
 type Client struct {
 	defaultService   *Service
 	agreementService *Service
-	inboxService     *Service
 }
 
-func NewClient(defaultService, agreementService, inboxService *Service) *Client {
+func NewClient(defaultService, agreementService *Service) *Client {
 	return &Client{
 		defaultService:   defaultService,
 		agreementService: agreementService,
-		inboxService:     inboxService,
 	}
 }
 
 func (c *Client) Available() bool {
-	return c != nil && c.defaultService != nil && c.agreementService != nil && c.inboxService != nil
+	return c != nil && c.defaultService != nil && c.agreementService != nil
+}
+
+func (c *Client) DefaultAvailable() bool {
+	return c != nil && c.defaultService != nil
+}
+
+func (c *Client) GenerateInboxReplyDraft(ctx context.Context, req aiapi.InboxReplyDraftRequest) (aiapi.InboxReplyDraftResponse, error) {
+	return c.defaultService.GenerateInboxReplyDraft(ctx, req)
+}
+
+func (c *Client) GenerateSemiPilotTurnDecision(ctx context.Context, input SemiPilotTurnInput) (SemiPilotTurnDecision, error) {
+	return c.defaultService.GenerateSemiPilotTurnDecision(ctx, input)
+}
+
+func (c *Client) GenerateAutopilotTurnDecision(ctx context.Context, input SemiPilotTurnInput) (SemiPilotTurnDecision, error) {
+	return c.defaultService.GenerateAutopilotTurnDecision(ctx, input)
 }
 
 func (c *Client) GenerateServiceDescription(ctx context.Context, req aiapi.GenerateServiceDescriptionRequest) (aiapi.GenerateServiceDescriptionResponse, error) {
 	return c.defaultService.GenerateServiceDescription(ctx, req)
-}
-
-func (c *Client) GenerateConversationAgentStep(ctx context.Context, req aiapi.ConversationAgentStepRequest) (aiapi.ConversationAgentStepResponse, error) {
-	return c.inboxService.GenerateConversationAgentStep(ctx, req)
-}
-
-func (c *Client) SuggestReply(ctx context.Context, req aiapi.SuggestReplyRequest) (aiapi.SuggestReplyResponse, error) {
-	return c.inboxService.SuggestReply(ctx, req)
 }
 
 func (c *Client) GenerateAgreementDocument(ctx context.Context, req aiapi.GenerateAgreementDocumentRequest) (aiapi.GenerateAgreementDocumentResponse, error) {

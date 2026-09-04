@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 
+	"booking/go-server/internal/aierror"
 	"booking/go-server/internal/config"
+	"booking/go-server/internal/observability"
 )
 
 type Client struct {
@@ -34,20 +38,33 @@ type Message struct {
 }
 
 type chatCompletionsRequest struct {
-	Model             string    `json:"model"`
-	Messages          []Message `json:"messages"`
-	Temperature       float64   `json:"temperature,omitempty"`
-	TopP              float64   `json:"top_p,omitempty"`
-	TopK              int       `json:"top_k,omitempty"`
-	MinP              float64   `json:"min_p,omitempty"`
-	PresencePenalty   float64   `json:"presence_penalty,omitempty"`
-	RepetitionPenalty float64   `json:"repeat_penalty,omitempty"`
-	EnableThinking    *bool     `json:"enable_thinking,omitempty"`
-	MaxTokens         int       `json:"max_tokens,omitempty"`
-	ResponseFormat    struct {
-		Type string `json:"type"`
-	} `json:"response_format"`
-	Stream bool `json:"stream"`
+	Model              string    `json:"model"`
+	Messages           []Message `json:"messages"`
+	Temperature        float64   `json:"temperature,omitempty"`
+	TopP               float64   `json:"top_p,omitempty"`
+	TopK               int       `json:"top_k,omitempty"`
+	MinP               float64   `json:"min_p,omitempty"`
+	PresencePenalty    float64   `json:"presence_penalty,omitempty"`
+	RepetitionPenalty  float64   `json:"repeat_penalty,omitempty"`
+	EnableThinking     *bool     `json:"enable_thinking,omitempty"`
+	ChatTemplateKwargs struct {
+		EnableThinking bool `json:"enable_thinking"`
+	} `json:"chat_template_kwargs"`
+	MaxTokens      int                `json:"max_tokens,omitempty"`
+	ResponseFormat chatResponseFormat `json:"response_format"`
+	JSONSchema     map[string]any     `json:"json_schema,omitempty"`
+	Stream         bool               `json:"stream"`
+}
+
+type chatResponseFormat struct {
+	Type       string                  `json:"type"`
+	JSONSchema *chatJSONSchemaEnvelope `json:"json_schema,omitempty"`
+}
+
+type chatJSONSchemaEnvelope struct {
+	Name   string         `json:"name"`
+	Strict bool           `json:"strict"`
+	Schema map[string]any `json:"schema"`
 }
 
 type chatCompletionsResponse struct {
@@ -59,7 +76,11 @@ type chatCompletionsResponse struct {
 	} `json:"error,omitempty"`
 }
 
-func NewClient(cfg config.Config) *Client {
+func NewClient(cfg config.Config, operationalMetrics ...*observability.Metrics) *Client {
+	httpClient := &http.Client{Timeout: cfg.LLMTimeout}
+	if len(operationalMetrics) > 0 && operationalMetrics[0] != nil {
+		httpClient = operationalMetrics[0].InstrumentHTTPClient(httpClient, "ai_self_hosted")
+	}
 	return &Client{
 		baseURL:           cfg.LLMBaseURL,
 		path:              cfg.LLMChatCompletions,
@@ -73,13 +94,72 @@ func NewClient(cfg config.Config) *Client {
 		repetitionPenalty: cfg.LLMRepetitionPenalty,
 		enableThinking:    cfg.SelfHostedThinking,
 		maxOutputTokens:   cfg.LLMMaxOutputTokens,
-		httpClient: &http.Client{
-			Timeout: cfg.LLMTimeout,
-		},
+		httpClient:        httpClient,
 	}
 }
 
 func (c *Client) GenerateJSON(ctx context.Context, systemPrompt, userPrompt string, dst any) error {
+	payload := c.newChatCompletionsRequest(systemPrompt, userPrompt)
+	payload.ResponseFormat.Type = "json_object"
+
+	content, err := c.complete(ctx, payload)
+	if err != nil {
+		return err
+	}
+	jsonPayload, err := extractJSONObject(content)
+	if err != nil {
+		return aierror.InvalidOutput("read self-hosted model output", err)
+	}
+	if err := json.Unmarshal([]byte(jsonPayload), dst); err != nil {
+		return aierror.InvalidOutput("decode self-hosted model output", err)
+	}
+
+	return nil
+}
+
+// GenerateJSONSchema returns the raw JSON object produced under an
+// application-managed schema. Keeping the raw bytes lets the application run
+// its own strict semantic validation without retaining any model reasoning.
+func (c *Client) GenerateJSONSchema(
+	ctx context.Context,
+	systemPrompt string,
+	userPrompt string,
+	schemaName string,
+	schemaJSON json.RawMessage,
+) (json.RawMessage, error) {
+	var schema map[string]any
+	if err := json.Unmarshal(schemaJSON, &schema); err != nil {
+		return nil, aierror.Terminal("prepare self-hosted model schema", aierror.KindConfiguration, err)
+	}
+	payload := c.newChatCompletionsRequest(systemPrompt, userPrompt)
+	// Strict application protocols never request or retain reasoning, even if
+	// another self-hosted generation task has thinking enabled globally.
+	payload.EnableThinking = boolPtr(false)
+	payload.ChatTemplateKwargs.EnableThinking = false
+	payload.ResponseFormat = chatResponseFormat{
+		Type: "json_schema",
+		JSONSchema: &chatJSONSchemaEnvelope{
+			Name:   schemaName,
+			Strict: true,
+			Schema: schema,
+		},
+	}
+	// llama-server builds support either the OpenAI-compatible nested schema or
+	// the native top-level json_schema field. Send both identical forms so the
+	// configured local runtime actually applies the grammar.
+	payload.JSONSchema = schema
+	content, err := c.complete(ctx, payload)
+	if err != nil {
+		return nil, err
+	}
+	jsonPayload, err := extractJSONObject(content)
+	if err != nil {
+		return nil, aierror.InvalidOutput("read self-hosted model output", err)
+	}
+	return json.RawMessage(jsonPayload), nil
+}
+
+func (c *Client) newChatCompletionsRequest(systemPrompt, userPrompt string) chatCompletionsRequest {
 	payload := chatCompletionsRequest{
 		Model: c.model,
 		Messages: []Message{
@@ -96,16 +176,19 @@ func (c *Client) GenerateJSON(ctx context.Context, systemPrompt, userPrompt stri
 		MaxTokens:         c.maxOutputTokens,
 		Stream:            false,
 	}
-	payload.ResponseFormat.Type = "json_object"
+	payload.ChatTemplateKwargs.EnableThinking = c.enableThinking
+	return payload
+}
 
+func (c *Client) complete(ctx context.Context, payload chatCompletionsRequest) (string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal llm request: %w", err)
+		return "", aierror.Terminal("encode self-hosted model request", aierror.KindConfiguration, err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.path, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build llm request: %w", err)
+		return "", aierror.Terminal("build self-hosted model request", aierror.KindConfiguration, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
@@ -114,44 +197,45 @@ func (c *Client) GenerateJSON(ctx context.Context, systemPrompt, userPrompt stri
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("call llm server: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		var networkErr net.Error
+		if errors.As(err, &networkErr) && networkErr.Timeout() {
+			return "", aierror.Transient("call self-hosted model", aierror.KindTimeout, err)
+		}
+		return "", aierror.Transient("call self-hosted model", aierror.KindTransport, err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return fmt.Errorf("read llm response: %w", err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		return "", aierror.Transient("read self-hosted model response", aierror.KindTransport, err)
 	}
 
 	if resp.StatusCode >= http.StatusBadRequest {
-		return fmt.Errorf("llm server returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return "", classifyProviderHTTPStatus("call self-hosted model", resp.StatusCode)
 	}
 
 	var decoded chatCompletionsResponse
 	if err := json.Unmarshal(respBody, &decoded); err != nil {
-		return fmt.Errorf("decode llm response: %w", err)
+		return "", aierror.Terminal("decode self-hosted model response", aierror.KindMalformedResponse, err)
 	}
 	if decoded.Error != nil && strings.TrimSpace(decoded.Error.Message) != "" {
-		return fmt.Errorf("llm server error: %s", decoded.Error.Message)
+		return "", aierror.Terminal("call self-hosted model", aierror.KindMalformedResponse, nil)
 	}
 	if len(decoded.Choices) == 0 {
-		return fmt.Errorf("llm response contained no choices")
+		return "", aierror.Terminal("decode self-hosted model response", aierror.KindMalformedResponse, nil)
 	}
 
 	content := strings.TrimSpace(decoded.Choices[0].Message.Content)
 	if content == "" {
-		return fmt.Errorf("llm response content was empty")
+		return "", aierror.InvalidOutput("read self-hosted model output", errors.New("empty assistant content"))
 	}
-
-	jsonPayload, err := extractJSONObject(content)
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal([]byte(jsonPayload), dst); err != nil {
-		return fmt.Errorf("decode llm json payload: %w", err)
-	}
-
-	return nil
+	return content, nil
 }
 
 func boolPtr(value bool) *bool {

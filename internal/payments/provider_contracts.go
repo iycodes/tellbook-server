@@ -119,6 +119,34 @@ type CollectionProvider interface {
 	ReconcilePayment(context.Context, PaymentRecord) (PaymentReconciliation, error)
 }
 
+type RefundInitiationStatus string
+
+const (
+	RefundInitiationPending    RefundInitiationStatus = "pending"
+	RefundInitiationSuccessful RefundInitiationStatus = "successful"
+)
+
+type RefundRequest struct {
+	RequestID            uuid.UUID
+	PaymentID            uuid.UUID
+	TransactionReference string
+	Provider             string
+	AmountMinor          money.Minor
+	CurrencyCode         string
+	CurrencyExponent     uint8
+	Reason               string
+}
+
+type RefundResult struct {
+	ProviderReference string
+	ProviderStatus    string
+	Status            RefundInitiationStatus
+}
+
+type RefundProvider interface {
+	InitiateRefund(context.Context, RefundRequest) (RefundResult, error)
+}
+
 type SettlementQuery struct {
 	From time.Time
 	To   time.Time

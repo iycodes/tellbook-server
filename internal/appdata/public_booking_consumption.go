@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"booking/go-server/internal/agreements/signature"
+	"booking/go-server/internal/bookingdomain"
 	"booking/go-server/internal/money"
 	"booking/go-server/internal/publictoken"
+	"booking/go-server/internal/whatsapp"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -67,7 +69,12 @@ type bookingAcceptanceEvidence struct {
 	accepted  bool
 }
 
-func (r *Repository) CreatePublicBooking(ctx context.Context, slug string, input CreatePublicBookingInput) (PublicBookingSummaryResponse, error) {
+func (r *Repository) createPublicBooking(
+	ctx context.Context,
+	slug string,
+	input CreatePublicBookingInput,
+	authority BookingReservationAuthority,
+) (PublicBookingSummaryResponse, error) {
 	quoteToken := strings.TrimSpace(input.QuoteToken)
 	if quoteToken == "" {
 		return PublicBookingSummaryResponse{}, fmt.Errorf("quote_token is required")
@@ -76,6 +83,10 @@ func (r *Repository) CreatePublicBooking(ctx context.Context, slug string, input
 	if normalizedEmail == "" {
 		return PublicBookingSummaryResponse{}, fmt.Errorf("email is required")
 	}
+	bookingSource, err := normalizePublicBookingSource(input.Source)
+	if err != nil {
+		return PublicBookingSummaryResponse{}, err
+	}
 
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
@@ -83,14 +94,60 @@ func (r *Repository) CreatePublicBooking(ctx context.Context, slug string, input
 	}
 	defer tx.Rollback(ctx)
 
+	var authorizedQuoteID uuid.UUID
+	if authority == BookingReservationAuthorityAutopilot &&
+		input.MarketplaceCustomerID != nil && input.AutopilotAuthority != nil {
+		authorizedQuoteID, err = r.validateInboxAutopilotReservationAuthorityTx(
+			ctx, tx, slug, quoteToken, input,
+		)
+		if err != nil {
+			return PublicBookingSummaryResponse{}, err
+		}
+	}
 	quote, err := lockBookingQuote(ctx, tx, slug, quoteToken)
 	if err != nil {
 		return PublicBookingSummaryResponse{}, err
 	}
+	if authority == BookingReservationAuthorityAutopilot && authorizedQuoteID == uuid.Nil {
+		return PublicBookingSummaryResponse{}, ErrAutopilotReservationAuthorityRequired
+	}
+	if authority == BookingReservationAuthorityAutopilot && quote.ID != authorizedQuoteID {
+		return PublicBookingSummaryResponse{}, ErrInboxAIProposalStale
+	}
+	bookingDetailsMatch := normalizedEmail == quote.CustomerEmail &&
+		strings.TrimSpace(input.FullName) == quote.CustomerName &&
+		strings.TrimSpace(input.Phone) == quote.CustomerPhone &&
+		strings.TrimSpace(input.Notes) == quote.BookingNotes
+	if quote.BookingID != nil && !bookingDetailsMatch {
+		return PublicBookingSummaryResponse{}, ErrBookingReplayConflict
+	}
 	if quote.BookingID != nil {
-		var bookingToken string
-		if err := tx.QueryRow(ctx, `SELECT public_token FROM bookings WHERE id = $1`, *quote.BookingID).Scan(&bookingToken); err != nil {
+		var bookingToken, existingSource, existingEmail, existingWhatsApp string
+		var existingEmailConsent, existingWhatsAppConsent, existingSMSConsent bool
+		if err := tx.QueryRow(ctx, `
+			SELECT public_token, source, customer_email_snapshot,
+				email_reminder_consent, COALESCE(customer_whatsapp_e164_snapshot, ''),
+				whatsapp_consent, sms_consent
+			FROM bookings WHERE id = $1
+		`, *quote.BookingID).Scan(
+			&bookingToken, &existingSource, &existingEmail, &existingEmailConsent,
+			&existingWhatsApp, &existingWhatsAppConsent, &existingSMSConsent,
+		); err != nil {
 			return PublicBookingSummaryResponse{}, fmt.Errorf("load consumed quote booking: %w", err)
+		}
+		expectedWhatsApp := ""
+		if input.WhatsAppConsent {
+			expectedWhatsApp, err = whatsapp.NormalizeE164ForCountry(input.Phone, quote.CountryCode)
+			if err != nil {
+				return PublicBookingSummaryResponse{}, ErrBookingReplayConflict
+			}
+		}
+		if existingSource != bookingSource || existingEmail != normalizedEmail ||
+			existingEmailConsent != input.EmailReminderConsent ||
+			existingWhatsApp != expectedWhatsApp ||
+			existingWhatsAppConsent != input.WhatsAppConsent ||
+			existingSMSConsent != input.SMSConsent {
+			return PublicBookingSummaryResponse{}, ErrBookingReplayConflict
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return PublicBookingSummaryResponse{}, fmt.Errorf("commit idempotent booking lookup: %w", err)
@@ -100,11 +157,21 @@ func (r *Repository) CreatePublicBooking(ctx context.Context, slug string, input
 	if !quote.ExpiresAt.After(time.Now().UTC()) {
 		return PublicBookingSummaryResponse{}, ErrQuoteExpired
 	}
-	if normalizedEmail != quote.CustomerEmail ||
-		strings.TrimSpace(input.FullName) != quote.CustomerName ||
-		strings.TrimSpace(input.Phone) != quote.CustomerPhone ||
-		strings.TrimSpace(input.Notes) != quote.BookingNotes {
+	if !bookingDetailsMatch {
 		return PublicBookingSummaryResponse{}, fmt.Errorf("booking details changed after the quote was created; refresh the quote")
+	}
+	var reservationExpiresAt *time.Time
+	if authority == BookingReservationAuthorityAutopilot && quote.TotalAmountMinor > 0 {
+		now := time.Now().UTC()
+		deadline := now.Add(r.inboxAIAutopilotPaymentWindow)
+		latestDeadline := quote.StartsAt.Add(-time.Minute)
+		if deadline.After(latestDeadline) {
+			deadline = latestDeadline
+		}
+		if !deadline.After(now) {
+			return PublicBookingSummaryResponse{}, ErrAutopilotPaymentWindowUnavailable
+		}
+		reservationExpiresAt = &deadline
 	}
 
 	location, err := loadLocation(quote.Timezone)
@@ -134,7 +201,9 @@ func (r *Repository) CreatePublicBooking(ctx context.Context, slug string, input
 		return PublicBookingSummaryResponse{}, ErrSlotUnavailable
 	}
 
-	evidence, agreementStatus, err := validateBookingAgreementEvidence(quote, input)
+	evidence, agreementStatus, err := r.validateBookingAgreementEvidenceForReservation(
+		ctx, tx, quote, input,
+	)
 	if err != nil {
 		return PublicBookingSummaryResponse{}, err
 	}
@@ -148,10 +217,30 @@ func (r *Repository) CreatePublicBooking(ctx context.Context, slug string, input
 		return PublicBookingSummaryResponse{}, fmt.Errorf("create booking token: %w", err)
 	}
 	paymentStatus := initialBookingPaymentState(quote.TotalAmountMinor, quote.DepositAmountMinor)
+	changePolicy := bookingdomain.StructuredPolicy(quote.CancellationPolicy)
+	consentSource := bookingNotificationConsentSource(authority, bookingSource)
+	consentRecordedAt := time.Now().UTC()
+	var emailConsentAt, whatsappConsentAt *time.Time
+	emailConsentSource := ""
+	whatsappConsentSource := ""
+	if input.EmailReminderConsent {
+		emailConsentAt = &consentRecordedAt
+		emailConsentSource = consentSource
+	}
+	var whatsappSnapshot *string
+	if input.WhatsAppConsent {
+		normalizedWhatsApp, normalizeErr := whatsapp.NormalizeE164ForCountry(input.Phone, quote.CountryCode)
+		if normalizeErr != nil {
+			return PublicBookingSummaryResponse{}, fmt.Errorf("%w: enter a valid WhatsApp number", ErrInvalidContact)
+		}
+		whatsappSnapshot = &normalizedWhatsApp
+		whatsappConsentAt = &consentRecordedAt
+		whatsappConsentSource = consentSource
+	}
 
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO bookings (
-			id, public_token, client_id, customer_id, service_id, title, stylist_name,
+			id, public_token, client_id, customer_id, marketplace_customer_id, service_id, title, stylist_name,
 			source, status, payment_status, agreement_status, start_at, end_at, timezone,
 			base_service_amount_minor, total_amount_minor, deposit_amount_minor,
 			currency_code, country_code, duration_minutes, notes, location_label, image_url,
@@ -167,17 +256,25 @@ func (r *Repository) CreatePublicBooking(ctx context.Context, slug string, input
 			prep_time_minutes, buffer_time_minutes, occupied_start_at, occupied_end_at,
 			virtual_delivery_label, virtual_join_url, virtual_instructions,
 			cancellation_policy_snapshot, lateness_policy_snapshot,
+			cancellation_notice_minutes_snapshot, cancellation_refund_bps_snapshot,
+			reschedule_notice_minutes_snapshot, reschedule_fee_minor_snapshot,
+			automated_reschedule_snapshot,
 			agreement_template_family_id_snapshot, agreement_template_version_id_snapshot,
 			agreement_title_snapshot, agreement_booking_summary_snapshot,
 			agreement_resolved_document_snapshot, agreement_schema_version_snapshot,
 			agreement_renderer_version_snapshot, agreement_rendered_html_snapshot,
 			agreement_resolved_terms_hash_snapshot, agreement_confirmation_method_snapshot,
 			agreement_timing_snapshot, standalone_signature_required_snapshot,
+			customer_email_snapshot, email_reminder_consent,
+			email_reminder_consent_at, email_reminder_consent_source,
+			customer_whatsapp_e164_snapshot, whatsapp_consent,
+			whatsapp_consent_at, whatsapp_consent_source,
+			notification_consent_policy_revision, sms_consent, reservation_expires_at,
 			created_at, updated_at
 		)
 		SELECT
-			$2, $3, bq.client_id, $4, bq.service_id, bq.service_title, bq.business_name,
-			'public_booking', 'booked', $5, $6, bq.appointment_start_at,
+			$2, $3, bq.client_id, $4, $10, bq.service_id, bq.service_title, bq.business_name,
+			$7, 'booked', $5, $6, bq.appointment_start_at,
 			bq.appointment_end_at, bq.timezone, bq.base_service_amount_minor,
 			bq.total_amount_minor, bq.deposit_amount_minor, bq.currency_code,
 			bq.country_code, bq.duration_minutes, bq.booking_notes_snapshot, bq.location_label,
@@ -195,22 +292,43 @@ func (r *Repository) CreatePublicBooking(ctx context.Context, slug string, input
 			bq.buffer_time_minutes, bq.occupied_start_at, bq.occupied_end_at,
 			bq.virtual_delivery_label, bq.virtual_join_url, bq.virtual_instructions,
 			bq.cancellation_policy, bq.lateness_policy,
+			$11, $12, $13, $14, $15,
 			bq.agreement_template_family_id_snapshot, bq.agreement_template_version_id_snapshot,
 			bq.agreement_title_snapshot, bq.agreement_booking_summary_snapshot,
 			bq.agreement_resolved_document_snapshot, bq.agreement_schema_version_snapshot,
 			bq.agreement_renderer_version_snapshot, bq.agreement_rendered_html_snapshot,
 			bq.agreement_resolved_terms_hash_snapshot, bq.agreement_confirmation_method_snapshot,
 			bq.agreement_timing_snapshot, bq.standalone_signature_required_snapshot,
+			$17, $18, $19, $20, $21, $8, $22, $23, 1, $9, $16,
 			NOW(), NOW()
 		FROM booking_quotes bq
 		WHERE bq.id = $1
-	`, quote.ID, bookingID, bookingToken, customerID, paymentStatus, agreementStatus); err != nil {
+	`, quote.ID, bookingID, bookingToken, customerID, paymentStatus, agreementStatus,
+		bookingSource, input.WhatsAppConsent, input.SMSConsent, input.MarketplaceCustomerID,
+		changePolicy.CancellationNoticeMinutes, changePolicy.CancellationRefundBPS,
+		changePolicy.RescheduleNoticeMinutes, changePolicy.RescheduleFeeMinor,
+		changePolicy.AutomatedReschedule, reservationExpiresAt,
+		normalizedEmail, input.EmailReminderConsent, emailConsentAt, emailConsentSource,
+		whatsappSnapshot, whatsappConsentAt, whatsappConsentSource); err != nil {
 		return PublicBookingSummaryResponse{}, fmt.Errorf("insert booking from quote: %w", err)
+	}
+	if input.MarketplaceCustomerID != nil {
+		if err := linkPreBookingConversationToBooking(
+			ctx, tx, quote.ClientID, customerID, *input.MarketplaceCustomerID, bookingID,
+		); err != nil {
+			return PublicBookingSummaryResponse{}, err
+		}
 	}
 	if err := convertQuotePromotionReservations(ctx, tx, quote, bookingID, customerID); err != nil {
 		return PublicBookingSummaryResponse{}, err
 	}
-	if quote.hasAgreement() {
+	if input.PrebookingAgreementID != nil {
+		if err := attachPrebookingAgreementToBooking(
+			ctx, tx, *input.PrebookingAgreementID, bookingID, customerID,
+		); err != nil {
+			return PublicBookingSummaryResponse{}, err
+		}
+	} else if quote.hasAgreement() {
 		if err := r.createBookingAgreementFromQuote(ctx, tx, quote, bookingID, customerID, evidence); err != nil {
 			return PublicBookingSummaryResponse{}, err
 		}
@@ -218,6 +336,11 @@ func (r *Repository) CreatePublicBooking(ctx context.Context, slug string, input
 		if err := insertStandaloneBookingSignature(ctx, tx, bookingID, evidence); err != nil {
 			return PublicBookingSummaryResponse{}, err
 		}
+	}
+	if err := insertBookingCreatedEventAndNotification(
+		ctx, tx, quote, bookingID, customerID, bookingSource,
+	); err != nil {
+		return PublicBookingSummaryResponse{}, err
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE booking_quotes
@@ -230,6 +353,206 @@ func (r *Repository) CreatePublicBooking(ctx context.Context, slug string, input
 		return PublicBookingSummaryResponse{}, fmt.Errorf("commit booking: %w", err)
 	}
 	return r.GetPublicBookingSummary(ctx, bookingToken)
+}
+
+func (r *Repository) validateBookingAgreementEvidenceForReservation(
+	ctx context.Context,
+	tx pgx.Tx,
+	quote bookingQuoteRecord,
+	input CreatePublicBookingInput,
+) (bookingAcceptanceEvidence, string, error) {
+	if input.PrebookingAgreementID == nil {
+		return validateBookingAgreementEvidence(quote, input)
+	}
+	if !quote.hasAgreement() || quote.AgreementTiming != "before_payment" ||
+		quote.StandaloneSignatureRequired {
+		return bookingAcceptanceEvidence{}, "", ErrInboxAIAgreementRequired
+	}
+	var clientID, familyID, versionID uuid.UUID
+	var bookingID, customerID uuid.NullUUID
+	var termsHash, method, timing, status string
+	var expiresAt *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT client_id, template_family_id, template_version_id,
+			resolved_terms_hash, confirmation_method, timing, status,
+			booking_id, customer_id, expires_at
+		FROM agreement_instances WHERE id=$1 FOR UPDATE
+	`, *input.PrebookingAgreementID).Scan(
+		&clientID, &familyID, &versionID, &termsHash, &method, &timing, &status,
+		&bookingID, &customerID, &expiresAt,
+	); errors.Is(err, pgx.ErrNoRows) {
+		return bookingAcceptanceEvidence{}, "", ErrInboxAIAgreementRequired
+	} else if err != nil {
+		return bookingAcceptanceEvidence{}, "", err
+	}
+	if clientID != quote.ClientID || familyID != quote.AgreementTemplateFamilyID ||
+		versionID != quote.AgreementTemplateVersionID || termsHash != quote.AgreementResolvedTermsHash ||
+		method != quote.AgreementConfirmationMethod || timing != "before_payment" || status != "completed" ||
+		bookingID.Valid || customerID.Valid || expiresAt == nil || !expiresAt.After(time.Now().UTC()) {
+		return bookingAcceptanceEvidence{}, "", ErrInboxAIAgreementRequired
+	}
+	var acceptanceMethod string
+	if err := tx.QueryRow(ctx, `
+		SELECT method FROM agreement_acceptances
+		WHERE agreement_id=$1 AND resolved_terms_hash=$2
+	`, *input.PrebookingAgreementID, termsHash).Scan(&acceptanceMethod); errors.Is(err, pgx.ErrNoRows) {
+		return bookingAcceptanceEvidence{}, "", ErrInboxAIAgreementRequired
+	} else if err != nil {
+		return bookingAcceptanceEvidence{}, "", err
+	}
+	if acceptanceMethod != method {
+		return bookingAcceptanceEvidence{}, "", ErrInboxAIAgreementRequired
+	}
+	agreementStatus := "accepted"
+	if method == "signature" {
+		agreementStatus = "signed"
+	}
+	return bookingAcceptanceEvidence{}, agreementStatus, nil
+}
+
+func attachPrebookingAgreementToBooking(
+	ctx context.Context,
+	tx pgx.Tx,
+	agreementID, bookingID, customerID uuid.UUID,
+) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE agreement_instances
+		SET booking_id=$2, customer_id=$3, updated_at=NOW()
+		WHERE id=$1 AND booking_id IS NULL AND customer_id IS NULL AND status='completed'
+	`, agreementID, bookingID, customerID)
+	if err != nil {
+		return fmt.Errorf("attach prebooking agreement: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrInboxAIAgreementRequired
+	}
+	return nil
+}
+
+func linkPreBookingConversationToBooking(
+	ctx context.Context,
+	tx pgx.Tx,
+	clientID, customerID, marketplaceCustomerID, bookingID uuid.UUID,
+) error {
+	var conversationID uuid.UUID
+	var linkedCustomerID uuid.NullUUID
+	if err := tx.QueryRow(ctx, `
+		SELECT id, customer_id
+		FROM inbox_conversations
+		WHERE client_id=$1 AND marketplace_customer_id=$2
+		FOR UPDATE
+	`, clientID, marketplaceCustomerID).Scan(&conversationID, &linkedCustomerID); errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("load pre-booking conversation: %w", err)
+	}
+	if linkedCustomerID.Valid && linkedCustomerID.UUID != customerID {
+		return fmt.Errorf("marketplace customer maps to multiple provider customer records")
+	}
+	if !linkedCustomerID.Valid {
+		if _, err := tx.Exec(ctx, `
+			UPDATE inbox_conversations
+			SET customer_id=$2, updated_at=NOW()
+			WHERE id=$1 AND customer_id IS NULL
+		`, conversationID, customerID); err != nil {
+			return fmt.Errorf("link provider customer to pre-booking conversation: %w", err)
+		}
+	}
+
+	commandTag, err := tx.Exec(ctx, `
+		INSERT INTO inbox_conversation_bookings (conversation_id, booking_id, linked_by_actor)
+		VALUES ($1,$2,'system')
+		ON CONFLICT (booking_id) DO NOTHING
+	`, conversationID, bookingID)
+	if err != nil {
+		return fmt.Errorf("link booking to pre-booking conversation: %w", err)
+	}
+	if commandTag.RowsAffected() == 0 {
+		return nil
+	}
+
+	var eventSequence int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO inbox_events (
+			conversation_id, client_id, marketplace_customer_id, event_type, payload
+		) VALUES (
+			$1,$2,$3,'conversation.updated',
+			jsonb_build_object('conversation_id',$1::uuid::text,'booking_id',$4::uuid::text)
+		)
+		RETURNING sequence
+	`, conversationID, clientID, marketplaceCustomerID, bookingID).Scan(&eventSequence); err != nil {
+		return fmt.Errorf("append pre-booking link event: %w", err)
+	}
+	if err := notifyInboxEvent(ctx, tx, eventSequence, clientID, marketplaceCustomerID); err != nil {
+		return fmt.Errorf("notify pre-booking link event: %w", err)
+	}
+	return nil
+}
+
+func normalizePublicBookingSource(source string) (string, error) {
+	switch strings.TrimSpace(source) {
+	case "", "direct_public_page":
+		return "direct_public_page", nil
+	case "marketplace":
+		return "marketplace", nil
+	default:
+		return "", fmt.Errorf("source must be direct_public_page or marketplace")
+	}
+}
+
+func bookingNotificationConsentSource(authority BookingReservationAuthority, source string) string {
+	if authority == BookingReservationAuthorityAutopilot {
+		return "inbox_autopilot"
+	}
+	if source == "marketplace" {
+		return "marketplace_checkout"
+	}
+	return "public_checkout"
+}
+
+func insertBookingCreatedEventAndNotification(
+	ctx context.Context,
+	tx pgx.Tx,
+	quote bookingQuoteRecord,
+	bookingID uuid.UUID,
+	customerID uuid.UUID,
+	source string,
+) error {
+	eventID := uuid.New()
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO booking_domain_events (
+			id, client_id, booking_id, event_type, dedupe_key, payload, created_at
+		) VALUES (
+			$1::uuid, $2::uuid, $3::uuid, 'booking_created', $4,
+			jsonb_build_object('booking_id', ($3::uuid)::text, 'source', $5::text, 'starts_at', $6::timestamptz),
+			NOW()
+		)
+	`, eventID, quote.ClientID, bookingID, "booking-created:"+bookingID.String(), source, quote.StartsAt); err != nil {
+		return fmt.Errorf("record booking-created event: %w", err)
+	}
+	title := "New direct booking"
+	if source == "marketplace" {
+		title = "New marketplace booking"
+	}
+	description := fmt.Sprintf(
+		"%s booked %s for %s",
+		quote.CustomerName,
+		quote.ServiceTitle,
+		quote.StartsAt.Format(time.RFC3339),
+	)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO notifications (
+			id, client_id, customer_id, booking_id, type, severity, title, description,
+			action_label, action_route, icon_name, icon_tone, metadata, created_at, updated_at
+		) VALUES (
+			$1,$2,$3,$4,'booking_created','normal',$5,$6,
+			'View booking','/bookings','calendar_today','muted',
+			jsonb_build_object('booking_event_id', $7::text, 'source', $8::text),NOW(),NOW()
+		)
+	`, uuid.New(), quote.ClientID, customerID, bookingID, title, description, eventID, source); err != nil {
+		return fmt.Errorf("create provider booking notification: %w", err)
+	}
+	return nil
 }
 
 func lockBookingQuote(ctx context.Context, tx pgx.Tx, slug, token string) (bookingQuoteRecord, error) {
@@ -447,7 +770,10 @@ func convertQuotePromotionReservations(ctx context.Context, tx pgx.Tx, quote boo
 func (r *Repository) GetPublicBookingSummary(ctx context.Context, bookingToken string) (PublicBookingSummaryResponse, error) {
 	const query = `
 		SELECT
-			b.id, b.public_token, b.title, COALESCE(b.image_url, ''), b.duration_minutes,
+			b.id, b.public_token, b.source, cp.business_name, cp.handle_slug,
+			COALESCE(cp.avatar_url, ''), c.full_name, c.email, c.phone,
+			b.email_reminder_consent, b.whatsapp_consent, b.sms_consent,
+			b.title, COALESCE(b.image_url, ''), b.duration_minutes,
 			b.start_at, b.end_at, b.location_label, b.fulfillment_mode,
 			b.provider_location_label, b.customer_location_label, b.travel_distance_meters,
 			b.virtual_delivery_label, COALESCE(b.virtual_join_url, ''),
@@ -460,10 +786,12 @@ func (r *Repository) GetPublicBookingSummary(ctx context.Context, bookingToken s
 			b.timezone, cp.locale, b.status, b.payment_status, b.agreement_status,
 			b.agreement_timing_snapshot, b.agreement_confirmation_method_snapshot,
 			b.agreement_title_snapshot, b.standalone_signature_required_snapshot,
+			b.reservation_expires_at, b.reservation_expired_at, b.reservation_expiry_reason,
 			COALESCE(latest_payment.public_token, ''), COALESCE(latest_payment.provider, ''),
 			COALESCE(latest_payment.reference, '')
 		FROM bookings b
 		INNER JOIN client_profiles cp ON cp.client_id = b.client_id
+		INNER JOIN customers c ON c.id = b.customer_id
 		LEFT JOIN LATERAL (
 			SELECT p.public_token, p.provider, p.reference
 			FROM payments p WHERE p.booking_id = b.id
@@ -485,8 +813,12 @@ func (r *Repository) GetPublicBookingSummary(ctx context.Context, bookingToken s
 	var travelFee int64
 	var totalAmount int64
 	var depositAmount int64
+	var reservationExpiresAt, reservationExpiredAt *time.Time
 	if err := r.db.QueryRow(ctx, query, strings.TrimSpace(bookingToken)).Scan(
-		&bookingID, &response.BookingToken, &response.ServiceTitle,
+		&bookingID, &response.BookingToken, &response.Source, &response.ProviderName,
+		&response.ProviderHandle, &response.ProviderAvatarURL, &response.CustomerName,
+		&response.CustomerEmail, &response.CustomerPhone, &response.EmailReminderConsent,
+		&response.WhatsAppConsent, &response.SMSConsent, &response.ServiceTitle,
 		&response.ServiceImageURL, &durationMinutes, &startAt, &endAt,
 		&response.LocationLabel, &response.FulfillmentMode,
 		&response.ProviderLocationLabel, &response.CustomerLocationLabel,
@@ -501,6 +833,7 @@ func (r *Repository) GetPublicBookingSummary(ctx context.Context, bookingToken s
 		&response.AgreementStatus, &response.AgreementTiming,
 		&response.AgreementConfirmationMethod,
 		&response.AgreementTemplateTitle, &response.StandaloneSignatureRequired,
+		&reservationExpiresAt, &reservationExpiredAt, &response.ReservationExpiryReason,
 		&response.PaymentToken, &response.PaymentProvider, &response.PaymentReference,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -531,9 +864,40 @@ func (r *Repository) GetPublicBookingSummary(ctx context.Context, bookingToken s
 	response.TotalAmountMinor = money.Minor(totalAmount)
 	response.DepositAmountMinor = money.Minor(depositAmount)
 	response.RemainingAmountMinor = money.Minor(totalAmount - depositAmount)
-	if !initialBookingObligationSatisfied(response.PaymentStatus) {
+	if reservationExpiresAt != nil {
+		response.ReservationExpiresAt = reservationExpiresAt.UTC().Format(time.RFC3339)
+	}
+	if reservationExpiredAt != nil {
+		response.ReservationExpiredAt = reservationExpiredAt.UTC().Format(time.RFC3339)
+	}
+	response.DeliveryStatus = PublicBookingDeliveryStatus{
+		ProviderInApp:    "available",
+		CustomerEmail:    "not_sent",
+		CustomerWhatsApp: consentDeliveryStatus(response.WhatsAppConsent),
+		CustomerSMS:      consentDeliveryStatus(response.SMSConsent),
+	}
+	if !publicBookingSecured(response) {
 		response.VirtualJoinURL = ""
 		response.VirtualInstructions = ""
 	}
 	return response, nil
+}
+
+func publicBookingAgreementSatisfied(booking PublicBookingSummaryResponse) bool {
+	agreementRequired := strings.TrimSpace(booking.AgreementTemplateTitle) != "" || booking.StandaloneSignatureRequired
+	if !agreementRequired {
+		return true
+	}
+	return booking.AgreementStatus == "accepted" || booking.AgreementStatus == "signed"
+}
+
+func publicBookingSecured(booking PublicBookingSummaryResponse) bool {
+	return initialBookingObligationSatisfied(booking.PaymentStatus) && publicBookingAgreementSatisfied(booking)
+}
+
+func consentDeliveryStatus(consented bool) string {
+	if consented {
+		return "consented_not_sent"
+	}
+	return "not_requested"
 }

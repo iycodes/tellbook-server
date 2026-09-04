@@ -55,6 +55,7 @@ const (
 var ErrInvalidFinancialTransition = errors.New("invalid financial state transition")
 
 var ErrPaymentObligationSatisfied = errors.New("booking payment obligation is already satisfied")
+var ErrBookingPaymentClosed = errors.New("booking payment window is closed")
 
 func ValidatePaymentTransition(from, to PaymentStatus) error {
 	if from == to {

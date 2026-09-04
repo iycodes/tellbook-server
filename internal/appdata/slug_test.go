@@ -65,6 +65,7 @@ func TestWriteProfileUpdateError(t *testing.T) {
 		{name: "not found", err: ErrNotFound, wantStatus: http.StatusNotFound, wantCode: "profile_not_found"},
 		{name: "invalid handle", err: ErrInvalidHandleSlug, wantStatus: http.StatusBadRequest, wantCode: "invalid_handle_slug"},
 		{name: "taken handle", err: ErrHandleSlugTaken, wantStatus: http.StatusConflict, wantCode: "handle_slug_taken"},
+		{name: "invalid capacity", err: ErrInvalidConcurrentBookingCapacity, wantStatus: http.StatusBadRequest, wantCode: "invalid_concurrent_booking_capacity"},
 		{name: "unexpected", err: errors.New("boom"), wantStatus: http.StatusInternalServerError, wantCode: "profile_update_failed"},
 	}
 

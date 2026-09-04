@@ -269,8 +269,11 @@ func (s *Service) uploadRegistrationCover(ctx context.Context, userID uuid.UUID,
 		return storageObject{}, err
 	}
 
-	objectKey := fmt.Sprintf("clients/%s/cover-%d%s", userID.String(), time.Now().UTC().Unix(), payload.Extension)
-	bucketName := s.storage.PrivateBucketName()
+	bucketName := s.storage.PublicBucketName()
+	if bucketName == "" {
+		return storageObject{}, errors.New("public image storage is not configured")
+	}
+	objectKey := fmt.Sprintf("clients/%s/profiles/%s%s", userID.String(), uuid.NewString(), payload.Extension)
 
 	objectURL, err := s.storage.Upload(ctx, payload.Data, objectKey, payload.ContentType, bucketName)
 	if err != nil {
@@ -677,15 +680,6 @@ func truncate(value string, limit int) string {
 }
 
 func clientIP(r *http.Request) string {
-	for _, header := range []string{"CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"} {
-		if value := strings.TrimSpace(r.Header.Get(header)); value != "" {
-			if header == "X-Forwarded-For" {
-				value = strings.TrimSpace(strings.Split(value, ",")[0])
-			}
-			return value
-		}
-	}
-
 	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err != nil {
 		return strings.TrimSpace(r.RemoteAddr)

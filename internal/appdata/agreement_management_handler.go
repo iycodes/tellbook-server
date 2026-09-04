@@ -50,14 +50,24 @@ func (h *Handler) listManagedAgreements(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusUnauthorized, "unauthorized", "You must be signed in.")
 		return
 	}
-	items, err := h.repo.ListManagedAgreements(
-		r.Context(), client.ID, r.URL.Query().Get("status"), r.URL.Query().Get("search"),
-	)
+	limit, err := boundedListLimit(r, defaultManagedAgreementListLimit, defaultManagedAgreementListLimit)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_agreement_list", err.Error())
+		return
+	}
+	response, err := h.repo.ListManagedAgreements(r.Context(), client.ID, ManagedAgreementListInput{
+		Status: r.URL.Query().Get("status"), Search: r.URL.Query().Get("search"),
+		Cursor: r.URL.Query().Get("cursor"), Limit: limit,
+	})
+	if errors.Is(err, ErrInvalidKeysetCursor) {
+		writeError(w, http.StatusBadRequest, "invalid_agreement_cursor", "Agreement cursor does not match these filters.")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "agreements_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) getManagedAgreementDeliveryLink(w http.ResponseWriter, r *http.Request) {

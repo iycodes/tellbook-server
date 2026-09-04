@@ -57,12 +57,7 @@ func buildPublicBookingCalendar(booking PublicBookingSummaryResponse, generatedA
 }
 
 func publicBookingCalendarAvailable(booking PublicBookingSummaryResponse) bool {
-	switch booking.PaymentStatus {
-	case "deposit_paid_balance_due", "paid_in_full":
-		return true
-	default:
-		return false
-	}
+	return publicBookingSecured(booking)
 }
 
 func publicBookingCalendarDisposition(serviceTitle string) string {

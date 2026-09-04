@@ -42,6 +42,31 @@ type CompleteGenerationJobParams struct {
 	Warnings             []aiapi.Warning
 }
 
+func (r *Repository) NextGenerationJobDelay(ctx context.Context, fallback time.Duration) time.Duration {
+	if r == nil || r.db == nil || fallback <= 0 {
+		return fallback
+	}
+	var next time.Time
+	err := r.db.QueryRow(ctx, `
+		SELECT COALESCE(MIN(
+			CASE WHEN status='processing' THEN lease_expires_at ELSE run_at END
+		),NOW()+($1::bigint*INTERVAL '1 millisecond'))
+		FROM agreement_template_generation_jobs
+		WHERE (status='queued' AND attempt_count<max_attempts) OR status='processing'
+	`, fallback.Milliseconds()).Scan(&next)
+	if err != nil {
+		return fallback
+	}
+	delay := time.Until(next)
+	if delay < 100*time.Millisecond {
+		return 100 * time.Millisecond
+	}
+	if delay > fallback {
+		return fallback
+	}
+	return delay
+}
+
 func (r *Repository) CreateGenerationDraft(ctx context.Context, params CreateGenerationDraftParams) (CreatedGenerationDraft, error) {
 	if r == nil || r.db == nil || params.ClientID == uuid.Nil {
 		return CreatedGenerationDraft{}, errors.New("invalid agreement generation repository")

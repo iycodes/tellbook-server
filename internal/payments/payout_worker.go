@@ -30,19 +30,22 @@ func NewPayoutWebhookWorker(repository *LedgerRepository, ledger *LedgerService,
 	}
 }
 
-func (w *PayoutWebhookWorker) Start(ctx context.Context) {
+func (w *PayoutWebhookWorker) Start(ctx context.Context, wakes ...<-chan struct{}) {
 	if w == nil || w.repository == nil || w.ledger == nil || w.payouts == nil {
 		return
 	}
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	wake := firstWorkerWake(wakes)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			w.runOnce(ctx)
+		case <-wake:
+		case <-timer.C:
 		}
+		w.runOnce(ctx)
+		timer.Reset(jitterDuration(25*time.Second, 0.2))
 	}
 }
 

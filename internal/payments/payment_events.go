@@ -74,12 +74,26 @@ func (b *PaymentEventBroker) listen(ctx context.Context) error {
 	if _, err := connection.Exec(ctx, "LISTEN "+paymentStatusChannel); err != nil {
 		return err
 	}
+	b.publishAll()
 	for {
 		notification, err := connection.Conn().WaitForNotification(ctx)
 		if err != nil {
 			return err
 		}
 		b.publish(notification.Payload)
+	}
+}
+
+func (b *PaymentEventBroker) publishAll() {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, subscribers := range b.subscribers {
+		for subscriber := range subscribers {
+			select {
+			case subscriber <- struct{}{}:
+			default:
+			}
+		}
 	}
 }
 

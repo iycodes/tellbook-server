@@ -28,6 +28,7 @@ type AvailabilityRequest struct {
 	MinimumNoticeMinutes int
 	MaxBookingsPerDay    int
 	ExistingServiceCount int
+	ConcurrentCapacity   int
 	Windows              []AvailabilityWindow
 	BusyRanges           []OccupiedRange
 }
@@ -45,7 +46,8 @@ func GenerateAvailableSlots(request AvailabilityRequest) ([]AvailableSlot, error
 	}
 	if request.DurationMinutes <= 0 || request.PrepTimeMinutes < 0 ||
 		request.BufferTimeMinutes < 0 || request.MinimumNoticeMinutes < 0 ||
-		request.MaxBookingsPerDay < 0 || request.ExistingServiceCount < 0 {
+		request.MaxBookingsPerDay < 0 || request.ExistingServiceCount < 0 ||
+		request.ConcurrentCapacity < 1 {
 		return nil, fmt.Errorf("invalid availability configuration")
 	}
 	if request.MaxBookingsPerDay > 0 && request.ExistingServiceCount >= request.MaxBookingsPerDay {
@@ -79,7 +81,7 @@ func GenerateAvailableSlots(request AvailabilityRequest) ([]AvailableSlot, error
 			if start.Before(minimumStart) {
 				continue
 			}
-			if overlapsOccupiedRange(occupiedStart, occupiedEnd, request.BusyRanges) {
+			if overlappingRangeCount(occupiedStart, occupiedEnd, request.BusyRanges) >= request.ConcurrentCapacity {
 				continue
 			}
 			slots = append(slots, AvailableSlot{
@@ -110,11 +112,12 @@ func SlotIsAvailable(request AvailabilityRequest, wantedStart time.Time) (Availa
 	return AvailableSlot{}, false, nil
 }
 
-func overlapsOccupiedRange(start, end time.Time, ranges []OccupiedRange) bool {
+func overlappingRangeCount(start, end time.Time, ranges []OccupiedRange) int {
+	count := 0
 	for _, occupied := range ranges {
 		if start.Before(occupied.End) && end.After(occupied.Start) {
-			return true
+			count++
 		}
 	}
-	return false
+	return count
 }

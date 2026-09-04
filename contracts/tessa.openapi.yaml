@@ -1,0 +1,350 @@
+openapi: 3.1.0
+info:
+  title: Tellbook Tessa API
+  version: 1.0.0
+paths:
+  /v1/app/tessa/bootstrap:
+    get:
+      operationId: getTessaBootstrap
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 50, default: 50 }
+      responses:
+        '200':
+          description: Current provider Tessa state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BootstrapResponse' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/app/tessa/introduction/complete:
+    post:
+      operationId: completeTessaIntroduction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompleteIntroductionRequest' }
+      responses:
+        '200':
+          description: Introduction completed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BootstrapResponse' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/app/tessa/threads:
+    post:
+      operationId: createTessaThread
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateThreadRequest' }
+      responses:
+        '200':
+          description: Idempotently created or returned thread
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Thread' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/app/tessa/threads/{threadID}/messages:
+    parameters:
+      - $ref: '#/components/parameters/ThreadID'
+    get:
+      operationId: listOlderTessaMessages
+      parameters:
+        - in: query
+          name: before
+          required: true
+          schema: { type: string, pattern: '^[1-9][0-9]*$' }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 50, default: 50 }
+      responses:
+        '200':
+          description: Older messages in ascending sequence order
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessagePageResponse' }
+        default: { $ref: '#/components/responses/Error' }
+    post:
+      operationId: sendTessaMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SendMessageRequest' }
+      responses:
+        '202':
+          description: Message persisted and run queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendMessageResponse' }
+        '409':
+          description: An active run or idempotency conflict
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/RunInProgressResponse'
+                  - $ref: '#/components/schemas/ErrorResponse'
+        default: { $ref: '#/components/responses/Error' }
+  /v1/app/tessa/runs/{runID}/cancel:
+    post:
+      operationId: cancelTessaRun
+      parameters:
+        - $ref: '#/components/parameters/RunID'
+      responses:
+        '200':
+          description: Cancelled run
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/app/tessa/events:
+    get:
+      operationId: streamTessaEvents
+      parameters:
+        - in: query
+          name: after
+          schema: { type: string }
+      responses:
+        '200':
+          description: SSE stream whose `tessa` frames contain RealtimeEvent JSON
+          content:
+            text/event-stream:
+              schema: { type: string }
+        default: { $ref: '#/components/responses/Error' }
+components:
+  parameters:
+    ThreadID:
+      in: path
+      name: threadID
+      required: true
+      schema: { type: string, format: uuid }
+    RunID:
+      in: path
+      name: runID
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Error:
+      description: Error response
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    Preferences:
+      type: object
+      additionalProperties: false
+      required:
+        - introduction_completed
+        - acknowledged_notice_revision
+        - current_notice_revision
+        - notice_required
+      properties:
+        introduction_completed: { type: boolean }
+        introduction_completed_at: { type: string, format: date-time }
+        acknowledged_notice_revision: { type: string }
+        notice_acknowledged_at: { type: string, format: date-time }
+        current_notice_revision: { type: string }
+        notice_required: { type: boolean }
+    Thread:
+      type: object
+      additionalProperties: false
+      required: [id, status, last_activity_at, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [active, archived] }
+        last_activity_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        archived_at: { type: string, format: date-time }
+    Message:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - thread_id
+        - sequence
+        - sender_type
+        - source_channel
+        - content
+        - presentation
+        - entity_references
+        - created_at
+      properties:
+        id: { type: string, format: uuid }
+        thread_id: { type: string, format: uuid }
+        sequence: { type: integer, format: int64, minimum: 1 }
+        sender_type: { type: string, enum: [provider, tessa, system] }
+        source_channel: { type: string, enum: [web] }
+        client_message_id: { type: string, format: uuid }
+        content: { type: string, minLength: 1, maxLength: 4000 }
+        presentation: { $ref: '#/components/schemas/MessagePresentation' }
+        entity_references:
+          type: array
+          maxItems: 12
+          items: { $ref: '#/components/schemas/EntityReference' }
+        run_id: { type: string, format: uuid }
+        created_at: { type: string, format: date-time }
+    Run:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - thread_id
+        - trigger_message_id
+        - status
+        - stage
+        - fallback_used
+        - created_at
+      properties:
+        id: { type: string, format: uuid }
+        thread_id: { type: string, format: uuid }
+        trigger_message_id: { type: string, format: uuid }
+        status: { type: string, enum: [queued, processing, completed, failed, cancelled] }
+        stage: { type: string, enum: [queued, planning, checking_help, checking_business, checking_bookings, checking_schedule, checking_availability, answering, completed] }
+        error_code: { type: string }
+        fallback_used: { type: boolean }
+        created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+        cancelled_at: { type: string, format: date-time }
+    NavigationAction:
+      type: object
+      additionalProperties: false
+      required: [route_id, label]
+      properties:
+        route_id:
+          type: string
+          enum:
+            - bookings
+            - booking_details
+            - services
+            - service_details
+            - customers
+            - customer_details
+            - payments
+            - payouts
+            - stats
+            - inbox
+            - reviews
+            - business_profile
+        entity_id: { type: string, format: uuid }
+        label: { type: string, minLength: 1, maxLength: 80 }
+    MessagePresentation:
+      type: object
+      additionalProperties: false
+      properties:
+        kind: { type: string, enum: [navigation_actions] }
+        version: { type: integer, enum: [1] }
+        actions:
+          type: array
+          maxItems: 4
+          items: { $ref: '#/components/schemas/NavigationAction' }
+    EntityReference:
+      type: object
+      additionalProperties: false
+      required: [kind, id, label, route_id]
+      properties:
+        kind: { type: string, enum: [booking, service, customer] }
+        id: { type: string, format: uuid }
+        label: { type: string, minLength: 1, maxLength: 120 }
+        route_id: { type: string, enum: [booking_details, service_details, customer_details] }
+    BootstrapResponse:
+      type: object
+      additionalProperties: false
+      required: [preferences, messages, has_more, realtime_cursor]
+      properties:
+        preferences: { $ref: '#/components/schemas/Preferences' }
+        thread: { $ref: '#/components/schemas/Thread' }
+        messages:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        current_run: { $ref: '#/components/schemas/Run' }
+        before_sequence: { type: string }
+        has_more: { type: boolean }
+        realtime_cursor: { type: string }
+    CompleteIntroductionRequest:
+      type: object
+      additionalProperties: false
+      required: [notice_revision]
+      properties:
+        notice_revision: { type: string, minLength: 1, maxLength: 80 }
+    CreateThreadRequest:
+      type: object
+      additionalProperties: false
+      required: [client_request_id]
+      properties:
+        client_request_id: { type: string, format: uuid }
+    SendMessageRequest:
+      type: object
+      additionalProperties: false
+      required: [client_message_id, content]
+      properties:
+        client_message_id: { type: string, format: uuid }
+        content: { type: string, minLength: 1, maxLength: 4000 }
+    SendMessageResponse:
+      type: object
+      additionalProperties: false
+      required: [message, run]
+      properties:
+        message: { $ref: '#/components/schemas/Message' }
+        run: { $ref: '#/components/schemas/Run' }
+    MessagePageResponse:
+      type: object
+      additionalProperties: false
+      required: [items, has_more]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Message' }
+        before_sequence: { type: string }
+        has_more: { type: boolean }
+    RealtimeEvent:
+      type: object
+      additionalProperties: false
+      required: [cursor, type, thread_id, created_at]
+      properties:
+        cursor: { type: string }
+        type:
+          type: string
+          enum:
+            - thread.created
+            - message.created
+            - run.started
+            - run.stage_changed
+            - run.completed
+            - run.failed
+            - run.cancelled
+        thread_id: { type: string, format: uuid }
+        message: { $ref: '#/components/schemas/Message' }
+        run: { $ref: '#/components/schemas/Run' }
+        created_at: { type: string, format: date-time }
+    RealtimeReset:
+      type: object
+      additionalProperties: false
+      required: [cursor, reason]
+      properties:
+        cursor: { type: string }
+        reason: { type: string }
+    RunInProgressResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error: { $ref: '#/components/schemas/ErrorDetail' }
+        run: { $ref: '#/components/schemas/Run' }
+    ErrorDetail:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error: { $ref: '#/components/schemas/ErrorDetail' }

@@ -1,0 +1,42 @@
+{
+	"environment": {
+		"name": "staging",
+		"hardware": "REPLACE_WITH_API_WORKER_DATABASE_REDIS_AND_REGION_DETAILS",
+		"commit": "REPLACE_WITH_COMMIT_SHA"
+	},
+	"measured_at": "REPLACE_WITH_ISO_TIMESTAMP",
+	"capacity": { "requests_per_second": 0, "concurrent_active_users": 0 },
+	"latency": {
+		"simple_read_p95_ms": 0,
+		"write_p95_ms": 0,
+		"discovery_database_p95_ms": 0,
+		"edge_cached_p95_ms": 0,
+		"database_acquire_wait_p95_ms": 0
+	},
+	"database": { "peak_pool_utilization_percent": 0 },
+	"scenarios": {
+		"anonymous_marketplace": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"marketplace_discovery_database": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"edge_cached_marketplace": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"auth_and_account": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"provider_application": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"booking_contention": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"inbox_and_tessa": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"idle_sse_10000": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"controlled_event_burst": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"worker_backlog_and_projection": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"cold_cache_and_stampede": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"redis_outage": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"listener_reconnect": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"failed_replica": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"soak": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" }
+	},
+	"assertions": {
+		"no_duplicate_side_effects": false,
+		"no_database_heartbeat_work": false,
+		"no_sustained_pool_saturation": false,
+		"no_queue_or_event_lag_growth": false,
+		"no_unbounded_memory_growth": false,
+		"bundle_budgets_passed": false
+	}
+}

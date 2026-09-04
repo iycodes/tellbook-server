@@ -45,28 +45,81 @@ func (r *Repository) GetStatsOverview(
 		Range: rangeName, PeriodStart: periodStart, PeriodEnd: periodEnd,
 		CurrencyCode: currencyCode,
 	}
+	return r.getProjectedStatsPeriod(ctx, clientID, response)
+}
+
+func (r *Repository) getProjectedStatsPeriod(
+	ctx context.Context,
+	clientID uuid.UUID,
+	response StatsOverviewResponse,
+) (StatsOverviewResponse, error) {
+	var mismatchedCurrencyCount int
+	if err := r.db.QueryRow(ctx, `
+		SELECT
+			COALESCE(SUM(total_bookings) FILTER (WHERE currency_code=$4),0)::int,
+			COALESCE(SUM(completed_bookings) FILTER (WHERE currency_code=$4),0)::int,
+			COALESCE(SUM(scheduled_bookings) FILTER (WHERE currency_code=$4),0)::int,
+			COALESCE(SUM(cancelled_bookings) FILTER (WHERE currency_code=$4),0)::int,
+			COALESCE(SUM(secured_bookings) FILTER (WHERE currency_code=$4),0)::int,
+			COALESCE((
+				SELECT COUNT(DISTINCT booking.customer_id)::int
+				FROM bookings booking
+				WHERE booking.client_id=$1
+				  AND booking.start_at >= $2
+				  AND booking.start_at < $3
+			),0)::int,
+			COALESCE(SUM(booked_value_minor) FILTER (WHERE currency_code=$4),0)::bigint,
+			COALESCE(SUM(total_bookings) FILTER (WHERE currency_code<>$4),0)::int
+		FROM provider_daily_metrics
+		WHERE client_id=$1
+		  AND metric_date >= $5::date
+		  AND metric_date < $6::date
+	`, clientID, response.PeriodStart, response.PeriodEnd, response.CurrencyCode,
+		response.PeriodStart.Format("2006-01-02"), response.PeriodEnd.Format("2006-01-02")).Scan(
+		&response.TotalBookings,
+		&response.CompletedBookings,
+		&response.ScheduledBookings,
+		&response.CancelledBookings,
+		&response.SecuredBookings,
+		&response.UniqueCustomerCount,
+		&response.BookedValueMinor,
+		&mismatchedCurrencyCount,
+	); err != nil {
+		return StatsOverviewResponse{}, fmt.Errorf("get projected stats overview: %w", err)
+	}
+	if mismatchedCurrencyCount > 0 {
+		return StatsOverviewResponse{}, errors.New("stats bookings contain mixed currencies")
+	}
+	return response, nil
+}
+
+func (r *Repository) getStatsPeriod(
+	ctx context.Context,
+	clientID uuid.UUID,
+	response StatsOverviewResponse,
+) (StatsOverviewResponse, error) {
 	var mismatchedCurrencyCount int
 	if err := r.db.QueryRow(ctx, `
 		SELECT
 			COUNT(*)::int,
 			COUNT(*) FILTER (WHERE LOWER(status) = 'completed')::int,
 			COUNT(*) FILTER (
-				WHERE LOWER(status) NOT IN ('completed', 'cancelled', 'canceled')
+				WHERE LOWER(status) NOT IN ('completed', 'cancelled', 'canceled', 'declined', 'expired')
 			)::int,
-			COUNT(*) FILTER (WHERE LOWER(status) IN ('cancelled', 'canceled'))::int,
+			COUNT(*) FILTER (WHERE LOWER(status) IN ('cancelled', 'canceled', 'declined', 'expired'))::int,
 			COUNT(*) FILTER (
 				WHERE LOWER(payment_status) IN ('deposit_paid', 'deposit_paid_balance_due', 'paid_in_full')
 			)::int,
 			COUNT(DISTINCT customer_id)::int,
 			COALESCE(SUM(total_amount_minor) FILTER (
-				WHERE LOWER(status) NOT IN ('cancelled', 'canceled')
+				WHERE LOWER(status) NOT IN ('cancelled', 'canceled', 'declined', 'expired')
 			), 0)::bigint,
 			COUNT(*) FILTER (WHERE currency_code <> $4)::int
 		FROM bookings
 		WHERE client_id = $1
 		  AND start_at >= $2
 		  AND start_at < $3
-	`, clientID, periodStart, periodEnd, currencyCode).Scan(
+	`, clientID, response.PeriodStart, response.PeriodEnd, response.CurrencyCode).Scan(
 		&response.TotalBookings,
 		&response.CompletedBookings,
 		&response.ScheduledBookings,

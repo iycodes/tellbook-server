@@ -38,9 +38,17 @@ func (h *Handler) createServiceSection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	if !h.validOptionalOwnedPublicImage(authedClient.ID, input.CoverImageURL, "sections") {
+		writeError(w, http.StatusBadRequest, "invalid_section_image", "Upload the section image before saving it.")
+		return
+	}
 
 	item, err := h.repo.CreateServiceSection(r.Context(), authedClient.ID, input)
 	if err != nil {
+		if errors.Is(err, ErrServiceSectionLimitReached) {
+			writeError(w, http.StatusConflict, "service_section_limit_reached", "You can create up to 25 service sections.")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "create_service_section_failed", err.Error())
 		return
 	}
@@ -67,6 +75,10 @@ func (h *Handler) updateServiceSection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	if !h.validOptionalOwnedPublicImage(authedClient.ID, input.CoverImageURL, "sections") {
+		writeError(w, http.StatusBadRequest, "invalid_section_image", "Upload the section image before saving it.")
+		return
+	}
 
 	item, err := h.repo.UpdateServiceSection(r.Context(), authedClient.ID, sectionID, input)
 	if err != nil {
@@ -77,6 +89,7 @@ func (h *Handler) updateServiceSection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "update_service_section_failed", err.Error())
 		return
 	}
+	h.deleteReplacedPublicImage(r.Context(), authedClient.ID, item.replacedImageURL, input.CoverImageURL, "sections")
 
 	item.CoverImageURL = h.signedMediaURL(r.Context(), item.CoverImageURL)
 	writeJSON(w, http.StatusOK, item)
@@ -127,7 +140,8 @@ func (h *Handler) deleteServiceSection(w http.ResponseWriter, r *http.Request) {
 		TargetSectionID: r.URL.Query().Get("target_section_id"),
 	}
 
-	if err := h.repo.DeleteServiceSection(r.Context(), authedClient.ID, sectionID, input); err != nil {
+	coverImageURL, err := h.repo.DeleteServiceSection(r.Context(), authedClient.ID, sectionID, input)
+	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "service_section_not_found", "Section was not found.")
 			return
@@ -135,6 +149,7 @@ func (h *Handler) deleteServiceSection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "delete_service_section_failed", err.Error())
 		return
 	}
+	h.deleteReplacedPublicImage(r.Context(), authedClient.ID, coverImageURL, "", "sections")
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -202,9 +217,17 @@ func (h *Handler) createManagedService(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	if !h.validOptionalOwnedPublicImage(authedClient.ID, input.ImageURL, "services") {
+		writeError(w, http.StatusBadRequest, "invalid_service_image", "Upload the service image before saving it.")
+		return
+	}
 
 	item, err := h.repo.CreateManagedService(r.Context(), authedClient.ID, input)
 	if err != nil {
+		if errors.Is(err, ErrServiceLimitReached) {
+			writeError(w, http.StatusConflict, "service_limit_reached", "You can create up to 100 services.")
+			return
+		}
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "service_section_not_found", "Selected section was not found.")
 			return
@@ -238,6 +261,10 @@ func (h *Handler) updateManagedService(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	if !h.validOptionalOwnedPublicImage(authedClient.ID, input.ImageURL, "services") {
+		writeError(w, http.StatusBadRequest, "invalid_service_image", "Upload the service image before saving it.")
+		return
+	}
 
 	item, err := h.repo.UpdateManagedService(r.Context(), authedClient.ID, serviceID, input)
 	if err != nil {
@@ -248,6 +275,7 @@ func (h *Handler) updateManagedService(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "update_service_failed", err.Error())
 		return
 	}
+	h.deleteReplacedPublicImage(r.Context(), authedClient.ID, item.replacedImageURL, input.ImageURL, "services")
 
 	item.ImageURL = h.signedMediaURL(r.Context(), item.ImageURL)
 	writeJSON(w, http.StatusOK, item)
@@ -329,7 +357,8 @@ func (h *Handler) deleteManagedService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.repo.DeleteManagedService(r.Context(), authedClient.ID, serviceID); err != nil {
+	imageURL, err := h.repo.DeleteManagedService(r.Context(), authedClient.ID, serviceID)
+	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "service_not_found", "Service was not found.")
 			return
@@ -337,6 +366,7 @@ func (h *Handler) deleteManagedService(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "delete_service_failed", "Could not delete service.")
 		return
 	}
+	h.deleteReplacedPublicImage(r.Context(), authedClient.ID, imageURL, "", "services")
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -442,6 +472,10 @@ func (h *Handler) duplicateManagedService(w http.ResponseWriter, r *http.Request
 
 	item, err := h.repo.DuplicateManagedService(r.Context(), authedClient.ID, serviceID)
 	if err != nil {
+		if errors.Is(err, ErrServiceLimitReached) {
+			writeError(w, http.StatusConflict, "service_limit_reached", "You can create up to 100 services.")
+			return
+		}
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "service_not_found", "Service was not found.")
 			return

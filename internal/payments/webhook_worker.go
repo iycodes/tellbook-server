@@ -31,19 +31,22 @@ func NewCollectionWebhookWorker(repository *LedgerRepository, ledger *LedgerServ
 	}
 }
 
-func (w *CollectionWebhookWorker) Start(ctx context.Context) {
+func (w *CollectionWebhookWorker) Start(ctx context.Context, wakes ...<-chan struct{}) {
 	if w == nil || w.repository == nil || w.ledger == nil || w.checkout == nil {
 		return
 	}
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	wake := firstWorkerWake(wakes)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			w.runOnce(ctx)
+		case <-wake:
+		case <-timer.C:
 		}
+		w.runOnce(ctx)
+		timer.Reset(jitterDuration(25*time.Second, 0.2))
 	}
 }
 
@@ -90,6 +93,18 @@ func (w *CollectionWebhookWorker) process(ctx context.Context, job FinancialJob)
 	if input, handled, err := adjustmentFromWebhook(payload.Event, payload.NormalizedEvent, payment); err != nil {
 		return err
 	} else if handled {
+		if input.Provider == "paystack" && strings.HasPrefix(strings.ToLower(payload.Event.EventType), "refund.") &&
+			strings.HasPrefix(input.ProviderReference, "webhook:") {
+			providerReference, found, err := w.repository.ResolveBookingRefundProviderReference(
+				ctx, input.PaymentID, input.Provider, input.AmountMinor, input.ProviderReference,
+			)
+			if err != nil {
+				return err
+			}
+			if found {
+				input.ProviderReference = providerReference
+			}
+		}
 		if _, _, err := w.repository.RecordPaymentAdjustment(ctx, input); err != nil {
 			return err
 		}

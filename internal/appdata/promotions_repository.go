@@ -70,8 +70,41 @@ type promotionResolution struct {
 	CodeError            string
 }
 
-func (r *Repository) ListPromotions(ctx context.Context, clientID uuid.UUID, promotionType string) ([]PromotionListItem, error) {
+const defaultPromotionListLimit = 40
+
+type promotionListCursor struct {
+	UpdatedAt time.Time `json:"updated_at"`
+	ID        uuid.UUID `json:"id"`
+}
+
+func (r *Repository) ListPromotions(ctx context.Context, clientID uuid.UUID, promotionType, rawCursor string, limit int) (PromotionListResponse, error) {
+	promotionType = normalizePromotionTypeFilter(promotionType)
+	if limit < 1 || limit > defaultPromotionListLimit {
+		return PromotionListResponse{}, errors.New("promotion list limit is invalid")
+	}
+	fingerprint := keysetFilterFingerprint("provider-promotions", promotionType)
+	var cursor promotionListCursor
+	if err := decodeKeysetCursor(rawCursor, fingerprint, &cursor); err != nil {
+		return PromotionListResponse{}, err
+	}
+	var cursorUpdatedAt any
+	var cursorID any
+	if strings.TrimSpace(rawCursor) != "" {
+		if cursor.UpdatedAt.IsZero() || cursor.ID == uuid.Nil {
+			return PromotionListResponse{}, ErrInvalidKeysetCursor
+		}
+		cursorUpdatedAt, cursorID = cursor.UpdatedAt.UTC(), cursor.ID
+	}
 	const query = `
+		WITH page AS MATERIALIZED (
+			SELECT p.*
+			FROM promotions p
+			WHERE p.client_id = $1
+			  AND ($2 = '' OR p.promotion_type = $2)
+			  AND ($3::timestamptz IS NULL OR (p.updated_at, p.id) < ($3, $4::uuid))
+			ORDER BY p.updated_at DESC, p.id DESC
+			LIMIT $5
+		)
 		SELECT
 			p.id,
 			p.name,
@@ -96,7 +129,7 @@ func (r *Repository) ListPromotions(ctx context.Context, clientID uuid.UUID, pro
 			COALESCE(section_targets.items, '[]'::jsonb),
 			p.created_at,
 			p.updated_at
-		FROM promotions p
+		FROM page p
 		LEFT JOIN LATERAL (
 			SELECT COUNT(*)::int AS count
 			FROM promotion_redemptions pr
@@ -120,14 +153,12 @@ func (r *Repository) ListPromotions(ctx context.Context, clientID uuid.UUID, pro
 			INNER JOIN service_sections ss ON ss.id = ps.section_id
 			WHERE ps.promotion_id = p.id
 		) section_targets ON TRUE
-		WHERE p.client_id = $1
-		  AND ($2 = '' OR p.promotion_type = $2)
-		ORDER BY p.updated_at DESC, p.created_at DESC
+		ORDER BY p.updated_at DESC, p.id DESC
 	`
 
-	rows, err := r.db.Query(ctx, query, clientID, normalizePromotionTypeFilter(promotionType))
+	rows, err := r.db.Query(ctx, query, clientID, promotionType, cursorUpdatedAt, cursorID, limit+1)
 	if err != nil {
-		return nil, fmt.Errorf("list promotions: %w", err)
+		return PromotionListResponse{}, fmt.Errorf("list promotions: %w", err)
 	}
 	defer rows.Close()
 
@@ -135,15 +166,48 @@ func (r *Repository) ListPromotions(ctx context.Context, clientID uuid.UUID, pro
 	for rows.Next() {
 		item, err := scanPromotionListItem(rows)
 		if err != nil {
-			return nil, err
+			return PromotionListResponse{}, err
 		}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate promotions: %w", err)
+		return PromotionListResponse{}, fmt.Errorf("iterate promotions: %w", err)
 	}
-
-	return items, nil
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	response := PromotionListResponse{Items: items}
+	if hasMore {
+		last := items[len(items)-1]
+		lastID, err := uuid.Parse(last.ID)
+		if err != nil {
+			return PromotionListResponse{}, fmt.Errorf("encode promotion cursor: %w", err)
+		}
+		response.NextCursor, err = encodeKeysetCursor(fingerprint, promotionListCursor{UpdatedAt: last.UpdatedAt.UTC(), ID: lastID})
+		if err != nil {
+			return PromotionListResponse{}, fmt.Errorf("encode promotion cursor: %w", err)
+		}
+	}
+	if strings.TrimSpace(rawCursor) == "" {
+		var summary PromotionListSummary
+		if err := r.db.QueryRow(ctx, `
+			SELECT
+				COUNT(*) FILTER (WHERE p.is_active AND p.starts_at <= NOW()
+					AND (p.ends_at IS NULL OR p.ends_at > NOW())
+					AND (p.max_redemptions = 0 OR COALESCE(redemptions.count, 0) < p.max_redemptions))::int,
+				COALESCE(SUM(COALESCE(redemptions.count, 0)), 0)::int
+			FROM promotions p
+			LEFT JOIN LATERAL (
+				SELECT COUNT(*)::int AS count FROM promotion_redemptions pr WHERE pr.promotion_id=p.id
+			) redemptions ON TRUE
+			WHERE p.client_id=$1 AND ($2='' OR p.promotion_type=$2)
+		`, clientID, promotionType).Scan(&summary.ActiveCount, &summary.RedemptionCount); err != nil {
+			return PromotionListResponse{}, fmt.Errorf("summarize promotions: %w", err)
+		}
+		response.Summary = &summary
+	}
+	return response, nil
 }
 
 func (r *Repository) GetPromotionDetails(ctx context.Context, clientID, promotionID uuid.UUID) (PromotionListItem, error) {
@@ -383,15 +447,38 @@ func (r *Repository) DeletePromotion(ctx context.Context, clientID, promotionID 
 	return nil
 }
 
-func (r *Repository) ListPromotionRedemptions(ctx context.Context, clientID, promotionID uuid.UUID) ([]PromotionRedemptionItem, error) {
+type promotionRedemptionListCursor struct {
+	CreatedAt time.Time `json:"created_at"`
+	ID        uuid.UUID `json:"id"`
+}
+
+func (r *Repository) ListPromotionRedemptions(ctx context.Context, clientID, promotionID uuid.UUID, rawCursor string, limit int) (PromotionRedemptionListResponse, error) {
+	if limit < 1 || limit > defaultPromotionListLimit {
+		return PromotionRedemptionListResponse{}, errors.New("promotion redemption list limit is invalid")
+	}
+	fingerprint := keysetFilterFingerprint("provider-promotion-redemptions", promotionID.String())
+	var cursor promotionRedemptionListCursor
+	if err := decodeKeysetCursor(rawCursor, fingerprint, &cursor); err != nil {
+		return PromotionRedemptionListResponse{}, err
+	}
+	var cursorCreatedAt any
+	var cursorID any
+	if strings.TrimSpace(rawCursor) != "" {
+		if cursor.CreatedAt.IsZero() || cursor.ID == uuid.Nil {
+			return PromotionRedemptionListResponse{}, ErrInvalidKeysetCursor
+		}
+		cursorCreatedAt, cursorID = cursor.CreatedAt.UTC(), cursor.ID
+	}
 	rows, err := r.db.Query(ctx, `
 		SELECT id, COALESCE(booking_id::text, ''), COALESCE(customer_id::text, ''), customer_email, code_used, discount_amount_minor, currency_code, created_at
 		FROM promotion_redemptions
 		WHERE client_id = $1 AND promotion_id = $2
-		ORDER BY created_at DESC
-	`, clientID, promotionID)
+		  AND ($3::timestamptz IS NULL OR (created_at, id) < ($3, $4::uuid))
+		ORDER BY created_at DESC, id DESC
+		LIMIT $5
+	`, clientID, promotionID, cursorCreatedAt, cursorID, limit+1)
 	if err != nil {
-		return nil, fmt.Errorf("list promotion redemptions: %w", err)
+		return PromotionRedemptionListResponse{}, fmt.Errorf("list promotion redemptions: %w", err)
 	}
 	defer rows.Close()
 
@@ -400,15 +487,31 @@ func (r *Repository) ListPromotionRedemptions(ctx context.Context, clientID, pro
 		var item PromotionRedemptionItem
 		var id uuid.UUID
 		if err := rows.Scan(&id, &item.BookingID, &item.CustomerID, &item.CustomerEmail, &item.CodeUsed, &item.DiscountAmountMinor, &item.CurrencyCode, &item.CreatedAt); err != nil {
-			return nil, fmt.Errorf("scan promotion redemption: %w", err)
+			return PromotionRedemptionListResponse{}, fmt.Errorf("scan promotion redemption: %w", err)
 		}
 		item.ID = id.String()
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate promotion redemptions: %w", err)
+		return PromotionRedemptionListResponse{}, fmt.Errorf("iterate promotion redemptions: %w", err)
 	}
-	return items, nil
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	response := PromotionRedemptionListResponse{Items: items}
+	if hasMore {
+		last := items[len(items)-1]
+		lastID, err := uuid.Parse(last.ID)
+		if err != nil {
+			return PromotionRedemptionListResponse{}, fmt.Errorf("encode promotion redemption cursor: %w", err)
+		}
+		response.NextCursor, err = encodeKeysetCursor(fingerprint, promotionRedemptionListCursor{CreatedAt: last.CreatedAt.UTC(), ID: lastID})
+		if err != nil {
+			return PromotionRedemptionListResponse{}, fmt.Errorf("encode promotion redemption cursor: %w", err)
+		}
+	}
+	return response, nil
 }
 
 func findPromotionDiscountAmount(candidate promotionCandidate, subtotal int64) int64 {

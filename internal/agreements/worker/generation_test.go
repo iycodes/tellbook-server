@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,44 @@ type generationStoreFake struct {
 	failed    bool
 	permanent bool
 	failCode  string
+}
+
+type wakeGenerationStore struct {
+	job       domain.TemplateGenerationJob
+	claims    atomic.Int32
+	firstPoll chan struct{}
+	completed chan struct{}
+}
+
+type scheduledGenerationStore struct {
+	*wakeGenerationStore
+	delay time.Duration
+}
+
+func (store *scheduledGenerationStore) NextGenerationJobDelay(context.Context, time.Duration) time.Duration {
+	return store.delay
+}
+
+func (s *wakeGenerationStore) ClaimGenerationJobs(context.Context, string, int, time.Duration) ([]domain.TemplateGenerationJob, error) {
+	if s.claims.Add(1) == 1 {
+		close(s.firstPoll)
+		return nil, nil
+	}
+	if s.job.ID == uuid.Nil {
+		return nil, nil
+	}
+	job := s.job
+	s.job = domain.TemplateGenerationJob{}
+	return []domain.TemplateGenerationJob{job}, nil
+}
+
+func (s *wakeGenerationStore) CompleteGenerationJob(context.Context, repository.CompleteGenerationJobParams) error {
+	close(s.completed)
+	return nil
+}
+
+func (*wakeGenerationStore) FailGenerationJob(context.Context, uuid.UUID, string, string, string, time.Time, bool) error {
+	return nil
 }
 
 func (s *generationStoreFake) ClaimGenerationJobs(context.Context, string, int, time.Duration) ([]domain.TemplateGenerationJob, error) {
@@ -76,6 +115,67 @@ func TestGenerationWorkerCompletesValidatedDocument(t *testing.T) {
 	}
 	if len(store.completed.Document.Blocks) != 2 || store.completed.Document.Blocks[0].ID == "" {
 		t.Fatalf("stored document was not finalized: %+v", store.completed.Document)
+	}
+}
+
+func TestGenerationWorkerRunsImmediatelyOnWake(t *testing.T) {
+	store := &wakeGenerationStore{
+		job: generationWorkerJob(t), firstPoll: make(chan struct{}), completed: make(chan struct{}),
+	}
+	worker, err := NewGenerationWorker(
+		store,
+		generationGeneratorFake{response: generatedWorkerResponse()},
+		generationBuilderFake{prepared: preparedWorkerRequest()},
+		nil,
+		GenerationWorkerConfig{PollInterval: time.Hour},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	wake := make(chan struct{}, 1)
+	go worker.Start(ctx, wake)
+	select {
+	case <-store.firstPoll:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not perform its initial safety poll")
+	}
+	wake <- struct{}{}
+	select {
+	case <-store.completed:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("worker did not run when notified")
+	}
+}
+
+func TestGenerationWorkerWakesWhenScheduledRetryBecomesDue(t *testing.T) {
+	base := &wakeGenerationStore{
+		job: generationWorkerJob(t), firstPoll: make(chan struct{}), completed: make(chan struct{}),
+	}
+	store := &scheduledGenerationStore{wakeGenerationStore: base, delay: 20 * time.Millisecond}
+	worker, err := NewGenerationWorker(
+		store,
+		generationGeneratorFake{response: generatedWorkerResponse()},
+		generationBuilderFake{prepared: preparedWorkerRequest()},
+		nil,
+		GenerationWorkerConfig{PollInterval: time.Hour},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go worker.Start(ctx)
+	select {
+	case <-store.firstPoll:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not perform its initial claim")
+	}
+	select {
+	case <-store.completed:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("worker waited for its safety poll instead of the scheduled retry")
 	}
 }
 

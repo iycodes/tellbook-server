@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	agreementrepo "booking/go-server/internal/agreements/repository"
 	agreementservice "booking/go-server/internal/agreements/service"
@@ -19,13 +21,21 @@ import (
 	"booking/go-server/internal/database"
 	"booking/go-server/internal/llm"
 	"booking/go-server/internal/mailer"
+	"booking/go-server/internal/marketplaceauth"
+	notificationworker "booking/go-server/internal/notifications"
+	"booking/go-server/internal/observability"
 	"booking/go-server/internal/payments"
 	"booking/go-server/internal/payments/capabilities"
 	payaza "booking/go-server/internal/payments/payaza"
 	paystack "booking/go-server/internal/payments/paystack"
+	"booking/go-server/internal/redisstore"
 	"booking/go-server/internal/secure"
 	"booking/go-server/internal/server"
 	"booking/go-server/internal/storage"
+	"booking/go-server/internal/tessa"
+	"booking/go-server/internal/whatsapp"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
@@ -42,16 +52,87 @@ func main() {
 
 	logger := config.NewLogger(cfg.AppEnv)
 	slog.SetDefault(logger)
+	if err := whatsapp.ValidateEnabledTemplateKeys(cfg.WhatsAppEnabledTemplateKeys); err != nil {
+		logger.Error("validate enabled WhatsApp templates", "error", err)
+		os.Exit(1)
+	}
+	runsAPI := cfg.ProcessRole == config.ProcessRoleAPI || cfg.ProcessRole == config.ProcessRoleAll
+	runsCoreWorkers := cfg.ProcessRole == config.ProcessRoleWorker || cfg.ProcessRole == config.ProcessRoleAll
+	runsAIWorkers := cfg.ProcessRole == config.ProcessRoleAIWorker || cfg.ProcessRole == config.ProcessRoleAll
+	runsMaintenance := cfg.ProcessRole == config.ProcessRoleMaintenance || cfg.ProcessRole == config.ProcessRoleAll
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	dbPool, err := database.OpenPool(ctx, cfg)
+	metrics := observability.New()
+	var redisClient *redisstore.Client
+	if runsAPI {
+		redisClient, err = redisstore.Open(ctx, redisstore.Options{
+			URL: cfg.RedisURL, KeyPrefix: cfg.RedisKeyPrefix,
+			KeyHMACSecret: cfg.RedisKeyHMACSecret,
+			ClientName:    "tellbook-" + cfg.AppEnv + "-" + cfg.ProcessRole,
+			PoolSize:      cfg.RedisPoolSize, MinIdleConnections: cfg.RedisMinIdleConnections,
+			DialTimeout: cfg.RedisDialTimeout, ReadTimeout: cfg.RedisReadTimeout,
+			WriteTimeout: cfg.RedisWriteTimeout, PoolTimeout: cfg.RedisPoolTimeout,
+			MaxPayloadBytes: cfg.RedisMaxPayloadBytes, Metrics: metrics,
+		})
+		if err != nil {
+			logger.Error("open Redis", "error", err)
+			os.Exit(1)
+		}
+		if redisClient != nil {
+			defer redisClient.Close()
+			metrics.RegisterRedisPool(func() observability.RedisPoolSnapshot {
+				snapshot := redisClient.PoolSnapshot()
+				return observability.RedisPoolSnapshot{
+					Hits: snapshot.Hits, Misses: snapshot.Misses, Timeouts: snapshot.Timeouts,
+					WaitCount: snapshot.WaitCount, Unusable: snapshot.Unusable,
+					WaitDuration:     snapshot.WaitDuration,
+					TotalConnections: snapshot.TotalConnections, IdleConnections: snapshot.IdleConnections,
+					StaleConnections: snapshot.StaleConnections, PendingRequests: snapshot.PendingRequests,
+				}
+			})
+		}
+	}
+	dbPool, err := database.OpenPool(ctx, cfg, metrics)
 	if err != nil {
 		logger.Error("open database", "error", err)
 		os.Exit(1)
 	}
 	defer dbPool.Close()
+	metrics.RegisterDatabasePool(dbPool)
+	directDBPool, err := database.OpenDirectPool(ctx, cfg, metrics)
+	if err != nil {
+		logger.Error("open direct database", "error", err)
+		os.Exit(1)
+	}
+	defer directDBPool.Close()
+	metrics.RegisterDirectDatabasePool(directDBPool)
+	maintenanceOwnership := "not_applicable"
+	var maintenanceConnection *pgxpool.Conn
+	if runsMaintenance {
+		maintenanceConnection, err = acquireMaintenanceLeadership(ctx, directDBPool)
+		if err != nil {
+			logger.Error("acquire maintenance leadership", "error", err)
+			os.Exit(1)
+		}
+		maintenanceOwnership = "leader"
+		defer releaseMaintenanceLeadership(maintenanceConnection)
+		go monitorMaintenanceLeadership(ctx, maintenanceConnection, logger, stop)
+	}
+	var readiness server.ReadinessChecker = &databaseReadiness{
+		query: dbPool, leadership: maintenanceConnection,
+	}
+	var coreWorkerWake *payments.CoreWorkerWakeBroker
+	if runsCoreWorkers {
+		coreWorkerWake = payments.NewCoreWorkerWakeBroker(directDBPool, logger)
+		go coreWorkerWake.Start(ctx)
+	}
+	var aiWorkerWake *payments.CoreWorkerWakeBroker
+	if runsAIWorkers {
+		aiWorkerWake = payments.NewAIWorkerWakeBroker(directDBPool, logger)
+		go aiWorkerWake.Start(ctx)
+	}
 
 	authRepo := auth.NewRepository(dbPool)
 	r2Service, err := storage.NewR2Service(cfg)
@@ -78,8 +159,26 @@ func main() {
 
 	authService := auth.NewService(authRepo, cfg, r2Service, smtpMailer)
 	authHandler := auth.NewHandler(authService, cfg)
+	marketplaceAuthRepo := marketplaceauth.NewRepository(dbPool)
+	marketplaceAuthService := marketplaceauth.NewService(marketplaceAuthRepo, cfg, smtpMailer)
+	if redisClient != nil {
+		marketplaceAuthService.ConfigureSessionCache(redisClient, cfg.RedisFallbackMaxConcurrency, metrics)
+	}
+	marketplaceAuthHandler := marketplaceauth.NewHandler(marketplaceAuthService, marketplaceAuthRepo, cfg)
 	appdataRepo := appdata.NewRepository(dbPool)
 	appdataRepo.ConfigureGoogleMaps(cfg.GoogleMapsServerAPIKey)
+	appdataRepo.ConfigureOperationalMetrics(metrics)
+	appdataRepo.ConfigureInboxAIAutopilotPaymentWindow(cfg.InboxAIAutopilotPaymentWindow)
+	if runsCoreWorkers {
+		marketplaceDiscoveryWorker := appdata.NewMarketplaceDiscoveryWorker(
+			appdataRepo,
+			logger,
+			appdata.MarketplaceDiscoveryWorkerConfig{},
+		)
+		marketplaceDiscoveryWake, unsubscribeMarketplaceDiscoveryWake := coreWorkerWake.Subscribe()
+		defer unsubscribeMarketplaceDiscoveryWake()
+		go marketplaceDiscoveryWorker.Start(ctx, marketplaceDiscoveryWake)
+	}
 	var agreementTokens *agreementservice.PublicTokenManager
 	if cfg.AgreementTokenEncryptionKeys != "" {
 		agreementKeyring, keyringErr := secure.ParseKeyring(cfg.AgreementTokenEncryptionKeys, cfg.AgreementTokenActiveKey)
@@ -95,63 +194,73 @@ func main() {
 		agreementTokens = configuredAgreementTokens
 		appdataRepo.ConfigureAgreementTokens(agreementTokens)
 	}
-	aiServices := make(map[string]*aisvc.Service, 2)
+	aiServices := make(map[string]*aisvc.Service, 3)
 	if cfg.NeedsSelfHosted() {
-		aiServices[config.AIProviderSelfHosted] = aisvc.NewService(llm.NewClient(cfg))
+		aiServices[config.AIProviderSelfHosted] = aisvc.NewService(llm.NewClient(cfg, metrics))
 	}
 	if cfg.NeedsHosted() {
-		aiServices[config.AIProviderHosted] = aisvc.NewService(llm.NewOpenAIClient(cfg))
+		aiServices[config.AIProviderHosted] = aisvc.NewService(llm.NewOpenAIClient(cfg, metrics))
+	}
+	if cfg.NeedsOpenAICompatible() {
+		aiServices[config.AIProviderOpenAICompatible] = aisvc.NewService(llm.NewOpenAICompatibleClient(cfg, metrics))
 	}
 	aiClient := aisvc.NewClient(
 		aiServices[cfg.DefaultAIProvider],
 		aiServices[cfg.AgreementAIProvider],
-		aiServices[cfg.InboxAIProvider],
 	)
 	agreementRepository := agreementrepo.New(dbPool)
-	if err := agreementRepository.SyncSystemTemplates(ctx); err != nil {
-		logger.Error("sync system agreement templates", "error", err)
-		os.Exit(1)
-	}
-	var agreementUploadPreparer agreementworker.UploadPreparer
-	if r2Service != nil && r2Service.PrivateBucketName() != "" {
-		agreementUploadPreparer, err = agreementworker.NewPDFUploadPreparer(r2Service)
-		if err != nil {
-			logger.Error("configure agreement upload preparation", "error", err)
+	if runsMaintenance {
+		if err := agreementRepository.SyncSystemTemplates(ctx); err != nil {
+			logger.Error("sync system agreement templates", "error", err)
 			os.Exit(1)
 		}
 	}
-	agreementRequestBuilder, err := agreementworker.NewStoredGenerationRequestBuilder(agreementUploadPreparer)
-	if err != nil {
-		logger.Error("configure agreement generation request builder", "error", err)
-		os.Exit(1)
-	}
-	agreementGenerationWorker, err := agreementworker.NewGenerationWorker(
-		agreementRepository,
-		aiClient,
-		agreementRequestBuilder,
-		logger,
-		agreementworker.GenerationWorkerConfig{},
-	)
-	if err != nil {
-		logger.Error("configure agreement generation worker", "error", err)
-		os.Exit(1)
-	}
-	go agreementGenerationWorker.Start(ctx)
-	if agreementTokens != nil {
-		var agreementStorage agreementworker.CompletedAgreementStore
-		if r2Service != nil {
-			agreementStorage = r2Service
+	if runsCoreWorkers {
+		var agreementUploadPreparer agreementworker.UploadPreparer
+		if r2Service != nil && r2Service.PrivateBucketName() != "" {
+			agreementUploadPreparer, err = agreementworker.NewPDFUploadPreparer(r2Service)
+			if err != nil {
+				logger.Error("configure agreement upload preparation", "error", err)
+				os.Exit(1)
+			}
 		}
-		agreementLifecycleWorker, lifecycleErr := agreementworker.NewLifecycleWorker(
-			dbPool, agreementTokens, smtpMailer, agreementStorage, cfg.ClientPublicBaseURL, logger,
+		agreementRequestBuilder, requestBuilderErr := agreementworker.NewStoredGenerationRequestBuilder(agreementUploadPreparer)
+		if requestBuilderErr != nil {
+			logger.Error("configure agreement generation request builder", "error", requestBuilderErr)
+			os.Exit(1)
+		}
+		agreementGenerationWorker, workerErr := agreementworker.NewGenerationWorker(
+			agreementRepository,
+			aiClient,
+			agreementRequestBuilder,
+			logger,
+			agreementworker.GenerationWorkerConfig{PollInterval: 25 * time.Second},
 		)
-		if lifecycleErr != nil {
-			logger.Error("configure agreement lifecycle worker", "error", lifecycleErr)
+		if workerErr != nil {
+			logger.Error("configure agreement generation worker", "error", workerErr)
 			os.Exit(1)
 		}
-		go agreementLifecycleWorker.Start(ctx)
-	} else {
-		logger.Info("agreement lifecycle worker disabled", "reason", "missing agreement token encryption keys")
+		agreementGenerationWake, unsubscribeGenerationWake := coreWorkerWake.Subscribe()
+		defer unsubscribeGenerationWake()
+		go agreementGenerationWorker.Start(ctx, agreementGenerationWake)
+		if agreementTokens != nil {
+			var agreementStorage agreementworker.CompletedAgreementStore
+			if r2Service != nil {
+				agreementStorage = r2Service
+			}
+			agreementLifecycleWorker, lifecycleErr := agreementworker.NewLifecycleWorker(
+				dbPool, agreementTokens, smtpMailer, agreementStorage, cfg.ClientPublicBaseURL, logger,
+			)
+			if lifecycleErr != nil {
+				logger.Error("configure agreement lifecycle worker", "error", lifecycleErr)
+				os.Exit(1)
+			}
+			agreementLifecycleWake, unsubscribeLifecycleWake := coreWorkerWake.Subscribe()
+			defer unsubscribeLifecycleWake()
+			go agreementLifecycleWorker.Start(ctx, agreementLifecycleWake)
+		} else {
+			logger.Info("agreement lifecycle worker disabled", "reason", "missing agreement token encryption keys")
+		}
 	}
 
 	ledgerRepository := payments.NewLedgerRepository(dbPool)
@@ -175,6 +284,7 @@ func main() {
 		os.Exit(1)
 	}
 	collectionProviders := make(map[string]payments.CollectionProvider, 2)
+	refundProviders := make(map[string]payments.RefundProvider, 2)
 	settlementProviders := make(map[string]payments.SettlementProvider, 1)
 	destinationProviders := make(map[string]payments.DestinationProvider, 2)
 	payoutProviders := make(map[string]payments.PayoutProvider, 2)
@@ -203,6 +313,7 @@ func main() {
 			DVABankCode:    cfg.PayazaNGNDVABankCode, DVAEnquiryBankCode: cfg.PayazaNGNDVAEnquiryBankCode,
 			DVABankName:    dvaBankName,
 			SourceAccounts: sourceAccounts,
+			HTTPClient:     metrics.InstrumentHTTPClient(&http.Client{Timeout: 15 * time.Second}, "payaza"),
 			PayoutSender: payaza.PayoutSender{
 				Name: cfg.PayazaPayoutSenderName, Phone: cfg.PayazaPayoutSenderPhone,
 				Address: cfg.PayazaPayoutSenderAddress,
@@ -213,6 +324,7 @@ func main() {
 			os.Exit(1)
 		}
 		collectionProviders["payaza"] = payazaClient
+		refundProviders["payaza"] = payazaClient
 		payoutProviders["payaza"] = payazaClient
 		webhookVerifiers["payaza"] = payazaClient
 
@@ -223,6 +335,7 @@ func main() {
 				payazaDirectoryClient, clientErr = payaza.NewClient(payaza.Config{
 					PublicKey: cfg.PayazaPublicKey, SecretKey: cfg.PayazaSecretKey,
 					BaseURL: cfg.PayazaBaseURL, TenantID: string(capabilities.EnvironmentLive),
+					HTTPClient: metrics.InstrumentHTTPClient(&http.Client{Timeout: 15 * time.Second}, "payaza"),
 				})
 				if clientErr != nil {
 					logger.Error("configure payaza live directory client", "error", clientErr)
@@ -244,14 +357,16 @@ func main() {
 	var paystackClient *paystack.Client
 	if cfg.PaystackEnabled() {
 		paystackClient, err = paystack.NewClient(paystack.Config{
-			SecretKey: cfg.PaystackCredentials(),
-			BaseURL:   cfg.PaystackBaseURL,
+			SecretKey:  cfg.PaystackCredentials(),
+			BaseURL:    cfg.PaystackBaseURL,
+			HTTPClient: metrics.InstrumentHTTPClient(&http.Client{Timeout: 15 * time.Second}, "paystack"),
 		})
 		if err != nil {
 			logger.Error("configure paystack client", "error", err)
 			os.Exit(1)
 		}
 		collectionProviders["paystack"] = paystackClient
+		refundProviders["paystack"] = paystackClient
 		destinationProviders["paystack"] = paystackClient
 		payoutProviders["paystack"] = paystackClient
 		webhookVerifiers["paystack"] = paystackClient
@@ -348,45 +463,290 @@ func main() {
 		logger.Error("configure payout service", "error", err)
 		os.Exit(1)
 	}
-	paymentEvents := payments.NewPaymentEventBroker(dbPool, logger)
-	go paymentEvents.Start(ctx)
-	activePayments := payments.NewActivePaymentReconciler(ctx, checkoutService, logger)
+	paymentEvents := payments.NewPaymentEventBroker(directDBPool, logger)
+	if runsAPI {
+		go paymentEvents.Start(ctx)
+	}
+	paymentReconciliations := payments.NewPaymentReconciliationScheduler(ledgerRepository)
+	if runsCoreWorkers {
+		paymentWake, unsubscribePaymentWake := coreWorkerWake.Subscribe()
+		defer unsubscribePaymentWake()
+		paymentReconciliationWorker := payments.NewPaymentReconciliationWorker(
+			ledgerRepository, checkoutService, logger, paymentWake,
+		)
+		go paymentReconciliationWorker.Start(ctx)
+	}
 	var providerWebhookHandler *payments.ProviderWebhookHandler
 	if financialKeyring != nil && len(webhookVerifiers) > 0 {
 		providerWebhookHandler = payments.NewProviderWebhookHandler(ledgerService, webhookVerifiers)
-		webhookWorker := payments.NewCollectionWebhookWorker(ledgerRepository, ledgerService, checkoutService, logger)
-		go webhookWorker.Start(ctx)
-		payoutWebhookWorker := payments.NewPayoutWebhookWorker(ledgerRepository, ledgerService, payoutService, logger)
-		go payoutWebhookWorker.Start(ctx)
+		if runsCoreWorkers {
+			webhookWorker := payments.NewCollectionWebhookWorker(ledgerRepository, ledgerService, checkoutService, logger)
+			webhookWake, unsubscribeWebhookWake := coreWorkerWake.Subscribe()
+			defer unsubscribeWebhookWake()
+			go webhookWorker.Start(ctx, webhookWake)
+			payoutWebhookWorker := payments.NewPayoutWebhookWorker(ledgerRepository, ledgerService, payoutService, logger)
+			payoutWebhookWake, unsubscribePayoutWebhookWake := coreWorkerWake.Subscribe()
+			defer unsubscribePayoutWebhookWake()
+			go payoutWebhookWorker.Start(ctx, payoutWebhookWake)
+		}
 	}
-	payoutReconciler := payments.NewPayoutReconciler(ledgerRepository, payoutService, logger)
-	go payoutReconciler.Start(ctx)
-	allocationWorker := payments.NewAllocationWorker(
-		ledgerRepository,
-		capabilityRegistry,
-		capabilities.Environment(cfg.PaymentsEnvironment),
-		logger,
+	if runsMaintenance {
+		payoutReconciler := payments.NewPayoutReconciler(ledgerRepository, payoutService, logger)
+		go payoutReconciler.Start(ctx)
+		settlementWorker := payments.NewSettlementWorker(ledgerRepository, settlementProviders, logger)
+		go settlementWorker.Start(ctx)
+	}
+	if runsCoreWorkers {
+		if len(cfg.NotificationDestinationHMACKey) >= 32 {
+			notificationRepository, notificationErr := notificationworker.NewRepository(
+				dbPool, cfg.NotificationDestinationHMACKey, cfg.WhatsAppEnabledTemplateKeys,
+			)
+			if notificationErr != nil {
+				logger.Error("configure notification planner", "error", notificationErr)
+				os.Exit(1)
+			}
+			notificationWake, unsubscribeNotificationWake := coreWorkerWake.Subscribe()
+			defer unsubscribeNotificationWake()
+			go notificationworker.NewPlannerWorker(
+				notificationRepository, logger, notificationWake, cfg.NotificationPlannerConcurrency,
+			).Start(ctx)
+		} else {
+			logger.Info("notification planner disabled", "reason", "missing destination HMAC key")
+		}
+		allocationWorker := payments.NewAllocationWorker(
+			ledgerRepository,
+			capabilityRegistry,
+			capabilities.Environment(cfg.PaymentsEnvironment),
+			logger,
+		)
+		allocationWake, unsubscribeAllocationWake := coreWorkerWake.Subscribe()
+		defer unsubscribeAllocationWake()
+		go allocationWorker.Start(ctx, allocationWake)
+		bookingRefundWorker := payments.NewBookingRefundWorker(ledgerRepository, refundProviders, logger)
+		bookingRefundWake, unsubscribeBookingRefundWake := coreWorkerWake.Subscribe()
+		defer unsubscribeBookingRefundWake()
+		go bookingRefundWorker.Start(ctx, bookingRefundWake)
+	}
+
+	appdataHandler := appdata.NewHandler(appdataRepo, authHandler, destinationService, r2Service, smtpMailer, aiClient, checkoutService, payoutService, paymentEvents, paymentReconciliations, cfg.ClientPublicBaseURL, cfg.MarketplacePublicBaseURL)
+	var notificationContacts *whatsapp.ContactFoundationRepository
+	if runsAPI && cfg.NotificationContactFoundationConfigured() {
+		notificationContacts, err = whatsapp.NewContactFoundationRepository(
+			dbPool, cfg.NotificationDestinationHMACKey, cfg.WABABusinessPhoneE164,
+			cfg.MetaWebhookConfigured(),
+		)
+		if err != nil {
+			logger.Error("configure notification contact foundation", "error", err)
+			os.Exit(1)
+		}
+		appdataHandler.ConfigureNotificationContacts(notificationContacts)
+	}
+	appdataHandler.ConfigureStreamBudgets(
+		cfg.SSEMaxConnections, cfg.SSEMaxConnectionsPerIP, cfg.PaymentSSEMaxConnectionsPerToken,
 	)
-	go allocationWorker.Start(ctx)
-	settlementWorker := payments.NewSettlementWorker(ledgerRepository, settlementProviders, logger)
-	go settlementWorker.Start(ctx)
+	appdataHandler.ConfigureOperationalMetrics(metrics)
+	if redisClient != nil {
+		appdataHandler.ConfigureInboxCommandLimiter(redisClient)
+	}
+	metrics.RegisterInbox(func() observability.InboxSnapshot {
+		snapshot := appdataHandler.InboxMetrics().Snapshot()
+		return observability.InboxSnapshot{
+			StreamsCurrent: snapshot.StreamsCurrent, StreamsOpened: snapshot.StreamsOpened,
+			StreamsRejected: snapshot.StreamsRejected, StreamFailures: snapshot.StreamFailures,
+			StreamResets: snapshot.StreamResets, EventsDelivered: snapshot.EventsDelivered,
+			EventLagTotal: snapshot.EventLag, EventLagMaximum: snapshot.EventLagMax,
+		}
+	})
+	inboxAIModelName := cfg.DefaultAIModelName()
+	inboxAIGenerationLimiter := appdata.NewInboxAIGenerationLimiter(cfg.InboxAIMaxConcurrency)
+	appdataHandler.ConfigureInboxAIDrafts(
+		cfg.InboxAIDraftsEnabled,
+		cfg.DefaultAIProvider,
+		inboxAIModelName,
+		cfg.InboxAIModelConfigHash(),
+		cfg.InboxAIProviderAllowlist,
+		inboxAIGenerationLimiter,
+	)
+	appdataHandler.ConfigureInboxAIAutomation(
+		cfg.InboxAIAutomationEnabled,
+		cfg.InboxAIAutomationProviderAllowlist,
+		cfg.InboxAISemiPilotReplyDelay,
+	)
+	if cfg.InboxAIDraftsEnabled && runsAIWorkers {
+		inboxAIDraftWorker, workerErr := appdata.NewInboxAIDraftWorker(
+			appdataRepo,
+			aiClient,
+			inboxAIGenerationLimiter,
+			logger,
+			appdata.InboxAIDraftWorkerConfig{
+				MaxConcurrency: cfg.InboxAIMaxConcurrency,
+				JobTimeout:     cfg.SynchronousAIRouteTimeout(),
+			},
+		)
+		if workerErr != nil {
+			logger.Error("configure inbox AI draft worker", "error", workerErr)
+			os.Exit(1)
+		}
+		inboxDraftWakes, unsubscribeInboxDraftWakes := subscribeWorkerWakes(aiWorkerWake, cfg.InboxAIMaxConcurrency)
+		defer unsubscribeInboxDraftWakes()
+		inboxAIDraftWorker.Start(ctx, inboxDraftWakes...)
+	}
+	if cfg.TessaAIEnabled && runsAPI {
+		tessaEvents := appdata.NewTessaEventBroker(directDBPool, logger)
+		go tessaEvents.Start(ctx)
+		appdataHandler.ConfigureTessa(
+			true, cfg.TessaAIProviderAllowlist, cfg.TessaAINoticeRevision,
+			cfg.TessaAIPrimaryProvider, cfg.AIModelName(cfg.TessaAIPrimaryProvider),
+			cfg.TessaAIConfigHash(), tessaEvents,
+		)
+	}
+	if cfg.TessaAIEnabled && runsAIWorkers {
+		primaryGenerator := newTessaGenerator(cfg, cfg.TessaAIPrimaryProvider, cfg.TessaAIPrimaryRequestTimeout)
+		primary := tessa.Provider{
+			Name: cfg.TessaAIPrimaryProvider, Model: cfg.AIModelName(cfg.TessaAIPrimaryProvider),
+			Generator: primaryGenerator, Timeout: cfg.TessaAIPrimaryRequestTimeout,
+		}
+		var fallback *tessa.Provider
+		if cfg.TessaAIFallbackProvider != "" {
+			fallback = &tessa.Provider{
+				Name: cfg.TessaAIFallbackProvider, Model: cfg.AIModelName(cfg.TessaAIFallbackProvider),
+				Generator: newTessaGenerator(cfg, cfg.TessaAIFallbackProvider, cfg.TessaAIFallbackRequestTimeout),
+				Timeout:   cfg.TessaAIFallbackRequestTimeout,
+			}
+		}
+		tessaService, serviceErr := tessa.NewService(primary, fallback, cfg.TessaAIMaxInputTokens)
+		if serviceErr != nil {
+			logger.Error("configure Tessa model service", "error", serviceErr)
+			os.Exit(1)
+		}
+		helpIndex, helpErr := tessa.LoadHelpIndex()
+		if helpErr != nil {
+			logger.Error("load Tessa help corpus", "error", helpErr)
+			os.Exit(1)
+		}
+		tessaWorker, workerErr := appdata.NewTessaWorker(
+			appdataRepo, tessaService, helpIndex, inboxAIGenerationLimiter, logger,
+			appdata.TessaWorkerConfig{
+				MaxConcurrency: cfg.TessaAIWorkerConcurrency,
+				TurnTimeout:    cfg.TessaAITurnTimeout,
+				ConfigHash:     cfg.TessaAIConfigHash(),
+				NoticeRevision: cfg.TessaAINoticeRevision,
+			},
+		)
+		if workerErr != nil {
+			logger.Error("configure Tessa worker", "error", workerErr)
+			os.Exit(1)
+		}
+		tessaWakes, unsubscribeTessaWakes := subscribeWorkerWakes(aiWorkerWake, cfg.TessaAIWorkerConcurrency)
+		defer unsubscribeTessaWakes()
+		tessaWorker.Start(ctx, tessaWakes...)
+	}
+	if runsMaintenance {
+		reservationExpiryWorker := appdata.NewInboxAIReservationExpiryWorker(
+			dbPool, appdataRepo, checkoutService, appdataHandler.InboxMetrics(), logger,
+		)
+		go reservationExpiryWorker.Start(ctx)
+	}
+	if cfg.InboxAIAutomationEnabled && runsAIWorkers {
+		semiPilotWorker, workerErr := appdata.NewInboxAISemiPilotWorker(
+			appdataRepo,
+			aiClient,
+			inboxAIGenerationLimiter,
+			logger,
+			appdata.InboxAISemiPilotWorkerConfig{
+				ModelProvider:   cfg.DefaultAIProvider,
+				ModelName:       inboxAIModelName,
+				ModelConfigHash: cfg.InboxAIModelConfigHash(),
+				MaxConcurrency:  cfg.InboxAIMaxConcurrency,
+				PollInterval:    25 * time.Second,
+			},
+		)
+		if workerErr != nil {
+			logger.Error("configure inbox semi-pilot worker", "error", workerErr)
+			os.Exit(1)
+		}
+		semiPilotWakes, unsubscribeSemiPilotWakes := subscribeWorkerWakes(aiWorkerWake, cfg.InboxAIMaxConcurrency)
+		defer unsubscribeSemiPilotWakes()
+		semiPilotWorker.Start(ctx, semiPilotWakes...)
+	}
+	appdataHandler.ConfigureMarketplaceAuthentication(marketplaceAuthHandler)
+	if runsAPI {
+		inboxEvents := appdata.NewInboxEventBroker(directDBPool, logger)
+		appdataHandler.ConfigureInboxEvents(inboxEvents)
+		go inboxEvents.Start(ctx)
+		bookingEvents := appdata.NewBookingEventBroker(directDBPool, logger)
+		appdataHandler.ConfigureBookingEvents(bookingEvents)
+		go bookingEvents.Start(ctx)
+	}
+	if runsMaintenance {
+		providerDailyMetrics := appdata.NewProviderDailyMetricsWorker(appdataRepo, logger)
+		go providerDailyMetrics.Start(ctx)
+		dataMaintenance := appdata.NewDataMaintenanceWorker(dbPool, logger)
+		go dataMaintenance.Start(ctx)
+		inboxEventRetention := appdata.NewInboxEventRetentionWorker(dbPool, logger)
+		go inboxEventRetention.Start(ctx)
+		tessaRetention := appdata.NewTessaRetentionWorker(dbPool, logger)
+		go tessaRetention.Start(ctx)
+		inboxAIRunRetention := appdata.NewInboxAIRunRetentionWorker(dbPool, logger)
+		go inboxAIRunRetention.Start(ctx)
+		inboxTelemetry := appdata.NewInboxTelemetryWorker(dbPool, appdataHandler.InboxMetrics(), logger)
+		go inboxTelemetry.Start(ctx)
+	}
 
-	appdataHandler := appdata.NewHandler(appdataRepo, authHandler, destinationService, r2Service, smtpMailer, aiClient, checkoutService, payoutService, paymentEvents, activePayments, cfg.ClientPublicBaseURL)
-	appdataReconciler := appdata.NewReconciler(ledgerRepository, checkoutService, logger)
-	go appdataReconciler.Start(ctx)
-
-	httpServer := server.New(cfg, logger, authHandler, providerWebhookHandler, appdataHandler)
+	var servedAuthHandler *auth.Handler
+	var servedWebhookHandler *payments.ProviderWebhookHandler
+	var servedAppdataHandler *appdata.Handler
+	var metaWhatsAppWebhook http.Handler
+	if runsAPI {
+		servedAuthHandler = authHandler
+		servedWebhookHandler = providerWebhookHandler
+		servedAppdataHandler = appdataHandler
+		if cfg.MetaWebhookConfigured() {
+			metaHandler, metaHandlerErr := whatsapp.NewWebhookHandler(
+				whatsapp.WebhookConfig{
+					AppSecret: cfg.MetaAppSecret, VerifyToken: cfg.MetaVerifyToken,
+					BusinessID: cfg.WhatsAppBusinessAccountID, PhoneNumberID: cfg.WABAPhoneNumberID,
+				},
+				whatsapp.NewWebhookRepository(dbPool, notificationContacts),
+				logger,
+			)
+			if metaHandlerErr != nil {
+				logger.Error("configure Meta WhatsApp webhook", "error", metaHandlerErr)
+				os.Exit(1)
+			}
+			metaWhatsAppWebhook = metaHandler
+		}
+	}
+	operational := server.OperationalDependencies{
+		Readiness: readiness, Metrics: metrics, Role: cfg.ProcessRole,
+		ConfigurationReady: true, WorkersReady: true,
+		MaintenanceOwnership: maintenanceOwnership,
+		MetaWhatsAppWebhook:  metaWhatsAppWebhook,
+	}
+	if redisClient != nil {
+		operational.RedisReadiness = redisClient
+		operational.SharedRateLimiter = redisClient
+	}
+	httpServer := server.New(
+		cfg,
+		logger,
+		servedAuthHandler,
+		servedWebhookHandler,
+		servedAppdataHandler,
+		operational,
+	)
 
 	serverErrCh := make(chan error, 1)
 	go func() {
 		logger.Info(
 			"starting server",
 			"addr", cfg.HTTPAddr,
+			"process_role", cfg.ProcessRole,
 			"default_ai_provider", cfg.DefaultAIProvider,
 			"agreement_ai_provider", cfg.AgreementAIProvider,
-			"inbox_ai_provider", cfg.InboxAIProvider,
 			"self_hosted_model", cfg.LLMModel,
 			"openai_model", cfg.OpenAIModel,
+			"openai_compatible_model", cfg.OpenAICompatModel,
 		)
 		serverErrCh <- httpServer.ListenAndServe()
 	}()
@@ -414,4 +774,134 @@ func main() {
 	}
 
 	logger.Info("server stopped cleanly")
+}
+
+func newTessaGenerator(cfg config.Config, provider string, timeout time.Duration) aisvc.JSONGenerator {
+	tessaConfig := cfg
+	switch provider {
+	case config.AIProviderHosted:
+		tessaConfig.OpenAITimeout = timeout
+		tessaConfig.OpenAIMaxOutputTokens = int64(cfg.TessaAIMaxOutputTokens)
+		tessaConfig.OpenAIResponseLogFile = ""
+		return llm.NewOpenAIClient(tessaConfig)
+	case config.AIProviderOpenAICompatible:
+		tessaConfig.OpenAICompatTimeout = timeout
+		tessaConfig.OpenAICompatMaxOutputTokens = cfg.TessaAIMaxOutputTokens
+		return llm.NewOpenAICompatibleClient(tessaConfig)
+	default:
+		tessaConfig.LLMTimeout = timeout
+		tessaConfig.LLMMaxOutputTokens = cfg.TessaAIMaxOutputTokens
+		return llm.NewClient(tessaConfig)
+	}
+}
+
+const maintenanceLeadershipKey = "tellbook-maintenance-v1"
+
+type databaseReadiness struct {
+	query      *pgxpool.Pool
+	leadership *pgxpool.Conn
+}
+
+func (readiness *databaseReadiness) Ping(ctx context.Context) error {
+	if readiness == nil || readiness.query == nil {
+		return errors.New("query database pool is not configured")
+	}
+	if err := readiness.query.Ping(ctx); err != nil {
+		return fmt.Errorf("query database: %w", err)
+	}
+	if readiness.leadership == nil {
+		return nil
+	}
+	var owned bool
+	if err := readiness.leadership.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_locks
+			WHERE locktype='advisory' AND pid=pg_backend_pid() AND granted
+		)
+	`).Scan(&owned); err != nil {
+		return err
+	}
+	if !owned {
+		return errors.New("maintenance leadership is not owned")
+	}
+	return nil
+}
+
+func acquireMaintenanceLeadership(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Conn, error) {
+	connection, err := pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var owned bool
+	if err := connection.QueryRow(
+		ctx, `SELECT pg_try_advisory_lock(hashtextextended($1,0))`, maintenanceLeadershipKey,
+	).Scan(&owned); err != nil {
+		connection.Release()
+		return nil, err
+	}
+	if !owned {
+		connection.Release()
+		return nil, errors.New("another maintenance process owns the leader lock")
+	}
+	return connection, nil
+}
+
+func releaseMaintenanceLeadership(connection *pgxpool.Conn) {
+	if connection == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = connection.Exec(ctx, `SELECT pg_advisory_unlock(hashtextextended($1,0))`, maintenanceLeadershipKey)
+	connection.Release()
+}
+
+func monitorMaintenanceLeadership(
+	ctx context.Context,
+	connection *pgxpool.Conn,
+	logger *slog.Logger,
+	stop context.CancelFunc,
+) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			var owned bool
+			err := connection.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM pg_locks
+					WHERE locktype='advisory' AND pid=pg_backend_pid() AND granted
+				)
+			`).Scan(&owned)
+			if err != nil || !owned {
+				logger.Error("maintenance leadership lost", "error", err)
+				stop()
+				return
+			}
+		}
+	}
+}
+
+func subscribeWorkerWakes(
+	broker *payments.CoreWorkerWakeBroker,
+	count int,
+) ([]<-chan struct{}, func()) {
+	if broker == nil || count < 1 {
+		return nil, func() {}
+	}
+	wakes := make([]<-chan struct{}, 0, count)
+	unsubscribes := make([]func(), 0, count)
+	for range count {
+		wake, unsubscribe := broker.Subscribe()
+		wakes = append(wakes, wake)
+		unsubscribes = append(unsubscribes, unsubscribe)
+	}
+	return wakes, func() {
+		for _, unsubscribe := range unsubscribes {
+			unsubscribe()
+		}
+	}
 }

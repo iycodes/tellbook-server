@@ -5,6 +5,8 @@ import (
 
 	"booking/go-server/internal/money"
 	"booking/go-server/internal/payments"
+
+	"github.com/google/uuid"
 )
 
 type DashboardResponse struct {
@@ -83,6 +85,7 @@ type RevenuePaymentItem struct {
 
 type BookingItem struct {
 	ID              string    `json:"id"`
+	Source          string    `json:"source"`
 	CustomerID      string    `json:"customer_id"`
 	Title           string    `json:"title"`
 	StartAt         time.Time `json:"start_at"`
@@ -94,6 +97,14 @@ type BookingItem struct {
 	IconName        string    `json:"icon_name"`
 	LocationLabel   string    `json:"location_label"`
 	Notes           string    `json:"notes"`
+}
+
+type BookingListResponse struct {
+	Items       []BookingItem `json:"items"`
+	SyncCursor  string        `json:"sync_cursor"`
+	NextCursor  string        `json:"next_cursor,omitempty"`
+	WindowStart time.Time     `json:"window_start"`
+	WindowEnd   time.Time     `json:"window_end"`
 }
 
 type BookingOptimizationItem struct {
@@ -116,21 +127,69 @@ type BookingOptimizationInsight struct {
 }
 
 type BookingDetailsResponse struct {
-	ID                     string      `json:"id"`
-	Status                 string      `json:"status"`
-	Title                  string      `json:"title"`
-	Stylist                string      `json:"stylist"`
-	DateLabel              string      `json:"date_label"`
-	TimeLabel              string      `json:"time_label"`
-	BaseServiceAmountMinor money.Minor `json:"base_service_amount_minor"`
-	DurationLabel          string      `json:"duration_label"`
-	TotalAmountMinor       money.Minor `json:"total_amount_minor"`
-	CurrencyCode           string      `json:"currency_code"`
-	PaymentStatus          string      `json:"payment_status"`
-	AgreementStatus        string      `json:"agreement_status"`
-	Notes                  string      `json:"notes"`
-	Location               string      `json:"location"`
-	ImageURL               string      `json:"image_url,omitempty"`
+	ID                     string                        `json:"id"`
+	Source                 string                        `json:"source"`
+	Status                 string                        `json:"status"`
+	Title                  string                        `json:"title"`
+	Stylist                string                        `json:"stylist"`
+	DateLabel              string                        `json:"date_label"`
+	TimeLabel              string                        `json:"time_label"`
+	BaseServiceAmountMinor money.Minor                   `json:"base_service_amount_minor"`
+	DurationLabel          string                        `json:"duration_label"`
+	TotalAmountMinor       money.Minor                   `json:"total_amount_minor"`
+	CurrencyCode           string                        `json:"currency_code"`
+	PaymentStatus          string                        `json:"payment_status"`
+	AgreementStatus        string                        `json:"agreement_status"`
+	Notes                  string                        `json:"notes"`
+	Location               string                        `json:"location"`
+	ImageURL               string                        `json:"image_url,omitempty"`
+	StartsAt               time.Time                     `json:"starts_at"`
+	EndsAt                 time.Time                     `json:"ends_at"`
+	Timezone               string                        `json:"timezone"`
+	FulfillmentMode        string                        `json:"fulfillment_mode"`
+	Preparation            string                        `json:"preparation,omitempty"`
+	PaymentHistory         []BookingDetailPaymentItem    `json:"payment_history"`
+	RefundHistory          []BookingDetailRefundItem     `json:"refund_history"`
+	ChangeHistory          []BookingDetailEvent          `json:"change_history"`
+	AllowedActions         ProviderBookingAllowedActions `json:"allowed_actions"`
+}
+
+type ProviderBookingAllowedActions struct {
+	Confirm    bool `json:"confirm"`
+	Decline    bool `json:"decline"`
+	Complete   bool `json:"complete"`
+	MarkNoShow bool `json:"mark_no_show"`
+}
+
+type BookingDetailPaymentItem struct {
+	ID           string      `json:"id"`
+	Purpose      string      `json:"purpose"`
+	Method       string      `json:"method"`
+	Status       string      `json:"status"`
+	AmountMinor  money.Minor `json:"amount_minor"`
+	CurrencyCode string      `json:"currency_code"`
+	Reference    string      `json:"reference"`
+	PaidAt       *time.Time  `json:"paid_at,omitempty"`
+	CreatedAt    time.Time   `json:"created_at"`
+}
+
+type BookingDetailRefundItem struct {
+	ID                    string      `json:"id"`
+	PaymentID             string      `json:"payment_id"`
+	Kind                  string      `json:"kind"`
+	Status                string      `json:"status"`
+	AmountMinor           money.Minor `json:"amount_minor"`
+	AllocationImpactMinor money.Minor `json:"allocation_impact_minor"`
+	CurrencyCode          string      `json:"currency_code"`
+	Reference             string      `json:"reference"`
+	Reason                string      `json:"reason,omitempty"`
+	OccurredAt            time.Time   `json:"occurred_at"`
+	CreatedAt             time.Time   `json:"created_at"`
+}
+
+type BookingDetailEvent struct {
+	Type      string    `json:"type"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type CustomerItem struct {
@@ -150,6 +209,12 @@ type CustomerItem struct {
 	HasCompletedBooking    bool       `json:"has_completed_booking"`
 	NextBookingAt          *time.Time `json:"next_booking_at,omitempty"`
 	LastCompletedBookingAt *time.Time `json:"last_completed_booking_at,omitempty"`
+}
+
+type CustomerListResponse struct {
+	Items      []CustomerItem `json:"items"`
+	NextCursor string         `json:"next_cursor,omitempty"`
+	Counts     map[string]int `json:"counts,omitempty"`
 }
 
 type CustomerBookingHistoryItem struct {
@@ -182,22 +247,25 @@ type CustomerDetailsResponse struct {
 }
 
 type NotificationItem struct {
-	ID          string    `json:"id"`
-	Type        string    `json:"type"`
-	Severity    string    `json:"severity"`
-	Title       string    `json:"title"`
-	Description string    `json:"description"`
-	ActionLabel string    `json:"action_label"`
-	ActionRoute string    `json:"action_route"`
-	ImageURL    string    `json:"image_url,omitempty"`
-	IconName    string    `json:"icon_name,omitempty"`
-	IconTone    string    `json:"icon_tone,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID          string     `json:"id"`
+	Type        string     `json:"type"`
+	Severity    string     `json:"severity"`
+	Title       string     `json:"title"`
+	Description string     `json:"description"`
+	ActionLabel string     `json:"action_label"`
+	ActionRoute string     `json:"action_route"`
+	ImageURL    string     `json:"image_url,omitempty"`
+	IconName    string     `json:"icon_name,omitempty"`
+	IconTone    string     `json:"icon_tone,omitempty"`
+	ReadAt      *time.Time `json:"read_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
 }
 
 type NotificationsResponse struct {
-	ActionRequired []NotificationItem `json:"action_required"`
-	Today          []NotificationItem `json:"today"`
+	Items               []NotificationItem `json:"items"`
+	NextCursor          string             `json:"next_cursor,omitempty"`
+	UnreadCount         int                `json:"unread_count"`
+	ActionRequiredCount int                `json:"action_required_count"`
 }
 
 type AutomationSettingItem struct {
@@ -210,41 +278,43 @@ type AutomationSettingItem struct {
 }
 
 type ClientProfileResponse struct {
-	FullName           string `json:"full_name"`
-	Email              string `json:"email"`
-	Bio                string `json:"bio"`
-	BusinessName       string `json:"business_name"`
-	HandleSlug         string `json:"handle_slug"`
-	Category           string `json:"category"`
-	Headline           string `json:"headline"`
-	ShortBio           string `json:"short_bio"`
-	PublicProfileAbout string `json:"public_profile_about"`
-	BookingPageIntro   string `json:"booking_page_intro"`
-	Location           string `json:"location_label"`
-	City               string `json:"city"`
-	Region             string `json:"region"`
-	Timezone           string `json:"timezone"`
-	Locale             string `json:"locale"`
-	CountryCode        string `json:"country_code"`
-	AvatarURL          string `json:"avatar_url,omitempty"`
-	HeroImageURL       string `json:"hero_image_url,omitempty"`
-	Verified           bool   `json:"verified"`
-	CurrencyCode       string `json:"currency_code"`
-	MarketConfigured   bool   `json:"market_configured"`
+	FullName                  string `json:"full_name"`
+	Email                     string `json:"email"`
+	Bio                       string `json:"bio"`
+	BusinessName              string `json:"business_name"`
+	HandleSlug                string `json:"handle_slug"`
+	Category                  string `json:"category"`
+	Headline                  string `json:"headline"`
+	ShortBio                  string `json:"short_bio"`
+	PublicProfileAbout        string `json:"public_profile_about"`
+	BookingPageIntro          string `json:"booking_page_intro"`
+	Location                  string `json:"location_label"`
+	City                      string `json:"city"`
+	Region                    string `json:"region"`
+	Timezone                  string `json:"timezone"`
+	Locale                    string `json:"locale"`
+	CountryCode               string `json:"country_code"`
+	AvatarURL                 string `json:"avatar_url,omitempty"`
+	HeroImageURL              string `json:"hero_image_url,omitempty"`
+	Verified                  bool   `json:"verified"`
+	CurrencyCode              string `json:"currency_code"`
+	MarketConfigured          bool   `json:"market_configured"`
+	ConcurrentBookingCapacity int    `json:"concurrent_booking_capacity"`
 }
 
 type UpdateClientProfileInput struct {
-	BusinessName       string  `json:"business_name"`
-	HandleSlug         *string `json:"handle_slug,omitempty"`
-	ShortBio           string  `json:"short_bio"`
-	Headline           string  `json:"headline"`
-	PublicProfileAbout string  `json:"public_profile_about"`
-	BookingPageIntro   string  `json:"booking_page_intro"`
-	Location           string  `json:"location_label"`
-	City               string  `json:"city"`
-	Region             string  `json:"region"`
-	Category           string  `json:"category"`
-	HeroImageURL       string  `json:"hero_image_url,omitempty"`
+	BusinessName              string  `json:"business_name"`
+	HandleSlug                *string `json:"handle_slug,omitempty"`
+	ShortBio                  string  `json:"short_bio"`
+	Headline                  string  `json:"headline"`
+	PublicProfileAbout        string  `json:"public_profile_about"`
+	BookingPageIntro          string  `json:"booking_page_intro"`
+	Location                  string  `json:"location_label"`
+	City                      string  `json:"city"`
+	Region                    string  `json:"region"`
+	Category                  string  `json:"category"`
+	HeroImageURL              string  `json:"hero_image_url,omitempty"`
+	ConcurrentBookingCapacity int     `json:"concurrent_booking_capacity"`
 }
 
 type UpdateClientMarketInput struct {
@@ -371,29 +441,35 @@ type CreatePayoutInput struct {
 type PublicProfileResponse struct {
 	Profile          PublicProfile         `json:"profile"`
 	FeaturedServices []PublicServiceItem   `json:"featured_services"`
+	Services         []PublicServiceItem   `json:"services,omitempty"`
 	Portfolio        []PublicPortfolioItem `json:"portfolio"`
 }
 
 type PublicProfile struct {
-	ClientID           string  `json:"client_id"`
-	BusinessName       string  `json:"business_name"`
-	HandleSlug         string  `json:"handle_slug"`
-	Category           string  `json:"category"`
-	Headline           string  `json:"headline"`
-	ShortBio           string  `json:"short_bio"`
-	PublicProfileAbout string  `json:"public_profile_about"`
-	BookingPageIntro   string  `json:"booking_page_intro"`
-	LocationLabel      string  `json:"location_label"`
-	HeroImageURL       string  `json:"hero_image_url,omitempty"`
-	AvatarURL          string  `json:"avatar_url,omitempty"`
-	Verified           bool    `json:"verified"`
-	YearsExperience    int     `json:"years_experience"`
-	ReviewRating       float64 `json:"review_rating"`
-	ReviewCount        int     `json:"review_count"`
-	CountryCode        string  `json:"country_code"`
-	CurrencyCode       string  `json:"currency_code"`
-	Timezone           string  `json:"timezone"`
-	Locale             string  `json:"locale"`
+	ClientID                string  `json:"client_id"`
+	BusinessName            string  `json:"business_name"`
+	HandleSlug              string  `json:"handle_slug"`
+	Category                string  `json:"category"`
+	Headline                string  `json:"headline"`
+	ShortBio                string  `json:"short_bio"`
+	PublicProfileAbout      string  `json:"public_profile_about"`
+	BookingPageIntro        string  `json:"booking_page_intro"`
+	LocationLabel           string  `json:"location_label"`
+	HeroImageURL            string  `json:"hero_image_url,omitempty"`
+	AvatarURL               string  `json:"avatar_url,omitempty"`
+	Verified                bool    `json:"verified"`
+	YearsExperience         int     `json:"years_experience"`
+	ReviewRating            float64 `json:"review_rating"`
+	ReviewCount             int     `json:"review_count"`
+	CountryCode             string  `json:"country_code"`
+	CurrencyCode            string  `json:"currency_code"`
+	Timezone                string  `json:"timezone"`
+	Locale                  string  `json:"locale"`
+	MarketplaceEnabled      bool    `json:"marketplace_enabled"`
+	MarketplaceCategoryID   string  `json:"marketplace_category_id,omitempty"`
+	MarketplaceCategoryName string  `json:"marketplace_category_name,omitempty"`
+	CompletedBookings       int     `json:"completed_bookings"`
+	PublicBookingURL        string  `json:"public_booking_url"`
 }
 
 type PublicServiceItem struct {
@@ -442,6 +518,22 @@ type PublicAvailabilityResponse struct {
 	Slots           []PublicAvailabilitySlot `json:"slots"`
 }
 
+type PublicAvailabilityDay struct {
+	Date  string                   `json:"date"`
+	Slots []PublicAvailabilitySlot `json:"slots"`
+}
+
+type PublicAvailabilityRangeResponse struct {
+	ServiceID       string                  `json:"service_id"`
+	From            string                  `json:"from"`
+	Days            int                     `json:"days"`
+	Timezone        string                  `json:"timezone"`
+	CurrencyCode    string                  `json:"currency_code"`
+	DurationMinutes int                     `json:"duration_minutes"`
+	LocationLabel   string                  `json:"location_label"`
+	Dates           []PublicAvailabilityDay `json:"dates"`
+}
+
 type ResolvePublicLocationInput struct {
 	Source          string   `json:"source"`
 	Address         string   `json:"address"`
@@ -454,10 +546,17 @@ type ResolvedPublicLocationResponse struct {
 	LocationToken    string `json:"location_token"`
 	FormattedAddress string `json:"formatted_address"`
 	ResolutionStatus string `json:"resolution_status"`
+	CountryCode      string `json:"country_code,omitempty"`
+	StateRegionID    string `json:"state_region_id,omitempty"`
+	StateName        string `json:"state_name,omitempty"`
+	LGARegionID      string `json:"lga_region_id,omitempty"`
+	LGAName          string `json:"lga_name,omitempty"`
+	Locality         string `json:"locality,omitempty"`
 	ExpiresAt        string `json:"expires_at"`
 }
 
 type CreatePublicBookingQuoteInput struct {
+	IdempotencyKey        string `json:"idempotency_key"`
 	ServiceID             string `json:"service_id"`
 	StartsAt              string `json:"starts_at"`
 	CustomerName          string `json:"customer_name"`
@@ -495,6 +594,9 @@ type PublicBookingQuoteResponse struct {
 	Locale                       string                          `json:"locale"`
 	Agreement                    *PublicBookingAgreementSnapshot `json:"agreement,omitempty"`
 	StandaloneSignatureRequired  bool                            `json:"standalone_signature_required"`
+	SlotHeld                     bool                            `json:"slot_held"`
+	AvailabilityRevalidated      bool                            `json:"availability_revalidated_at_booking"`
+	IdempotentReplay             bool                            `json:"-"`
 }
 
 type PublicBookingAgreementSnapshot struct {
@@ -506,70 +608,99 @@ type PublicBookingAgreementSnapshot struct {
 }
 
 type CreatePublicBookingInput struct {
-	QuoteToken                string `json:"quote_token"`
-	FullName                  string `json:"full_name"`
-	Email                     string `json:"email"`
-	Phone                     string `json:"phone"`
-	Notes                     string `json:"notes"`
-	AgreementAccepted         bool   `json:"agreement_accepted"`
-	AgreementFullName         string `json:"agreement_full_name"`
-	AgreementSignatureDataURL string `json:"agreement_signature_data_url"`
+	QuoteToken                string                              `json:"quote_token"`
+	Source                    string                              `json:"source"`
+	FullName                  string                              `json:"full_name"`
+	Email                     string                              `json:"email"`
+	Phone                     string                              `json:"phone"`
+	Notes                     string                              `json:"notes"`
+	AgreementAccepted         bool                                `json:"agreement_accepted"`
+	AgreementFullName         string                              `json:"agreement_full_name"`
+	AgreementSignatureDataURL string                              `json:"agreement_signature_data_url"`
+	EmailReminderConsent      bool                                `json:"email_reminder_consent"`
+	WhatsAppConsent           bool                                `json:"whatsapp_consent"`
+	SMSConsent                bool                                `json:"sms_consent"`
+	MarketplaceCustomerID     *uuid.UUID                          `json:"-"`
+	PrebookingAgreementID     *uuid.UUID                          `json:"-"`
+	AutopilotAuthority        *InboxAutopilotReservationAuthority `json:"-"`
 }
 
 type PublicBookingSummaryResponse struct {
-	BookingID                    string      `json:"-"`
-	BookingToken                 string      `json:"booking_token"`
-	ServiceTitle                 string      `json:"service_title"`
-	ServiceImageURL              string      `json:"service_image_url,omitempty"`
-	DurationLabel                string      `json:"duration_label"`
-	DateLabel                    string      `json:"date_label"`
-	TimeLabel                    string      `json:"time_label"`
-	StartsAt                     string      `json:"starts_at"`
-	EndsAt                       string      `json:"ends_at"`
-	LocationLabel                string      `json:"location_label"`
-	FulfillmentMode              string      `json:"fulfillment_mode"`
-	ProviderLocationLabel        string      `json:"provider_location_label,omitempty"`
-	CustomerLocationLabel        string      `json:"customer_location_label,omitempty"`
-	TravelDistanceMeters         *int        `json:"travel_distance_meters,omitempty"`
-	VirtualDeliveryLabel         string      `json:"virtual_delivery_label,omitempty"`
-	VirtualJoinURL               string      `json:"virtual_join_url,omitempty"`
-	VirtualInstructions          string      `json:"virtual_instructions,omitempty"`
-	CancellationPolicy           string      `json:"cancellation_policy,omitempty"`
-	LatenessPolicy               string      `json:"lateness_policy,omitempty"`
-	OriginalAmountMinor          money.Minor `json:"original_amount_minor"`
-	DiscountApplied              bool        `json:"discount_applied"`
-	DiscountName                 string      `json:"discount_name,omitempty"`
-	DiscountSource               string      `json:"discount_source,omitempty"`
-	DiscountCode                 string      `json:"discount_code,omitempty"`
-	DiscountType                 string      `json:"discount_type,omitempty"`
-	DiscountPercentageBPS        int64       `json:"discount_percentage_bps,omitempty"`
-	DiscountValueMinor           money.Minor `json:"discount_value_minor,omitempty"`
-	DiscountAmountMinor          money.Minor `json:"discount_amount_minor"`
-	DiscountedServiceAmountMinor money.Minor `json:"discounted_service_amount_minor"`
-	ShortNoticeFeeMinor          money.Minor `json:"short_notice_fee_minor"`
-	TravelFeeMinor               money.Minor `json:"travel_fee_minor"`
-	TotalAmountMinor             money.Minor `json:"total_amount_minor"`
-	DepositAmountMinor           money.Minor `json:"deposit_amount_minor"`
-	RemainingAmountMinor         money.Minor `json:"remaining_amount_minor"`
-	CountryCode                  string      `json:"country_code"`
-	CurrencyCode                 string      `json:"currency_code"`
-	Timezone                     string      `json:"timezone"`
-	Locale                       string      `json:"locale"`
-	Status                       string      `json:"status"`
-	PaymentStatus                string      `json:"payment_status"`
-	AgreementStatus              string      `json:"agreement_status"`
-	PaymentToken                 string      `json:"payment_token,omitempty"`
-	PaymentProvider              string      `json:"payment_provider,omitempty"`
-	PaymentReference             string      `json:"payment_reference,omitempty"`
-	AgreementTiming              string      `json:"agreement_timing,omitempty"`
-	AgreementConfirmationMethod  string      `json:"agreement_confirmation_method,omitempty"`
-	AgreementTemplateTitle       string      `json:"agreement_template_title,omitempty"`
-	StandaloneSignatureRequired  bool        `json:"standalone_signature_required"`
+	BookingID                    string                      `json:"-"`
+	BookingToken                 string                      `json:"booking_token"`
+	Source                       string                      `json:"source"`
+	ProviderName                 string                      `json:"provider_name"`
+	ProviderHandle               string                      `json:"provider_handle"`
+	ProviderAvatarURL            string                      `json:"provider_avatar_url,omitempty"`
+	CustomerName                 string                      `json:"customer_name"`
+	CustomerEmail                string                      `json:"customer_email"`
+	CustomerPhone                string                      `json:"customer_phone"`
+	EmailReminderConsent         bool                        `json:"email_reminder_consent"`
+	WhatsAppConsent              bool                        `json:"whatsapp_consent"`
+	SMSConsent                   bool                        `json:"sms_consent"`
+	DeliveryStatus               PublicBookingDeliveryStatus `json:"delivery_status"`
+	ServiceTitle                 string                      `json:"service_title"`
+	ServiceImageURL              string                      `json:"service_image_url,omitempty"`
+	DurationLabel                string                      `json:"duration_label"`
+	DateLabel                    string                      `json:"date_label"`
+	TimeLabel                    string                      `json:"time_label"`
+	StartsAt                     string                      `json:"starts_at"`
+	EndsAt                       string                      `json:"ends_at"`
+	LocationLabel                string                      `json:"location_label"`
+	FulfillmentMode              string                      `json:"fulfillment_mode"`
+	ProviderLocationLabel        string                      `json:"provider_location_label,omitempty"`
+	CustomerLocationLabel        string                      `json:"customer_location_label,omitempty"`
+	TravelDistanceMeters         *int                        `json:"travel_distance_meters,omitempty"`
+	VirtualDeliveryLabel         string                      `json:"virtual_delivery_label,omitempty"`
+	VirtualJoinURL               string                      `json:"virtual_join_url,omitempty"`
+	VirtualInstructions          string                      `json:"virtual_instructions,omitempty"`
+	CancellationPolicy           string                      `json:"cancellation_policy,omitempty"`
+	LatenessPolicy               string                      `json:"lateness_policy,omitempty"`
+	OriginalAmountMinor          money.Minor                 `json:"original_amount_minor"`
+	DiscountApplied              bool                        `json:"discount_applied"`
+	DiscountName                 string                      `json:"discount_name,omitempty"`
+	DiscountSource               string                      `json:"discount_source,omitempty"`
+	DiscountCode                 string                      `json:"discount_code,omitempty"`
+	DiscountType                 string                      `json:"discount_type,omitempty"`
+	DiscountPercentageBPS        int64                       `json:"discount_percentage_bps,omitempty"`
+	DiscountValueMinor           money.Minor                 `json:"discount_value_minor,omitempty"`
+	DiscountAmountMinor          money.Minor                 `json:"discount_amount_minor"`
+	DiscountedServiceAmountMinor money.Minor                 `json:"discounted_service_amount_minor"`
+	ShortNoticeFeeMinor          money.Minor                 `json:"short_notice_fee_minor"`
+	TravelFeeMinor               money.Minor                 `json:"travel_fee_minor"`
+	TotalAmountMinor             money.Minor                 `json:"total_amount_minor"`
+	DepositAmountMinor           money.Minor                 `json:"deposit_amount_minor"`
+	RemainingAmountMinor         money.Minor                 `json:"remaining_amount_minor"`
+	CountryCode                  string                      `json:"country_code"`
+	CurrencyCode                 string                      `json:"currency_code"`
+	Timezone                     string                      `json:"timezone"`
+	Locale                       string                      `json:"locale"`
+	Status                       string                      `json:"status"`
+	PaymentStatus                string                      `json:"payment_status"`
+	AgreementStatus              string                      `json:"agreement_status"`
+	PaymentToken                 string                      `json:"payment_token,omitempty"`
+	PaymentProvider              string                      `json:"payment_provider,omitempty"`
+	PaymentReference             string                      `json:"payment_reference,omitempty"`
+	AgreementTiming              string                      `json:"agreement_timing,omitempty"`
+	AgreementConfirmationMethod  string                      `json:"agreement_confirmation_method,omitempty"`
+	AgreementTemplateTitle       string                      `json:"agreement_template_title,omitempty"`
+	StandaloneSignatureRequired  bool                        `json:"standalone_signature_required"`
+	ReservationExpiresAt         string                      `json:"reservation_expires_at,omitempty"`
+	ReservationExpiredAt         string                      `json:"reservation_expired_at,omitempty"`
+	ReservationExpiryReason      string                      `json:"reservation_expiry_reason,omitempty"`
 }
 
 type CreatePublicBookingCheckoutInput struct {
 	IdempotencyKey string `json:"idempotency_key"`
 	Method         string `json:"method"`
+	ReturnSurface  string `json:"return_surface"`
+}
+
+type PublicBookingDeliveryStatus struct {
+	ProviderInApp    string `json:"provider_in_app"`
+	CustomerEmail    string `json:"customer_email"`
+	CustomerWhatsApp string `json:"customer_whatsapp"`
+	CustomerSMS      string `json:"customer_sms"`
 }
 
 type PublicBookingCheckoutStateResponse struct {
@@ -685,6 +816,17 @@ type PromotionListItem struct {
 	UpdatedAt                 time.Time            `json:"updated_at"`
 }
 
+type PromotionListResponse struct {
+	Items      []PromotionListItem   `json:"items"`
+	NextCursor string                `json:"next_cursor,omitempty"`
+	Summary    *PromotionListSummary `json:"summary,omitempty"`
+}
+
+type PromotionListSummary struct {
+	ActiveCount     int `json:"active_count"`
+	RedemptionCount int `json:"redemption_count"`
+}
+
 type CreatePromotionInput struct {
 	Name                      string      `json:"name"`
 	PromotionType             string      `json:"promotion_type"`
@@ -719,6 +861,11 @@ type PromotionRedemptionItem struct {
 	DiscountAmountMinor money.Minor `json:"discount_amount_minor"`
 	CurrencyCode        string      `json:"currency_code"`
 	CreatedAt           time.Time   `json:"created_at"`
+}
+
+type PromotionRedemptionListResponse struct {
+	Items      []PromotionRedemptionItem `json:"items"`
+	NextCursor string                    `json:"next_cursor,omitempty"`
 }
 
 type PublicAgreementResponse struct {

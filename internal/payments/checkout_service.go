@@ -218,6 +218,7 @@ func (s *CheckoutService) initialize(ctx context.Context, input BookingCheckoutI
 		checkoutInitializationLeaseOwner:     leaseOwner,
 		checkoutInitializationLeaseExpiresAt: &leaseExpiresAt,
 		nextProviderCheckAt:                  &requestedAt,
+		expiresAt:                            obligation.ReservationExpiresAt,
 	})
 	if err != nil {
 		var activePaymentError *ActivePaymentError
@@ -391,7 +392,7 @@ func (s *CheckoutService) ReconcileByPublicToken(ctx context.Context, token stri
 			return payment, nil
 		}
 	}
-	refreshed, err := s.repository.WithPaymentReconciliationLock(ctx, payment.ID, func() (FinancialPayment, error) {
+	refreshed, err := s.repository.WithPaymentReconciliationLease(ctx, payment.ID, func() (FinancialPayment, error) {
 		current, loadErr := s.repository.GetPaymentByPublicToken(ctx, token)
 		if loadErr != nil {
 			return FinancialPayment{}, loadErr
@@ -403,15 +404,23 @@ func (s *CheckoutService) ReconcileByPublicToken(ctx context.Context, token stri
 		if errors.Is(reconcileErr, ErrConcurrentUpdate) {
 			return s.repository.GetPaymentByPublicToken(ctx, token)
 		}
-		if reconcileErr != nil || isTerminalPaymentStatus(result.Status) || result.Method != PaymentMethodBankTransfer ||
+		if reconcileErr != nil || isTerminalPaymentStatus(result.Status) ||
 			result.ExpiresAt == nil || time.Now().UTC().Before(*result.ExpiresAt) {
 			return result, reconcileErr
 		}
 		now := time.Now().UTC()
+		reason := "checkout payment window expired after final provider verification"
+		failureCode := "checkout_expired"
+		failureMessage := "The payment window expired before payment was confirmed."
+		if result.Method == PaymentMethodBankTransfer {
+			reason = "bank-transfer account window expired after final provider verification"
+			failureCode = "account_expired"
+			failureMessage = "The bank-transfer account window expired before payment was confirmed."
+		}
 		expired, expireErr := s.repository.TransitionPayment(ctx, result.ID, result.Version, PaymentStatusExpired, PaymentTransitionUpdate{
 			ProviderStatus: result.ProviderStatus, ProviderChannel: result.ProviderChannel,
-			ReconciliationReason: "bank-transfer account window expired after final provider verification",
-			FailureCode:          "account_expired", FailureMessage: "The bank-transfer account window expired before payment was confirmed.",
+			ReconciliationReason: reason,
+			FailureCode:          failureCode, FailureMessage: failureMessage,
 			ReconciledAt: &now,
 		})
 		if errors.Is(expireErr, ErrConcurrentUpdate) {

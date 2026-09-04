@@ -1,0 +1,108 @@
+openapi: 3.1.0
+info:
+  title: Tellbook Provider Notification Preferences API
+  version: 1.0.0
+servers:
+  - url: /v1/app
+security:
+  - bearerAuth: []
+paths:
+  /notification-preferences:
+    get:
+      operationId: getProviderNotificationPreferences
+      responses:
+        '200':
+          description: Provider notification preferences and available contact capabilities.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProviderNotificationPreferencesResponse' }
+    patch:
+      operationId: updateProviderNotificationPreferences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProviderNotificationPreferencesPatch' }
+      responses:
+        '200':
+          description: Updated provider notification preferences.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProviderNotificationPreferencesResponse' }
+  /notification-preferences/whatsapp-verification:
+    post:
+      operationId: startProviderWhatsAppVerification
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [phone]
+              properties:
+                phone: { type: string, minLength: 1 }
+      responses:
+        '201':
+          description: Verification challenge created when the inbound webhook capability is active.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [verification]
+                properties:
+                  verification: { $ref: '#/components/schemas/ProviderWhatsAppVerification' }
+        '503':
+          description: Inbound WhatsApp verification is not configured.
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    ProviderNotificationPreferences:
+      type: object
+      additionalProperties: false
+      required:
+        - booking_email
+        - booking_whatsapp
+        - appointment_reminder_enabled
+        - appointment_reminder_minutes
+        - email_available
+        - whatsapp_verification_available
+        - preference_revision
+        - updated_at
+      properties:
+        booking_email: { type: boolean }
+        booking_whatsapp: { type: boolean }
+        appointment_reminder_enabled: { type: boolean }
+        appointment_reminder_minutes: { type: integer, enum: [1440] }
+        email_available: { type: boolean }
+        whatsapp_e164: { type: string }
+        whatsapp_verified_at: { type: string, format: date-time }
+        whatsapp_verification_available: { type: boolean }
+        preference_revision: { type: integer, format: int64, minimum: 1 }
+        updated_at: { type: string, format: date-time }
+    ProviderNotificationPreferencesResponse:
+      type: object
+      additionalProperties: false
+      required: [preferences]
+      properties:
+        preferences: { $ref: '#/components/schemas/ProviderNotificationPreferences' }
+    ProviderNotificationPreferencesPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        booking_email: { type: boolean }
+        booking_whatsapp: { type: boolean }
+        appointment_reminder_enabled: { type: boolean }
+        appointment_reminder_minutes: { type: integer, enum: [1440] }
+    ProviderWhatsAppVerification:
+      type: object
+      additionalProperties: false
+      required: [verification_url, destination, expires_at]
+      properties:
+        verification_url: { type: string, format: uri }
+        destination: { type: string }
+        expires_at: { type: string, format: date-time }

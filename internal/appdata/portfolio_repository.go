@@ -56,11 +56,15 @@ func (r *Repository) CreatePortfolioItem(ctx context.Context, clientID uuid.UUID
 	}
 	defer tx.Rollback(ctx)
 
-	if err := tx.QueryRow(ctx, `SELECT id FROM clients WHERE id = $1 FOR UPDATE`, clientID).Scan(&clientID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ManagedPortfolioItem{}, ErrNotFound
-		}
-		return ManagedPortfolioItem{}, fmt.Errorf("lock portfolio owner: %w", err)
+	if err := enforceProviderCollectionLimit(
+		ctx,
+		tx,
+		clientID,
+		`SELECT COUNT(*) FROM provider_portfolio_items WHERE client_id = $1`,
+		MaxProviderPortfolioItems,
+		ErrPortfolioItemLimitReached,
+	); err != nil {
+		return ManagedPortfolioItem{}, err
 	}
 
 	var item ManagedPortfolioItem

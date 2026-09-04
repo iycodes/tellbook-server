@@ -71,8 +71,24 @@ func TestPublicBookingCalendarAvailability(t *testing.T) {
 			t.Fatalf("expected %q to allow calendar export", status)
 		}
 	}
+	if publicBookingCalendarAvailable(PublicBookingSummaryResponse{
+		PaymentStatus: "paid_in_full", AgreementTemplateTitle: "Service agreement", AgreementStatus: "pending",
+	}) {
+		t.Fatal("a required pending agreement must block calendar export")
+	}
+	if !publicBookingCalendarAvailable(PublicBookingSummaryResponse{
+		PaymentStatus: "paid_in_full", AgreementTemplateTitle: "Service agreement", AgreementStatus: "signed",
+	}) {
+		t.Fatal("a paid booking with a signed agreement should allow calendar export")
+	}
 	if publicBookingCalendarAvailable(PublicBookingSummaryResponse{PaymentStatus: "full_payment_pending"}) {
 		t.Fatal("pending payment must not allow calendar export")
+	}
+}
+
+func TestInitialBookingPaymentStateTreatsFreeBookingAsPaid(t *testing.T) {
+	if got := initialBookingPaymentState(0, 0); got != "paid_in_full" {
+		t.Fatalf("free booking payment state = %q, want paid_in_full", got)
 	}
 }
 

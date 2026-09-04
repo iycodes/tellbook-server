@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"mime"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"booking/go-server/internal/auth"
+
+	"github.com/google/uuid"
 )
 
 type uploadImageInput struct {
@@ -59,9 +59,23 @@ func (h *Handler) uploadImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	category := normalizeUploadCategory(input.Category)
-	objectKey := fmt.Sprintf("clients/%s/%s/%d%s", authedClient.ID.String(), category, time.Now().UTC().UnixNano(), payload.Extension)
-	bucketName := h.storage.PrivateBucketName()
+	category, ok := normalizeUploadCategory(input.Category)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid_image_category", "Image category must be services, sections, profiles, or portfolio.")
+		return
+	}
+	bucketName := h.storage.PublicBucketName()
+	if bucketName == "" {
+		writeError(w, http.StatusServiceUnavailable, "public_media_not_configured", "Public image storage is not configured.")
+		return
+	}
+	objectKey := fmt.Sprintf(
+		"clients/%s/%s/%s%s",
+		authedClient.ID.String(),
+		category,
+		uuid.NewString(),
+		payload.Extension,
+	)
 
 	objectURL, err := h.storage.Upload(r.Context(), payload.Data, objectKey, payload.ContentType, bucketName)
 	if err != nil {
@@ -178,9 +192,7 @@ func decodeImageDataURL(dataURL, providedContentType string) (decodedImagePayloa
 		}
 	}
 
-	switch contentType {
-	case "image/jpeg", "image/png", "image/webp", "image/gif":
-	default:
+	if _, ok := allowedImageExtension(contentType); !ok {
 		return decodedImagePayload{}, errors.New("image must be jpeg, png, webp, or gif")
 	}
 
@@ -199,22 +211,32 @@ func decodeImageDataURL(dataURL, providedContentType string) (decodedImagePayloa
 	}
 
 	detectedContentType := http.DetectContentType(data)
-	if !strings.HasPrefix(detectedContentType, "image/") {
-		return decodedImagePayload{}, errors.New("image content type is invalid")
+	extension, ok := allowedImageExtension(detectedContentType)
+	if !ok {
+		return decodedImagePayload{}, errors.New("image content must be jpeg, png, webp, or gif")
 	}
 	contentType = detectedContentType
-
-	extensions, _ := mime.ExtensionsByType(contentType)
-	extension := ".bin"
-	if len(extensions) > 0 {
-		extension = extensions[0]
-	}
 
 	return decodedImagePayload{
 		ContentType: contentType,
 		Data:        data,
-		Extension:   filepath.Clean(extension),
+		Extension:   extension,
 	}, nil
+}
+
+func allowedImageExtension(contentType string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(contentType)) {
+	case "image/jpeg":
+		return ".jpg", true
+	case "image/png":
+		return ".png", true
+	case "image/webp":
+		return ".webp", true
+	case "image/gif":
+		return ".gif", true
+	default:
+		return "", false
+	}
 }
 
 func decodeDocumentDataURL(dataURL, providedContentType string) (decodedImagePayload, error) {
@@ -264,17 +286,17 @@ func decodeDocumentDataURL(dataURL, providedContentType string) (decodedImagePay
 	}, nil
 }
 
-func normalizeUploadCategory(value string) string {
+func normalizeUploadCategory(value string) (string, bool) {
 	switch strings.TrimSpace(strings.ToLower(value)) {
 	case "services":
-		return "services"
+		return "services", true
 	case "sections":
-		return "sections"
+		return "sections", true
 	case "profiles":
-		return "profiles"
+		return "profiles", true
 	case "portfolio":
-		return "portfolio"
+		return "portfolio", true
 	default:
-		return "misc"
+		return "", false
 	}
 }

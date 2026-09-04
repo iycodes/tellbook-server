@@ -91,7 +91,7 @@ func SeedDemoProvider(ctx context.Context, tx pgx.Tx, input Input) (Result, erro
 		return Result{}, err
 	}
 
-	if err := insertConversations(ctx, tx, input.ClientID, customerIDs, now); err != nil {
+	if err := insertConversations(ctx, tx, input.ClientID, customerIDs, bookingIDs, now); err != nil {
 		return Result{}, err
 	}
 	if err := insertNotifications(ctx, tx, input.ClientID, customerIDs, bookingIDs, now); err != nil {
@@ -103,7 +103,7 @@ func SeedDemoProvider(ctx context.Context, tx pgx.Tx, input Input) (Result, erro
 	if err := insertPortfolioItems(ctx, tx, input.ClientID, serviceIDs, now); err != nil {
 		return Result{}, err
 	}
-	if err := insertReviews(ctx, tx, input.ClientID, customerIDs, now); err != nil {
+	if err := insertReviews(ctx, tx, input.ClientID, customerIDs, serviceIDs, bookingIDs, now); err != nil {
 		return Result{}, err
 	}
 	return Result{
@@ -241,11 +241,12 @@ func insertClientProfile(ctx context.Context, tx pgx.Tx, clientID uuid.UUID, now
 			client_id, business_name, handle_slug, category, headline, short_bio, public_location_label,
 			city, region, timezone, hero_image_url, avatar_url, verified, years_experience,
 			review_rating, review_count, country_code, currency_code, locale, market_configured_at,
+			marketplace_enabled, marketplace_category_id, marketplace_location_visibility,
 			created_at, updated_at
 		)
 		VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-			'NG', 'NGN', 'en-NG', $17, $18, $19
+			'NG', 'NGN', 'en-NG', $17, TRUE, '10000000-0000-4000-8000-000000000004', 'approximate', $18, $19
 		)
 	`
 
@@ -258,16 +259,16 @@ func insertClientProfile(ctx context.Context, tx pgx.Tx, clientID uuid.UUID, now
 		"Photography",
 		"Premium Photographer",
 		"Luxury portrait, event, and branding sessions built for modern personal and business storytelling.",
-		"New York, NY",
-		"New York",
-		"NY",
+		"Lekki, Lagos",
+		"Lagos",
+		"Lagos",
 		"Africa/Lagos",
 		"https://images.unsplash.com/photo-1511285560929-80b456fea0bc?auto=format&fit=crop&w=1600&q=80",
 		"https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=800&q=80",
 		true,
 		8,
-		4.90,
-		128,
+		4.67,
+		3,
 		now,
 		now,
 		now,
@@ -310,10 +311,14 @@ func insertBusinessLocation(ctx context.Context, tx pgx.Tx, clientID uuid.UUID, 
 	_, err := tx.Exec(ctx, `
 		INSERT INTO business_locations (
 			id, client_id, label, formatted_address, address_source,
-			resolution_status, timezone, is_primary, is_active, created_at, updated_at
+			latitude, longitude, resolution_status, country_code, state_region_id, lga_region_id,
+			locality, timezone, is_primary, is_active, created_at, updated_at
 		)
-		VALUES ($1,$2,'Main studio','New York, NY','manual','text_only',
-			'Africa/Lagos',TRUE,TRUE,$3,$3)
+		VALUES ($1,$2,'Main studio','Lekki Phase 1, Lagos','manual',6.447800,3.472300,
+			'coordinates_resolved','NG',
+			(SELECT id FROM administrative_regions WHERE level='state' AND ST_Covers(boundary, ST_SetSRID(ST_MakePoint(3.472300,6.447800),4326)) LIMIT 1),
+			(SELECT id FROM administrative_regions WHERE level='lga' AND ST_Covers(boundary, ST_SetSRID(ST_MakePoint(3.472300,6.447800),4326)) LIMIT 1),
+			'Lekki','Africa/Lagos',TRUE,TRUE,$3,$3)
 	`, locationID, clientID, now)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("insert business location: %w", err)
@@ -346,10 +351,11 @@ func insertServices(ctx context.Context, tx pgx.Tx, clientID, providerLocationID
 		INSERT INTO services (
 			id, client_id, title, slug, description, category, icon_name, image_url,
 			duration_minutes, price_amount_minor, currency_code, is_active, sort_order,
-			fulfillment_mode, provider_location_id, availability_mode, created_at, updated_at
+			fulfillment_mode, provider_location_id, availability_mode, agreement_timing,
+			created_at, updated_at
 		)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'NGN',TRUE,$11,
-			'provider_location',$12,'inherit_business_hours',$13,$14)
+			'provider_location',$12,'inherit_business_hours',NULL,$13,$14)
 	`
 
 	ids := make(map[string]uuid.UUID, len(records))
@@ -470,6 +476,9 @@ func insertBookings(ctx context.Context, tx pgx.Tx, clientID uuid.UUID, serviceI
 		{"event_today", "sarah", "event", "Event Coverage", "pending", "pending_deposit", "sent", startOfDay.Add(14*time.Hour + 30*time.Minute), startOfDay.Add(17*time.Hour + 30*time.Minute), 360000, 360000, 180, "Need wide and candid coverage for keynote moments.", "Downtown Studio, New York, NY", "https://images.unsplash.com/photo-1511578314322-379afb476865?auto=format&fit=crop&w=800&q=80"},
 		{"brand_tomorrow", "julian", "brand", "Brand Strategy Shoot", "booked", "deposit_paid", "signed", startOfDay.Add(35 * time.Hour), startOfDay.Add(37 * time.Hour), 350000, 350000, 120, "Prefers minimalist sets and dark-themed product styling.", "Hudson Creative Loft, New York, NY", "https://images.unsplash.com/photo-1521737604893-d14cc237f11d?auto=format&fit=crop&w=800&q=80"},
 		{"wedding_future", "elena", "wedding", "Wedding Highlight Package", "booked", "paid", "signed", startOfDay.Add(72 * time.Hour), startOfDay.Add(76 * time.Hour), 650000, 650000, 240, "Need extra bridal party portraits and family lineup coverage.", "Riverside Manor, New York, NY", "https://images.unsplash.com/photo-1519741497674-611481863552?auto=format&fit=crop&w=800&q=80"},
+		{"portrait_review", "marcus", "portrait", "Portrait Session", "completed", "paid", "signed", startOfDay.Add(-11 * 24 * time.Hour), startOfDay.Add(-11*24*time.Hour + 90*time.Minute), 250000, 250000, 90, "Completed marketplace review booking.", "Lagos studio", ""},
+		{"wedding_review", "elena", "wedding", "Wedding Highlight Package", "completed", "paid", "signed", startOfDay.Add(-13 * 24 * time.Hour), startOfDay.Add(-13*24*time.Hour + 4*time.Hour), 650000, 650000, 240, "Completed marketplace review booking.", "Lagos venue", ""},
+		{"event_review", "sarah", "event", "Event Coverage", "completed", "paid", "signed", startOfDay.Add(-15 * 24 * time.Hour), startOfDay.Add(-15*24*time.Hour + 3*time.Hour), 120000, 120000, 180, "Completed marketplace review booking.", "Lagos event venue", ""},
 	}
 
 	const query = `
@@ -523,129 +532,93 @@ func insertBookings(ctx context.Context, tx pgx.Tx, clientID uuid.UUID, serviceI
 	return ids, nil
 }
 
-func insertConversations(ctx context.Context, tx pgx.Tx, clientID uuid.UUID, customerIDs map[string]uuid.UUID, now time.Time) error {
-	type seededMessage struct {
-		role    string
-		content string
-		when    time.Time
-	}
-	type conversation struct {
-		key      string
-		client   string
-		source   string
-		status   string
-		subject  string
-		preview  string
-		avatar   string
-		messages []seededMessage
-	}
-
-	records := []conversation{
-		{
-			key:     "sarah",
-			client:  "sarah",
-			source:  "instagram",
-			status:  "NEW",
-			subject: "Consultation inquiry",
-			preview: "Can I book a consultation for next Tuesday? I saw your recent post...",
-			avatar:  "https://images.unsplash.com/photo-1488426862026-3ee34a7d66df?auto=format&fit=crop&w=600&q=80",
-			messages: []seededMessage{
-				{"client", "Hi, can I book a consultation for next Tuesday?", now.Add(-20 * time.Minute)},
-				{"client", "I saw your recent post and loved the style.", now.Add(-18 * time.Minute)},
-				{"ai", "Absolutely. I can help you with that. Do you prefer morning or afternoon?", now.Add(-16 * time.Minute)},
-			},
-		},
-		{
-			key:     "marcus",
-			client:  "marcus",
-			source:  "facebook",
-			status:  "WAITING",
-			subject: "Follow-up",
-			preview: "I've sent over the documents you requested last week...",
-			avatar:  "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=600&q=80",
-			messages: []seededMessage{
-				{"client", "I've sent over the documents you requested.", now.Add(-90 * time.Minute)},
-				{"provider", "Perfect, I’ll review and get back to you shortly.", now.Add(-85 * time.Minute)},
-			},
-		},
-		{
-			key:     "elena",
-			client:  "elena",
-			source:  "instagram",
-			status:  "BOOKED",
-			subject: "Booked follow-up",
-			preview: "Thanks for confirming! Looking forward to our session on Friday afternoon.",
-			avatar:  "https://images.unsplash.com/photo-1544005313-94ddf0286df2?auto=format&fit=crop&w=600&q=80",
-			messages: []seededMessage{
-				{"provider", "Thanks for confirming! Looking forward to our session on Friday afternoon.", now.Add(-3 * time.Hour)},
-			},
-		},
-		{
-			key:     "oscar",
-			client:  "oscar",
-			source:  "facebook",
-			status:  "ESCALATED",
-			subject: "Payment issue",
-			preview: "The payment didn't go through on my end. Can you check the transaction status?",
-			avatar:  "https://images.unsplash.com/photo-1506794778202-cad84cf45f1d?auto=format&fit=crop&w=600&q=80",
-			messages: []seededMessage{
-				{"client", "The payment didn't go through on my end. Can you check it?", now.Add(-4 * time.Hour)},
-				{"ai", "I’ve flagged this for manual review. A team member will check the payment status.", now.Add(-3*time.Hour - 55*time.Minute)},
-			},
-		},
+func insertConversations(
+	ctx context.Context,
+	tx pgx.Tx,
+	clientID uuid.UUID,
+	customerIDs, bookingIDs map[string]uuid.UUID,
+	now time.Time,
+) error {
+	marketplaceCustomerID := demoID(clientID, "marketplace-customer:sarah")
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO marketplace_customers (
+			id, full_name, email, email_verified_at, created_at, updated_at
+		) VALUES ($1,'Sarah Johnson',$2,NOW(),$3,$3)
+		ON CONFLICT (id) DO UPDATE SET
+			full_name=EXCLUDED.full_name,
+			email=EXCLUDED.email,
+			email_verified_at=COALESCE(marketplace_customers.email_verified_at,NOW()),
+			updated_at=EXCLUDED.updated_at
+	`, marketplaceCustomerID, "marketplace-sarah-"+clientID.String()+"@example.com", now); err != nil {
+		return fmt.Errorf("insert native inbox marketplace customer: %w", err)
 	}
 
-	const conversationQuery = `
+	bookingID := bookingIDs["event_today"]
+	if _, err := tx.Exec(ctx, `
+		UPDATE bookings SET marketplace_customer_id=$1, source='marketplace', updated_at=$3 WHERE id=$2
+	`, marketplaceCustomerID, bookingID, now); err != nil {
+		return fmt.Errorf("link native inbox demo booking owner: %w", err)
+	}
+
+	conversationID := demoID(clientID, "conversation:sarah:tellbook")
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO inbox_conversations (
-			id, client_id, customer_id, source, status, subject, preview, avatar_url, last_message_at, created_at, updated_at
-		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-	`
-	const messageQuery = `
-		INSERT INTO inbox_messages (id, conversation_id, sender_role, content, message_type, sent_at, created_at)
-		VALUES ($1,$2,$3,$4,'text',$5,$6)
-	`
-
-	for _, record := range records {
-		conversationID := demoID(clientID, "conversation:"+record.key)
-		lastMessageAt := now
-		if len(record.messages) > 0 {
-			lastMessageAt = record.messages[len(record.messages)-1].when
-		}
-		if _, err := tx.Exec(
-			ctx,
-			conversationQuery,
-			conversationID,
-			clientID,
-			customerIDs[record.client],
-			record.source,
-			record.status,
-			record.subject,
-			record.preview,
-			record.avatar,
-			lastMessageAt,
-			now,
-			now,
-		); err != nil {
-			return fmt.Errorf("insert conversation: %w", err)
-		}
-
-		for idx, message := range record.messages {
-			if _, err := tx.Exec(
-				ctx,
-				messageQuery,
-				demoID(clientID, fmt.Sprintf("conversation:%s:message:%d", record.key, idx)),
-				conversationID,
-				message.role,
-				message.content,
-				message.when,
-				now,
-			); err != nil {
-				return fmt.Errorf("insert conversation message: %w", err)
-			}
-		}
+			id, client_id, customer_id, marketplace_customer_id, channel, preview,
+			created_at, updated_at
+		) VALUES ($1,$2,$3,$4,'tellbook','Thanks — I will bring the reference photos.',$5,$5)
+	`, conversationID, clientID, customerIDs["sarah"], marketplaceCustomerID, now); err != nil {
+		return fmt.Errorf("insert native inbox conversation: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO inbox_conversation_bookings (conversation_id, booking_id, linked_by_actor)
+		VALUES ($1,$2,'system')
+	`, conversationID, bookingID); err != nil {
+		return fmt.Errorf("insert native inbox booking link: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO inbox_participant_states (conversation_id, participant_type, participant_id)
+		VALUES ($1,'provider',$2),($1,'marketplace_customer',$3)
+	`, conversationID, clientID, marketplaceCustomerID); err != nil {
+		return fmt.Errorf("insert native inbox participant states: %w", err)
 	}
 
+	type seededMessage struct {
+		key, senderType, content string
+		senderID                 uuid.UUID
+		when                     time.Time
+	}
+	messages := []seededMessage{
+		{"customer", "marketplace_customer", "Hi, is there anything I should bring to the event session?", marketplaceCustomerID, now.Add(-20 * time.Minute)},
+		{"provider", "provider", "Please bring any reference photos you want us to match.", clientID, now.Add(-16 * time.Minute)},
+		{"customer-confirmation", "marketplace_customer", "Thanks — I will bring the reference photos.", marketplaceCustomerID, now.Add(-12 * time.Minute)},
+	}
+	var lastSequence int64
+	for _, message := range messages {
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO inbox_messages (
+				id, conversation_id, sender_type, sender_id, booking_id, content, sent_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7)
+			RETURNING sequence
+		`, demoID(clientID, "conversation:sarah:message:"+message.key), conversationID,
+			message.senderType, message.senderID, bookingID, message.content, message.when,
+		).Scan(&lastSequence); err != nil {
+			return fmt.Errorf("insert native inbox message: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE inbox_conversations
+		SET last_message_sequence=$2, last_message_at=$3, updated_at=$4
+		WHERE id=$1
+	`, conversationID, lastSequence, messages[len(messages)-1].when, now); err != nil {
+		return fmt.Errorf("update native inbox conversation summary: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO inbox_events (
+			conversation_id, client_id, marketplace_customer_id, event_type, payload, created_at
+		) VALUES ($1,$2,$3,'conversation.created',jsonb_build_object('conversation_id',$1::text),$4)
+	`, conversationID, clientID, marketplaceCustomerID, now); err != nil {
+		return fmt.Errorf("insert native inbox event: %w", err)
+	}
 	return nil
 }
 
@@ -800,25 +773,28 @@ func insertPortfolioItems(ctx context.Context, tx pgx.Tx, clientID uuid.UUID, se
 	return nil
 }
 
-func insertReviews(ctx context.Context, tx pgx.Tx, clientID uuid.UUID, customerIDs map[string]uuid.UUID, now time.Time) error {
+func insertReviews(ctx context.Context, tx pgx.Tx, clientID uuid.UUID, customerIDs, serviceIDs, bookingIDs map[string]uuid.UUID, now time.Time) error {
 	records := []struct {
-		key       string
-		clientKey string
-		author    string
-		rating    int
-		body      string
-		imageURL  string
+		key        string
+		clientKey  string
+		serviceKey string
+		bookingKey string
+		author     string
+		rating     int
+		body       string
+		imageURL   string
 	}{
-		{"review1", "marcus", "Marcus Holloway", 5, "Fast turnaround, strong creative direction, and a premium session experience from start to finish.", ""},
-		{"review2", "elena", "Elena Rodriguez", 5, "The communication was effortless and the final gallery felt polished and luxurious.", ""},
-		{"review3", "sarah", "Sarah Chen", 4, "Loved the attention to detail and how easy the booking process was.", ""},
+		{"review1", "marcus", "portrait", "portrait_review", "Marcus Holloway", 5, "Fast turnaround, strong creative direction, and a premium session experience from start to finish.", ""},
+		{"review2", "elena", "wedding", "wedding_review", "Elena Rodriguez", 5, "The communication was effortless and the final gallery felt polished and luxurious.", "https://images.unsplash.com/photo-1519741497674-611481863552?auto=format&fit=crop&w=1000&q=80"},
+		{"review3", "sarah", "event", "event_review", "Sarah Chen", 4, "Loved the attention to detail and how easy the booking process was.", ""},
 	}
 
 	const query = `
 		INSERT INTO provider_reviews (
-			id, client_id, customer_id, author_name, rating, review_text, image_url, created_at
+			id, client_id, customer_id, booking_id, service_id, author_name, rating,
+			review_text, image_url, status, created_at, updated_at
 		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'approved',$10,$10)
 	`
 
 	for i, record := range records {
@@ -828,6 +804,8 @@ func insertReviews(ctx context.Context, tx pgx.Tx, clientID uuid.UUID, customerI
 			demoID(clientID, "review:"+record.key),
 			clientID,
 			customerIDs[record.clientKey],
+			bookingIDs[record.bookingKey],
+			serviceIDs[record.serviceKey],
 			record.author,
 			record.rating,
 			record.body,
