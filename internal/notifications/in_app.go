@@ -31,8 +31,7 @@ func (r *Repository) reconcileInAppTx(
 ) error {
 	now := r.now()
 	if event != nil {
-		typeName := eventNotificationType(state, *event)
-		if typeName != "" {
+		for _, typeName := range eventNotificationTypes(state, *event) {
 			if err := insertProviderLifecycleNotificationTx(ctx, tx, state, typeName); err != nil {
 				return err
 			}

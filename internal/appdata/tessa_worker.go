@@ -14,6 +14,7 @@ import (
 
 	"booking/go-server/internal/aierror"
 	"booking/go-server/internal/tessa"
+	"booking/go-server/internal/whatsapp"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -35,16 +36,21 @@ type TessaWorkerConfig struct {
 	TurnTimeout    time.Duration
 	ConfigHash     string
 	NoticeRevision string
+	// Deliberately unset in production until B4 reply delivery is wired.
+	WhatsAppPhoneNumberID     string
+	WhatsAppProviderAllowlist []string
 }
 
 type TessaWorker struct {
-	repo         *Repository
-	service      *tessa.Service
-	help         *tessa.HelpIndex
-	limiter      *InboxAIGenerationLimiter
-	logger       *slog.Logger
-	config       TessaWorkerConfig
-	workerPrefix string
+	repo              *Repository
+	service           *tessa.Service
+	help              *tessa.HelpIndex
+	limiter           *InboxAIGenerationLimiter
+	logger            *slog.Logger
+	config            TessaWorkerConfig
+	workerPrefix      string
+	whatsAppProviders map[uuid.UUID]bool
+	whatsAppTyping    whatsapp.TypingSender
 }
 
 type tessaClaimedRun struct {
@@ -57,6 +63,9 @@ type tessaClaimedRun struct {
 	MaxAttempts      int
 	ConfigHash       string
 	CreatedAt        time.Time
+	SourceChannel    string
+	QuestionAt       time.Time
+	CheckAt          time.Time
 }
 
 var errTessaConfigChanged = errors.New("Tessa configuration changed before the run started")
@@ -82,9 +91,16 @@ func NewTessaWorker(
 	if limiter == nil {
 		limiter = NewInboxAIGenerationLimiter(config.MaxConcurrency)
 	}
+	allowed := make(map[uuid.UUID]bool, len(config.WhatsAppProviderAllowlist))
+	for _, raw := range config.WhatsAppProviderAllowlist {
+		if id, err := uuid.Parse(raw); err == nil {
+			allowed[id] = true
+		}
+	}
 	return &TessaWorker{
 		repo: repo, service: service, help: help, limiter: limiter, logger: logger, config: config,
-		workerPrefix: "tessa-" + uuid.NewString(),
+		workerPrefix:      "tessa-" + uuid.NewString(),
+		whatsAppProviders: allowed,
 	}, nil
 }
 
@@ -148,13 +164,20 @@ func (worker *TessaWorker) nextWakeDelay(ctx context.Context) time.Duration {
 }
 
 func (worker *TessaWorker) ProcessOne(ctx context.Context, workerIDs ...string) (bool, error) {
+	admitted, err := worker.admitWhatsApp(ctx)
+	if err != nil {
+		return false, err
+	}
 	workerID := worker.workerPrefix + "-manual"
 	if len(workerIDs) > 0 && strings.TrimSpace(workerIDs[0]) != "" {
 		workerID = strings.TrimSpace(workerIDs[0])
 	}
 	run, err := worker.claim(ctx, workerID)
 	if err != nil || run.ID == uuid.Nil {
-		return false, err
+		return admitted, err
+	}
+	if err := worker.checkWhatsAppAuthority(ctx, worker.repo.db, run); err != nil {
+		return true, worker.retryOrFail(ctx, workerID, run, err)
 	}
 	if err := requireTessaNoticeAcknowledgement(
 		ctx, worker.repo.db, run.ClientID, worker.config.NoticeRevision,
@@ -181,6 +204,8 @@ func (worker *TessaWorker) ProcessOne(ctx context.Context, workerIDs ...string) 
 
 	turnContext, cancel := context.WithTimeout(ctx, worker.config.TurnTimeout)
 	defer cancel()
+	stopTyping := worker.startWhatsAppTyping(turnContext, run)
+	defer stopTyping()
 	if err := worker.process(turnContext, workerID, run); err != nil {
 		if persistErr := worker.retryOrFail(ctx, workerID, run, err); persistErr != nil {
 			return true, fmt.Errorf("process Tessa run: %v; persist failure: %w", err, persistErr)
@@ -213,11 +238,13 @@ func (worker *TessaWorker) claim(ctx context.Context, workerID string) (tessaCla
 			FOR UPDATE OF queued SKIP LOCKED LIMIT 1
 		)
 		SELECT run.id,run.thread_id,run.client_id,run.trigger_message_id,
-			run.attempt_count,run.max_attempts,run.config_hash,run.created_at
-		FROM tessa_runs run JOIN candidates ON candidates.id=run.id
+			run.attempt_count,run.max_attempts,run.config_hash,run.created_at,message.source_channel,
+			COALESCE(ingress.source_timestamp,message.created_at)
+		FROM tessa_runs run JOIN candidates ON candidates.id=run.id JOIN tessa_messages message ON message.id=run.trigger_message_id
+		LEFT JOIN tessa_whatsapp_ingress ingress ON ingress.run_id=run.id AND ingress.client_id=run.client_id
 	`).Scan(
 		&run.ID, &run.ThreadID, &run.ClientID, &run.TriggerMessageID,
-		&run.AttemptCount, &run.MaxAttempts, &run.ConfigHash, &run.CreatedAt,
+		&run.AttemptCount, &run.MaxAttempts, &run.ConfigHash, &run.CreatedAt, &run.SourceChannel, &run.QuestionAt,
 	); errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
 			return tessaClaimedRun{}, err
@@ -269,16 +296,24 @@ func (worker *TessaWorker) markStarted(ctx context.Context, workerID string, run
 }
 
 func (worker *TessaWorker) process(ctx context.Context, workerID string, run tessaClaimedRun) error {
+	if err := worker.checkWhatsAppAuthority(ctx, worker.repo.db, run); err != nil {
+		return err
+	}
 	question, timezone, summary, recent, err := worker.loadContext(ctx, run)
 	if err != nil {
 		return err
 	}
+	previousTools, err := worker.loadPreviousTessaTools(ctx, run)
+	if err != nil {
+		return err
+	}
 	contextPayload, err := json.Marshal(struct {
-		Question string                 `json:"question"`
-		Summary  string                 `json:"summary"`
-		Recent   []tessa.ContextMessage `json:"recent"`
-		Timezone string                 `json:"timezone"`
-	}{question, summary, recent, timezone})
+		Question      string                 `json:"question"`
+		Summary       string                 `json:"summary"`
+		Recent        []tessa.ContextMessage `json:"recent"`
+		Timezone      string                 `json:"timezone"`
+		PreviousTools []tessa.ToolRequest    `json:"previous_tools"`
+	}{question, summary, recent, timezone, previousTools})
 	if err != nil {
 		return fmt.Errorf("encode Tessa context hash: %w", err)
 	}
@@ -298,8 +333,10 @@ func (worker *TessaWorker) process(ctx context.Context, workerID string, run tes
 	location := timezoneLocation(timezone)
 	now := time.Now().In(location)
 	input := tessa.PlanInput{
-		Question: question, ConversationSummary: summary, RecentMessages: recent,
+		PreviousTools: previousTools,
+		Question:      question, ConversationSummary: summary, RecentMessages: recent,
 		CurrentDate: now.Format("2006-01-02"), CurrentTime: now.Format("15:04:05"), Timezone: location.String(),
+		QuestionAt: run.QuestionAt.In(location).Format(time.RFC3339),
 	}
 	decision, err := worker.loadOrCreatePlanningDecision(ctx, run, input)
 	if err != nil {
@@ -308,6 +345,10 @@ func (worker *TessaWorker) process(ctx context.Context, workerID string, run tes
 	plan, activeProvider := decision.Plan, decision.Provider
 	fallbackUsed, fallbackReason := decision.FallbackUsed, decision.FallbackReason
 	input.CurrentDate, input.CurrentTime, input.Timezone = decision.CurrentDate, decision.CurrentTime, decision.Timezone
+	run.CheckAt, err = time.ParseInLocation("2006-01-02 15:04:05", input.CurrentDate+" "+input.CurrentTime, timezoneLocation(input.Timezone))
+	if err != nil {
+		return err
+	}
 	if plan.AnswerMode == "direct" {
 		if err := worker.setStage(ctx, workerID, run, "answering"); err != nil {
 			return err
@@ -325,19 +366,35 @@ func (worker *TessaWorker) process(ctx context.Context, workerID string, run tes
 	if err := worker.setStage(ctx, workerID, run, "answering"); err != nil {
 		return err
 	}
+	if err := worker.checkWhatsAppAuthority(ctx, worker.repo.db, run); err != nil {
+		return err
+	}
 	answer, err := worker.service.GenerateAnswer(ctx, activeProvider, tessa.SynthesisInput{
-		Question: question, ConversationSummary: summary, RecentMessages: recent, Evidence: execution.Evidence,
+		ResolvedQuestion: plan.ResolvedQuestion,
+		BookingCountOnly: plan.BookingCountOnly,
+		Tools:            plan.Tools,
+		SourceChannel:    run.SourceChannel,
+		Question:         question, ConversationSummary: summary, RecentMessages: recent, Evidence: execution.Evidence,
 		CurrentDate: input.CurrentDate, Timezone: input.Timezone,
+		QuestionAt: run.QuestionAt.Format(time.RFC3339),
 	})
 	if err != nil && !fallbackUsed && shouldFallbackTessa(err) {
 		if fallback, ok := worker.service.Fallback(); ok {
 			fallbackUsed, fallbackReason, activeProvider = true, tessaSafeFailureCode(err), fallback
+			if err := worker.checkWhatsAppAuthority(ctx, worker.repo.db, run); err != nil {
+				return err
+			}
 			if err := worker.recordSynthesisProviderTransition(ctx, run, activeProvider, fallbackReason); err != nil {
 				return err
 			}
 			answer, err = worker.service.GenerateAnswer(ctx, activeProvider, tessa.SynthesisInput{
-				Question: question, ConversationSummary: summary, RecentMessages: recent, Evidence: execution.Evidence,
+				ResolvedQuestion: plan.ResolvedQuestion,
+				BookingCountOnly: plan.BookingCountOnly,
+				Tools:            plan.Tools,
+				SourceChannel:    run.SourceChannel,
+				Question:         question, ConversationSummary: summary, RecentMessages: recent, Evidence: execution.Evidence,
 				CurrentDate: input.CurrentDate, Timezone: input.Timezone,
+				QuestionAt: run.QuestionAt.Format(time.RFC3339),
 			})
 		}
 	}
@@ -351,7 +408,11 @@ func (worker *TessaWorker) process(ctx context.Context, workerID string, run tes
 	if err := worker.recordModelStep(ctx, run, 100, "synthesis", activeProvider, stepCode); err != nil {
 		return err
 	}
-	return worker.complete(ctx, workerID, run, answer.Content, execution.Presentation, execution.References, activeProvider, fallbackUsed, fallbackReason)
+	presentation, references, err := tessaAnswerMetadata(plan.Tools, execution, answer)
+	if err != nil {
+		return err
+	}
+	return worker.complete(ctx, workerID, run, answer.Content, presentation, references, activeProvider, fallbackUsed, fallbackReason)
 }
 
 type tessaPersistedPlanningDecision struct {
@@ -373,6 +434,9 @@ func (worker *TessaWorker) loadOrCreatePlanningDecision(
 	run tessaClaimedRun,
 	input tessa.PlanInput,
 ) (tessaPlanningDecision, error) {
+	if err := worker.checkWhatsAppAuthority(ctx, worker.repo.db, run); err != nil {
+		return tessaPlanningDecision{}, err
+	}
 	if decision, found, err := worker.loadPlanningDecision(ctx, run); err != nil || found {
 		return decision, err
 	}
@@ -383,6 +447,9 @@ func (worker *TessaWorker) loadOrCreatePlanningDecision(
 	if err != nil && shouldFallbackTessa(err) {
 		if fallback, ok := worker.service.Fallback(); ok {
 			fallbackReason, activeProvider = tessaSafeFailureCode(err), fallback
+			if err := worker.checkWhatsAppAuthority(ctx, worker.repo.db, run); err != nil {
+				return tessaPlanningDecision{}, err
+			}
 			plan, err = worker.service.GeneratePlan(ctx, activeProvider, input)
 		}
 	}
@@ -524,6 +591,40 @@ func tessaToolStage(requests []tessa.ToolRequest) string {
 	return stage
 }
 
+// Fetch a bounded piece of committed query state, not another business read.
+// It is restricted to this tenant/thread and messages preceding the current turn,
+// so later activity cannot alter the context hash of a retried run.
+func (worker *TessaWorker) loadPreviousTessaTools(ctx context.Context, run tessaClaimedRun) ([]tessa.ToolRequest, error) {
+	var raw json.RawMessage
+	err := worker.repo.db.QueryRow(ctx, `
+		SELECT step.safe_result->'plan'->'tools'
+		FROM (
+			SELECT run_id,sequence FROM tessa_messages
+			WHERE thread_id=$1 AND client_id=$2 AND sender_type='tessa'
+				AND sequence<(SELECT sequence FROM tessa_messages WHERE id=$3 AND thread_id=$1 AND client_id=$2)
+			ORDER BY sequence DESC LIMIT 6
+		) recent
+		JOIN tessa_run_steps step ON step.run_id=recent.run_id AND step.sequence=1
+		WHERE step.stage='planning' AND step.status='succeeded'
+			AND step.safe_result->'plan'->>'answer_mode'='tools'
+		ORDER BY recent.sequence DESC LIMIT 1
+	`, run.ThreadID, run.ClientID, run.TriggerMessageID).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load Tessa previous query scope: %w", err)
+	}
+	var requests []tessa.ToolRequest
+	if err = json.Unmarshal(raw, &requests); err != nil {
+		return nil, err
+	}
+	if len(requests) > tessa.MaxToolCalls {
+		return nil, errors.New("previous Tessa scope exceeds tool bound")
+	}
+	return requests, nil
+}
+
 func (worker *TessaWorker) loadContext(ctx context.Context, run tessaClaimedRun) (string, string, string, []tessa.ContextMessage, error) {
 	var question, timezone, summary string
 	if err := worker.repo.db.QueryRow(ctx, `
@@ -536,8 +637,8 @@ func (worker *TessaWorker) loadContext(ctx context.Context, run tessaClaimedRun)
 		return "", "", "", nil, fmt.Errorf("load Tessa question: %w", err)
 	}
 	rows, err := worker.repo.db.Query(ctx, `
-		SELECT sender_type,content FROM (
-			SELECT sender_type,content,sequence FROM tessa_messages
+		SELECT sender_type,content,entity_references FROM (
+			SELECT sender_type,content,entity_references,sequence FROM tessa_messages
 			WHERE thread_id=$1 AND client_id=$2 AND sequence<(
 				SELECT sequence FROM tessa_messages WHERE id=$3
 			) ORDER BY sequence DESC LIMIT $4
@@ -550,14 +651,30 @@ func (worker *TessaWorker) loadContext(ctx context.Context, run tessaClaimedRun)
 	recent := make([]tessa.ContextMessage, 0, tessaRecentContextLimit)
 	for rows.Next() {
 		var sender, content string
-		if err := rows.Scan(&sender, &content); err != nil {
+		var referencesJSON []byte
+		if err := rows.Scan(&sender, &content, &referencesJSON); err != nil {
 			return "", "", "", nil, err
 		}
 		role := "assistant"
 		if sender == "provider" {
 			role = "provider"
 		}
-		recent = append(recent, tessa.ContextMessage{Role: role, Content: truncateRunes(content, 2000)})
+		message := tessa.ContextMessage{Role: role, Content: truncateRunes(content, 2000)}
+		if sender == "tessa" {
+			var references []TessaEntityReference
+			if err := json.Unmarshal(referencesJSON, &references); err != nil {
+				return "", "", "", nil, err
+			}
+			for index, reference := range references {
+				if index >= tessaEntityReferenceLimit {
+					break
+				}
+				message.References = append(message.References, tessa.ContextReference{
+					Kind: reference.Kind, ID: reference.ID, Label: truncateTessaToolText(reference.Label, 120),
+				})
+			}
+		}
+		recent = append(recent, message)
 	}
 	if err := rows.Err(); err != nil {
 		return "", "", "", nil, err
@@ -615,9 +732,7 @@ func compactTessaConversation(
 }
 
 type tessaToolExecution struct {
-	Evidence     []tessa.Evidence
-	Presentation TessaMessagePresentation
-	References   []TessaEntityReference
+	Evidence []tessa.Evidence
 }
 
 func (worker *TessaWorker) executeTools(ctx context.Context, run tessaClaimedRun, requests []tessa.ToolRequest, timezone string) (tessaToolExecution, error) {
@@ -646,11 +761,13 @@ func (worker *TessaWorker) executeTools(ctx context.Context, run tessaClaimedRun
 	for _, item := range results {
 		evidence = append(evidence, tessa.Evidence{Tool: item.request.Name, Result: item.payload})
 	}
-	presentation, references := tessaToolMetadata(evidence)
-	return tessaToolExecution{Evidence: evidence, Presentation: presentation, References: references}, nil
+	return tessaToolExecution{Evidence: evidence}, nil
 }
 
 func (worker *TessaWorker) loadOrExecuteTool(ctx context.Context, run tessaClaimedRun, index int, request tessa.ToolRequest, timezone string) (json.RawMessage, int, error) {
+	if err := worker.checkWhatsAppAuthority(ctx, worker.repo.db, run); err != nil {
+		return nil, 0, err
+	}
 	key := tessaToolActionKey(index, request)
 	var stored json.RawMessage
 	var storedCount int
@@ -681,7 +798,7 @@ func (worker *TessaWorker) loadOrExecuteTool(ctx context.Context, run tessaClaim
 		if err != nil {
 			return nil, 0, err
 		}
-		result, err := worker.repo.SearchTessaBookings(ctx, run.ClientID, from, to, request.Statuses, request.Query, request.Limit, true)
+		result, err := worker.repo.SearchTessaBookings(ctx, run.ClientID, from, to, tessaRequestBookingFilter(request, run.CheckAt), request.Limit, true)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -701,7 +818,7 @@ func (worker *TessaWorker) loadOrExecuteTool(ctx context.Context, run tessaClaim
 		if err != nil {
 			return nil, 0, err
 		}
-		result, err := worker.repo.SearchTessaBookings(ctx, run.ClientID, from, to, nil, "", tessaBookingResultLimit, false)
+		result, err := worker.repo.SearchTessaBookings(ctx, run.ClientID, from, to, TessaBookingFilter{StartsNotBefore: tessaUpcomingStart(request, run.CheckAt)}, tessaBookingResultLimit, false)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -715,7 +832,7 @@ func (worker *TessaWorker) loadOrExecuteTool(ctx context.Context, run tessaClaim
 		if request.ServiceID != "" {
 			serviceID, _ = uuid.Parse(request.ServiceID)
 		}
-		result, err := worker.repo.GetTessaAvailability(ctx, run.ClientID, serviceID, from, tessaCalendarDays(from, to))
+		result, err := worker.repo.GetTessaAvailability(ctx, run.ClientID, serviceID, request.Query, from, tessaCalendarDays(from, to))
 		if errors.Is(err, ErrNotFound) {
 			count, value = 0, map[string]any{"found": false}
 		} else if err != nil {
@@ -803,6 +920,15 @@ func (worker *TessaWorker) loadOrExecuteTool(ctx context.Context, run tessaClaim
 		if err != nil {
 			return nil, 0, err
 		}
+		if request.Metric == "count" {
+			result, err := worker.repo.CountTessaBookings(ctx, run.ClientID, from, to, tessaRequestBookingFilter(request, run.CheckAt))
+			if err != nil {
+				return nil, 0, err
+			}
+			// One aggregate evidence object, not total_bookings individual rows.
+			count, value = 1, result
+			break
+		}
 		result, err := worker.repo.GetTessaBookingMetrics(ctx, run.ClientID, from, to, request.ComparePrevious)
 		if err != nil {
 			return nil, 0, err
@@ -835,6 +961,9 @@ func (worker *TessaWorker) loadOrExecuteTool(ctx context.Context, run tessaClaim
 	}
 	payload, err := marshalTessaSafeResult(value)
 	if err != nil {
+		return nil, 0, err
+	}
+	if err := worker.checkWhatsAppAuthority(ctx, worker.repo.db, run); err != nil {
 		return nil, 0, err
 	}
 	count = tessaStoredResultCount(request.Name, payload, count)
@@ -910,6 +1039,20 @@ func (worker *TessaWorker) complete(
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var lastSequence, summaryThrough int64
+	if run.SourceChannel == "whatsapp" {
+		if _, err = tx.Exec(ctx, `SELECT id FROM clients WHERE id=$1 FOR SHARE`, run.ClientID); err != nil {
+			return err
+		}
+		if err = worker.checkWhatsAppAuthority(ctx, tx, run); err != nil {
+			return err
+		}
+	} else if _, err = tx.Exec(ctx, `SELECT id FROM clients WHERE id=$1 FOR KEY SHARE`, run.ClientID); err != nil {
+		return err
+	}
+	// Serialize completion with reset before locking either the thread or run.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('tessa-thread:' || $1::uuid::text,0))`, run.ClientID); err != nil {
+		return err
+	}
 	var summary string
 	if err := tx.QueryRow(ctx, `
 		SELECT thread.last_message_sequence,thread.summary,thread.summary_through_sequence
@@ -940,9 +1083,14 @@ func (worker *TessaWorker) complete(
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO tessa_messages (
 			id,thread_id,client_id,sequence,sender_type,source_channel,content,presentation,entity_references,run_id
-		) VALUES ($1,$2,$3,$4,'tessa','web',$5,$6::jsonb,$7::jsonb,$8) RETURNING created_at
-	`, messageID, run.ThreadID, run.ClientID, sequence, content, presentationJSON, referencesJSON, run.ID).Scan(&createdAt); err != nil {
+		) VALUES ($1,$2,$3,$4,'tessa',(SELECT source_channel FROM tessa_messages WHERE id=$9),$5,$6::jsonb,$7::jsonb,$8) RETURNING created_at
+	`, messageID, run.ThreadID, run.ClientID, sequence, content, presentationJSON, referencesJSON, run.ID, run.TriggerMessageID).Scan(&createdAt); err != nil {
 		return fmt.Errorf("insert Tessa answer: %w", err)
+	}
+	if run.SourceChannel == "whatsapp" {
+		if err := whatsapp.EnqueueTessaAnswerTx(ctx, tx, run.ClientID, run.ThreadID, run.ID, messageID, worker.config.NoticeRevision); err != nil {
+			return err
+		}
 	}
 	latency := int(time.Since(run.CreatedAt).Milliseconds())
 	if _, err := tx.Exec(ctx, `
@@ -1058,6 +1206,9 @@ func shouldFallbackTessa(err error) bool {
 }
 
 func tessaSafeFailureCode(err error) string {
+	if errors.Is(err, errTessaWhatsAppAuthority) {
+		return "whatsapp_connection_changed"
+	}
 	if errors.Is(err, ErrTessaNoticeRevision) {
 		return "notice_changed"
 	}
@@ -1103,16 +1254,7 @@ func tessaToolActionKey(index int, request tessa.ToolRequest) string {
 }
 
 func tessaDateRange(fromValue, toValue, timezone string) (time.Time, time.Time, error) {
-	location := timezoneLocation(timezone)
-	from, err := time.ParseInLocation("2006-01-02", fromValue, location)
-	if err != nil {
-		return time.Time{}, time.Time{}, err
-	}
-	to, err := time.ParseInLocation("2006-01-02", toValue, location)
-	if err != nil || to.Before(from) {
-		return time.Time{}, time.Time{}, errors.New("invalid Tessa date range")
-	}
-	return from, to.AddDate(0, 0, 1), nil
+	return tessa.DateRangeBounds(fromValue, toValue, timezone)
 }
 
 func tessaAvailabilitySlotCount(result TessaAvailabilityResult) int {
@@ -1135,7 +1277,20 @@ func tessaCalendarDays(from, to time.Time) int {
 
 func marshalTessaSafeResult(value any) (json.RawMessage, error) {
 	for {
+		if availability, ok := value.(TessaAvailabilityResult); ok {
+			for i := range availability.Services {
+				availability.Services[i].ReturnedSlotCount = 0
+				for _, day := range availability.Services[i].Dates {
+					availability.Services[i].ReturnedSlotCount += len(day.Slots)
+				}
+			}
+			value = availability
+		}
 		payload, err := json.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		payload, err = formatTessaMoneyEvidence(payload)
 		if err != nil {
 			return nil, err
 		}
@@ -1258,12 +1413,18 @@ func tessaStoredResultCount(toolName string, payload json.RawMessage, fallback i
 }
 
 func tessaToolMetadata(evidence []tessa.Evidence) (TessaMessagePresentation, []TessaEntityReference) {
+	return tessaSelectedToolMetadata(evidence, nil, tessaEntityReferenceLimit)
+}
+
+// Filter before presentation limits: a described item may appear after the
+// first four actions or twelve references in the unfiltered evidence.
+func tessaSelectedToolMetadata(evidence []tessa.Evidence, selected map[string]bool, referenceLimit int) (TessaMessagePresentation, []TessaEntityReference) {
 	actions := []TessaNavigationAction{}
 	references := []TessaEntityReference{}
 	seenReferences := map[string]struct{}{}
 	seenActions := map[string]struct{}{}
 	addEntity := func(kind, id, label, routeID, actionLabel string) {
-		if id == "" {
+		if id == "" || (selected != nil && !selected[id]) {
 			return
 		}
 		referenceKey := kind + ":" + id
@@ -1271,7 +1432,7 @@ func tessaToolMetadata(evidence []tessa.Evidence) (TessaMessagePresentation, []T
 		if label == "" {
 			label = kind
 		}
-		if _, exists := seenReferences[referenceKey]; !exists && len(references) < tessaEntityReferenceLimit {
+		if _, exists := seenReferences[referenceKey]; !exists && len(references) < referenceLimit {
 			seenReferences[referenceKey] = struct{}{}
 			references = append(references, TessaEntityReference{
 				Kind: kind, ID: id, Label: label, RouteID: routeID,
@@ -1293,7 +1454,8 @@ func tessaToolMetadata(evidence []tessa.Evidence) (TessaMessagePresentation, []T
 		actions = append(actions, TessaNavigationAction{RouteID: routeID, Label: label})
 	}
 	addBooking := func(item TessaBookingSummary) {
-		addEntity("booking", item.BookingID, item.ServiceTitle, "booking_details", "View booking")
+		label := strings.TrimSpace(truncateTessaToolText(item.CustomerName, 40) + " " + item.StartsAt + " " + truncateTessaToolText(item.ServiceTitle, 40))
+		addEntity("booking", item.BookingID, label, "booking_details", "View booking")
 	}
 	for _, item := range evidence {
 		switch item.Tool {
@@ -1326,6 +1488,14 @@ func tessaToolMetadata(evidence []tessa.Evidence) (TessaMessagePresentation, []T
 			if json.Unmarshal(item.Result, &result) == nil {
 				for _, service := range result.Items {
 					addEntity("service", service.ServiceID, service.Name, "service_details", "View service")
+				}
+				addRoute("services", "Open services")
+			}
+		case "get_availability":
+			var result TessaAvailabilityResult
+			if json.Unmarshal(item.Result, &result) == nil {
+				for _, service := range result.Services {
+					addEntity("service", service.ServiceID, service.ServiceTitle, "service_details", "View service")
 				}
 				addRoute("services", "Open services")
 			}
@@ -1370,7 +1540,12 @@ func tessaToolMetadata(evidence []tessa.Evidence) (TessaMessagePresentation, []T
 		case "get_payout_summary":
 			addRoute("payouts", "Open payouts")
 		case "get_booking_metrics":
-			addRoute("stats", "Open stats")
+			var count TessaBookingCount
+			if json.Unmarshal(item.Result, &count) == nil && count.Exact {
+				addRoute("bookings", "View bookings")
+			} else {
+				addRoute("stats", "Open stats")
+			}
 		case "get_inbox_summary":
 			addRoute("inbox", "Open inbox")
 		case "get_review_summary":

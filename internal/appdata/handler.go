@@ -99,6 +99,7 @@ type Handler struct {
 	inboxAIProviderAllowlist map[uuid.UUID]struct{}
 	inboxAIGenerationLimiter *InboxAIGenerationLimiter
 	tessaEnabled             bool
+	tessaWhatsApp            *whatsapp.TessaLinkRepository
 	tessaProviderAllowlist   map[uuid.UUID]struct{}
 	tessaNoticeRevision      string
 	tessaPrimaryProvider     string
@@ -238,6 +239,7 @@ func (h *Handler) Routes(r chi.Router) {
 	r.Route("/app", func(r chi.Router) {
 		if h.auth != nil {
 			r.Use(h.auth.AuthMiddleware())
+			h.auth.ProtectedRoutes(r)
 		}
 
 		r.Get("/dashboard", h.getDashboard)
@@ -258,6 +260,9 @@ func (h *Handler) Routes(r chi.Router) {
 		r.Get("/inbox/events", h.streamProviderInboxEvents)
 		r.Get("/inbox/conversations/{conversationID}", h.getProviderConversation)
 		r.Get("/tessa/bootstrap", h.getTessaBootstrap)
+		r.Get("/tessa/whatsapp", h.getTessaWhatsApp)
+		r.Post("/tessa/whatsapp/link", h.startTessaWhatsAppLink)
+		r.Delete("/tessa/whatsapp", h.disconnectTessaWhatsApp)
 		r.Post("/tessa/introduction/complete", h.completeTessaIntroduction)
 		r.Post("/tessa/threads", h.createTessaThread)
 		r.Get("/tessa/threads/{threadID}/messages", h.listOlderTessaMessages)
@@ -345,6 +350,11 @@ func (h *Handler) Routes(r chi.Router) {
 		r.Get("/profile/handle-availability", h.checkHandleSlugAvailability)
 		r.Get("/profile", h.getClientProfile)
 		r.Put("/profile", h.updateClientProfile)
+		r.Get("/profile/customer-contact", h.customerContact)
+		r.Patch("/profile/customer-contact", h.customerContact)
+		r.Delete("/profile/customer-contact", h.customerContact)
+		r.Post("/profile/customer-contact/reuse-verified", h.customerContactNumber)
+		r.Post("/profile/customer-contact/verification", h.customerContactNumber)
 		r.Get("/profile/marketplace", h.getMarketplaceProfileSettings)
 		r.Patch("/profile/marketplace", h.updateMarketplaceProfileSettings)
 		r.Patch("/profile/market", h.updateClientMarket)
@@ -418,6 +428,7 @@ func (h *Handler) Routes(r chi.Router) {
 	})
 
 	r.Route("/public", func(r chi.Router) {
+		r.Get("/notification-capabilities", h.getPublicNotificationCapabilities)
 		r.Post("/locations/resolve", h.resolvePublicLocation)
 		r.Get("/clients/{slug}", h.getPublicProfile)
 		r.Get("/clients/{slug}/services", h.listPublicServices)

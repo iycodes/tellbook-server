@@ -40,7 +40,7 @@ type Message struct {
 type chatCompletionsRequest struct {
 	Model              string    `json:"model"`
 	Messages           []Message `json:"messages"`
-	Temperature        float64   `json:"temperature,omitempty"`
+	Temperature        float64   `json:"temperature"`
 	TopP               float64   `json:"top_p,omitempty"`
 	TopK               int       `json:"top_k,omitempty"`
 	MinP               float64   `json:"min_p,omitempty"`
@@ -52,7 +52,7 @@ type chatCompletionsRequest struct {
 	} `json:"chat_template_kwargs"`
 	MaxTokens      int                `json:"max_tokens,omitempty"`
 	ResponseFormat chatResponseFormat `json:"response_format"`
-	JSONSchema     map[string]any     `json:"json_schema,omitempty"`
+	JSONSchema     json.RawMessage    `json:"json_schema,omitempty"`
 	Stream         bool               `json:"stream"`
 }
 
@@ -62,14 +62,15 @@ type chatResponseFormat struct {
 }
 
 type chatJSONSchemaEnvelope struct {
-	Name   string         `json:"name"`
-	Strict bool           `json:"strict"`
-	Schema map[string]any `json:"schema"`
+	Name   string          `json:"name"`
+	Strict bool            `json:"strict"`
+	Schema json.RawMessage `json:"schema"`
 }
 
 type chatCompletionsResponse struct {
 	Choices []struct {
-		Message Message `json:"message"`
+		Message      Message `json:"message"`
+		FinishReason string  `json:"finish_reason"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
@@ -141,13 +142,15 @@ func (c *Client) GenerateJSONSchema(
 		JSONSchema: &chatJSONSchemaEnvelope{
 			Name:   schemaName,
 			Strict: true,
-			Schema: schema,
+			Schema: schemaJSON,
 		},
 	}
 	// llama-server builds support either the OpenAI-compatible nested schema or
 	// the native top-level json_schema field. Send both identical forms so the
 	// configured local runtime actually applies the grammar.
-	payload.JSONSchema = schema
+	// Preserve discriminator/property order for constrained decoding. Decoding
+	// and re-encoding through a Go map would sort tool arguments before name.
+	payload.JSONSchema = schemaJSON
 	content, err := c.complete(ctx, payload)
 	if err != nil {
 		return nil, err
@@ -229,6 +232,15 @@ func (c *Client) complete(ctx context.Context, payload chatCompletionsRequest) (
 	}
 	if len(decoded.Choices) == 0 {
 		return "", aierror.Terminal("decode self-hosted model response", aierror.KindMalformedResponse, nil)
+	}
+	switch decoded.Choices[0].FinishReason {
+	case "stop":
+	case "length":
+		return "", aierror.Terminal("call self-hosted model", aierror.KindOutputTruncated, nil)
+	case "content_filter":
+		return "", aierror.Terminal("call self-hosted model", aierror.KindContentFiltered, nil)
+	default:
+		return "", aierror.Terminal("decode self-hosted model response", aierror.KindMalformedResponse, errors.New("missing or unsupported finish reason"))
 	}
 
 	content := strings.TrimSpace(decoded.Choices[0].Message.Content)

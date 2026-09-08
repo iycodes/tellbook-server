@@ -857,6 +857,10 @@ func (r *Repository) GetBookingDetails(ctx context.Context, clientID, bookingID 
 	response.PaymentHistory = paymentHistory
 	response.RefundHistory = refundHistory
 	response.ChangeHistory = changeHistory
+	response.DeliveryStatus, err = r.loadBookingDeliveryStatus(ctx, bookingID)
+	if err != nil {
+		return BookingDetailsResponse{}, err
+	}
 
 	return response, nil
 }
@@ -1520,7 +1524,7 @@ func (r *Repository) GetClientProfile(ctx context.Context, clientID uuid.UUID) (
 	const query = `
 		SELECT
 			c.full_name,
-			c.email,
+			COALESCE(c.email, ''),
 			c.bio,
 			COALESCE(cp.business_name, c.full_name),
 			COALESCE(cp.handle_slug, ''),
@@ -2156,7 +2160,8 @@ func (r *Repository) getPublicProfile(ctx context.Context, slug string) (PublicP
 			COALESCE(category.id::text, ''),
 			COALESCE(category.name, ''),
 			(SELECT COUNT(*)::int FROM bookings completed
-			 WHERE completed.client_id = cp.client_id AND completed.status = 'completed')
+			 WHERE completed.client_id = cp.client_id AND completed.status = 'completed'),
+			COALESCE(cp.public_contact_phone, '')
 		FROM client_profiles cp
 		INNER JOIN client_profile_handles cph
 			ON cph.client_id = cp.client_id
@@ -2195,6 +2200,7 @@ func (r *Repository) getPublicProfile(ctx context.Context, slug string) (PublicP
 		&profile.MarketplaceCategoryID,
 		&profile.MarketplaceCategoryName,
 		&profile.CompletedBookings,
+		&profile.CustomerContactPhone,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return PublicProfile{}, ErrNotFound

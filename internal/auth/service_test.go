@@ -1,41 +1,32 @@
 package auth
 
 import (
-	"bytes"
 	"testing"
+	"time"
+
+	"booking/go-server/internal/config"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
-func TestNewSixDigitCode(t *testing.T) {
-	for range 100 {
-		code, tokenHash, err := newSixDigitCode()
-		if err != nil {
-			t.Fatalf("newSixDigitCode() error = %v", err)
-		}
-		if !isSixDigitCode(code) {
-			t.Fatalf("newSixDigitCode() code = %q, want six numeric digits", code)
-		}
-		if !bytes.Equal(tokenHash, hashToken(code)) {
-			t.Fatal("newSixDigitCode() returned a hash that does not match the code")
-		}
+func TestAccessTokenSecurityRevisionIsRequired(t *testing.T) {
+	service := NewService(nil, config.Config{
+		AuthAccessTokenSecret: "test-secret",
+		AuthAccessTokenTTL:    time.Hour,
+		AuthIssuer:            "tellbook-test",
+	}, nil, nil)
+	user := User{ID: uuid.New(), FullName: "Provider", SecurityRevision: 3}
+	token, err := service.signAccessToken(user, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestIsSixDigitCode(t *testing.T) {
-	tests := []struct {
-		value string
-		want  bool
-	}{
-		{value: "000000", want: true},
-		{value: "123456", want: true},
-		{value: "12345", want: false},
-		{value: "1234567", want: false},
-		{value: "12345a", want: false},
-		{value: "１２３４５６", want: false},
+	claims := &AccessTokenClaims{}
+	_, _, err = jwt.NewParser().ParseUnverified(token, claims)
+	if err != nil {
+		t.Fatalf("parse access token: %v", err)
 	}
-
-	for _, test := range tests {
-		if got := isSixDigitCode(test.value); got != test.want {
-			t.Errorf("isSixDigitCode(%q) = %t, want %t", test.value, got, test.want)
-		}
+	if claims.SecurityRevision != user.SecurityRevision {
+		t.Fatalf("security revision = %d, want %d", claims.SecurityRevision, user.SecurityRevision)
 	}
 }

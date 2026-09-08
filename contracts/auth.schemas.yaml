@@ -1,0 +1,120 @@
+openapi: 3.1.0
+info:
+  title: Tellbook shared authentication schemas
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    AuthChannel:
+      type: string
+      enum: [email, whatsapp]
+    IdentityType:
+      type: string
+      enum: [email, phone]
+    ChallengeDeliveryState:
+      type: string
+      enum: [queued, accepted, sent, delivered, unknown, failed, expired]
+    AuthCapabilities:
+      type: object
+      additionalProperties: false
+      required: [channels, code_length, password_fallback_available]
+      properties:
+        channels:
+          type: array
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/AuthChannel' }
+        code_length: { type: integer, const: 6 }
+        password_fallback_available: { type: boolean }
+    CodeStartInput:
+      type: object
+      additionalProperties: false
+      required: [identifier, delivery_channel]
+      properties:
+        identifier: { type: string, minLength: 3, maxLength: 320 }
+        delivery_channel: { $ref: '#/components/schemas/AuthChannel' }
+    CodeResendInput:
+      type: object
+      additionalProperties: false
+      required: [challenge_id]
+      properties:
+        challenge_id: { type: string, format: uuid }
+    CodeVerifyInput:
+      type: object
+      additionalProperties: false
+      required: [challenge_id, code]
+      properties:
+        challenge_id: { type: string, format: uuid }
+        code: { type: string, pattern: '^[0-9]{6}$' }
+    ChallengeResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - challenge_id
+        - identifier_type
+        - delivery_channel
+        - destination_hint
+        - delivery_state
+        - delivery_expires_in_seconds
+        - verification_expires_in_seconds
+        - resend_available_in_seconds
+        - next_status_check_in_seconds
+      properties:
+        challenge_id: { type: string, format: uuid }
+        identifier_type: { $ref: '#/components/schemas/IdentityType' }
+        delivery_channel: { $ref: '#/components/schemas/AuthChannel' }
+        destination_hint: { type: string }
+        delivery_state: { $ref: '#/components/schemas/ChallengeDeliveryState' }
+        delivery_expires_in_seconds: { type: integer, minimum: 0 }
+        verification_expires_in_seconds:
+          type: [integer, 'null']
+          minimum: 0
+        resend_available_in_seconds: { type: integer, minimum: 0 }
+        next_status_check_in_seconds:
+          type: [integer, 'null']
+          minimum: 0
+    PasswordSignInInput:
+      type: object
+      additionalProperties: false
+      required: [identifier, password]
+      properties:
+        identifier: { type: string, minLength: 3, maxLength: 320 }
+        password: { type: string, minLength: 8, maxLength: 72 }
+    PasswordResetStartInput:
+      allOf:
+        - { $ref: '#/components/schemas/CodeStartInput' }
+    PasswordResetVerifyInput:
+      allOf:
+        - { $ref: '#/components/schemas/CodeVerifyInput' }
+    PasswordResetVerifyResponse:
+      type: object
+      additionalProperties: false
+      required: [reset_grant, expires_in_seconds]
+      properties:
+        reset_grant: { type: string, minLength: 32 }
+        expires_in_seconds: { type: integer, minimum: 1 }
+    PasswordResetCompleteInput:
+      type: object
+      additionalProperties: false
+      required: [reset_grant, new_password]
+      properties:
+        reset_grant: { type: string, minLength: 32 }
+        new_password: { type: string, minLength: 8, maxLength: 72 }
+    PasswordUpdateInput:
+      type: object
+      additionalProperties: false
+      required: [new_password]
+      properties:
+        current_password: { type: string, maxLength: 72 }
+        new_password: { type: string, minLength: 8, maxLength: 72 }
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }

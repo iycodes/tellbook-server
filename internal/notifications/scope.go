@@ -52,12 +52,44 @@ func (r *Repository) PlanScopeJob(ctx context.Context, job ScopeJob) error {
 		return tx.Commit(ctx)
 	}
 	rows, err := tx.Query(ctx, `
-		SELECT booking.id,latest.id
+		SELECT latest.id,booking.start_at,
+			booking.id,booking.client_id,booking.marketplace_customer_id,
+			booking.status,booking.payment_status,booking.agreement_status,booking.start_at,
+			booking.reservation_expired_at,
+			(booking.agreement_template_family_id_snapshot IS NOT NULL
+			 OR booking.standalone_signature_required_snapshot),
+			COALESCE(booking.customer_email_snapshot,''),
+			COALESCE(booking.customer_whatsapp_e164_snapshot,''),
+			booking.email_reminder_consent,booking.whatsapp_consent,
+			booking.notification_consent_policy_revision,
+			COALESCE(customer_preference.booking_email,TRUE),
+			COALESCE(
+				customer_preference.booking_email OR customer_preference.updated_at<=booking.created_at,
+				TRUE
+			),
+			COALESCE(
+				customer_preference.booking_whatsapp OR customer_preference.updated_at<=booking.created_at,
+				TRUE
+			),
+			COALESCE(lower(btrim(client.email)),''),client.email_verified_at IS NOT NULL,
+			COALESCE(provider_preference.booking_email,TRUE),
+			COALESCE(provider_preference.booking_whatsapp,FALSE),
+			COALESCE(provider_preference.appointment_reminder_enabled,TRUE),
+			COALESCE(provider_preference.appointment_reminder_minutes,1440),
+			COALESCE(provider_preference.whatsapp_e164,''),
+			provider_preference.whatsapp_verified_at IS NOT NULL,
+			COALESCE(provider_preference.preference_revision,1),latest.sequence,COALESCE(profile.booking_contact_phone,'')
 		FROM bookings booking
 		JOIN LATERAL (
-			SELECT event.id FROM booking_domain_events event
+			SELECT event.id,event.sequence FROM booking_domain_events event
 			WHERE event.booking_id=booking.id ORDER BY event.sequence DESC LIMIT 1
 		) latest ON TRUE
+		JOIN clients client ON client.id=booking.client_id
+		LEFT JOIN client_profiles profile ON profile.client_id=booking.client_id
+		LEFT JOIN provider_notification_preferences provider_preference
+			ON provider_preference.client_id=booking.client_id
+		LEFT JOIN marketplace_notification_preferences customer_preference
+			ON customer_preference.marketplace_customer_id=booking.marketplace_customer_id
 		WHERE booking.client_id=$1 AND booking.start_at>NOW()
 		  AND ($2::timestamptz IS NULL OR (booking.start_at,booking.id)>($2,$3::uuid))
 		ORDER BY booking.start_at,booking.id LIMIT $4
@@ -65,14 +97,22 @@ func (r *Repository) PlanScopeJob(ctx context.Context, job ScopeJob) error {
 	if err != nil {
 		return fmt.Errorf("load notification scope bookings: %w", err)
 	}
-	type scopeBooking struct{ bookingID, eventID uuid.UUID }
+	type scopeBooking struct {
+		eventID uuid.UUID
+		startAt time.Time
+		state   bookingState
+	}
 	bookings := make([]scopeBooking, 0, scopeBookingBatch+1)
 	for rows.Next() {
 		var booking scopeBooking
-		if err := rows.Scan(&booking.bookingID, &booking.eventID); err != nil {
+		var marketplaceCustomerID uuid.NullUUID
+		targets := []any{&booking.eventID, &booking.startAt}
+		targets = append(targets, bookingStateScanTargets(&booking.state, &marketplaceCustomerID)...)
+		if err := rows.Scan(targets...); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan notification scope booking: %w", err)
 		}
+		setMarketplaceCustomerID(&booking.state, marketplaceCustomerID)
 		bookings = append(bookings, booking)
 	}
 	if err := rows.Err(); err != nil {
@@ -84,27 +124,20 @@ func (r *Repository) PlanScopeJob(ctx context.Context, job ScopeJob) error {
 	if hasMore {
 		bookings = bookings[:scopeBookingBatch]
 	}
+	suppressionCache := make(map[string]bool)
 	for _, booking := range bookings {
-		state, err := loadBookingStateTx(ctx, tx, booking.eventID)
-		if err != nil {
-			return err
-		}
-		if err := r.reconcileBookingTx(ctx, tx, state, nil); err != nil {
+		if err := r.reconcileBookingTx(ctx, tx, booking.state, nil, false, suppressionCache); err != nil {
 			return err
 		}
 	}
 	if hasMore {
 		last := bookings[len(bookings)-1]
-		var startAt time.Time
-		if err := tx.QueryRow(ctx, `SELECT start_at FROM bookings WHERE id=$1`, last.bookingID).Scan(&startAt); err != nil {
-			return fmt.Errorf("load notification scope cursor: %w", err)
-		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE notification_scope_replan_jobs
 			SET status='pending',next_attempt_at=NOW(),lease_owner='',lease_expires_at=NULL,
 				booking_cursor_start_at=$4,booking_cursor_id=$5,last_error_code='',updated_at=NOW()
 			WHERE client_id=$1 AND preference_revision=$2 AND lease_owner=$3
-		`, job.ClientID, job.PreferenceRevision, job.LeaseOwner, startAt, last.bookingID); err != nil {
+		`, job.ClientID, job.PreferenceRevision, job.LeaseOwner, last.startAt, last.state.ID); err != nil {
 			return fmt.Errorf("advance notification scope cursor: %w", err)
 		}
 	} else {

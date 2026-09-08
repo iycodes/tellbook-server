@@ -25,6 +25,17 @@ var (
 
 const tessaEventChannel = "tellbook_tessa_events"
 
+// The unique assistant-message index makes this a bounded join for bootstrap,
+// pagination and batched SSE hydration, not a per-message network query.
+const tessaMessageRead = `SELECT m.id,m.thread_id,m.sequence,m.sender_type,m.source_channel,m.client_message_id,m.content,
+    m.presentation,m.entity_references,m.run_id,m.created_at,
+    CASE WHEN d.id IS NULL THEN NULL ELSE jsonb_strip_nulls(jsonb_build_object(
+      'status',tessa_whatsapp_public_status(d.status),'updated_at',d.updated_at,
+      'reason',CASE WHEN d.status='expired' THEN 'customer_service_window_closed' END,
+      'accepted_at',d.accepted_at,'sent_at',d.sent_at,'delivered_at',d.delivered_at,'read_at',d.read_at)) END
+    FROM tessa_messages m LEFT JOIN tessa_whatsapp_outbox d ON d.assistant_message_id=m.id
+      AND d.client_id=m.client_id AND d.thread_id=m.thread_id AND d.kind='answer' `
+
 func (r *Repository) GetTessaBootstrap(
 	ctx context.Context,
 	clientID uuid.UUID,
@@ -118,6 +129,11 @@ func (r *Repository) CompleteTessaIntroduction(
 		return fmt.Errorf("begin Tessa introduction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Take the account lock before any thread lock. WhatsApp ingress/revocation
+	// locks the account first; later FK checks must not invert that order.
+	if _, err := tx.Exec(ctx, `SELECT id FROM clients WHERE id=$1 FOR KEY SHARE`, clientID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `
 		SELECT pg_advisory_xact_lock(hashtextextended('tessa-thread:' || $1::uuid::text,0))
 	`, clientID); err != nil {
@@ -150,6 +166,11 @@ func (r *Repository) CreateTessaThread(
 		return TessaThread{}, fmt.Errorf("begin Tessa thread replacement: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Reset can publish delivery cancellations. Serialize on the account before
+	// taking thread/outbox locks, matching completion, callbacks and disconnect.
+	if _, err := tx.Exec(ctx, `SELECT id FROM clients WHERE id=$1 FOR UPDATE`, clientID); err != nil {
+		return TessaThread{}, err
+	}
 	if _, err := tx.Exec(ctx, `
 		SELECT pg_advisory_xact_lock(hashtextextended('tessa-thread:' || $1::uuid::text,0))
 	`, clientID); err != nil {
@@ -172,12 +193,22 @@ func (r *Repository) CreateTessaThread(
 		}
 		return existing, nil
 	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM tessa_threads WHERE client_id=$1 AND status='active' FOR UPDATE`, clientID); err != nil {
+		return TessaThread{}, err
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE tessa_runs SET status='cancelled', stage='completed', lease_owner='', lease_token=NULL,
 			lease_expires_at=NULL, error_code='thread_archived', cancelled_at=NOW()
 		WHERE client_id=$1 AND status IN ('queued','processing')
 	`, clientID); err != nil {
 		return TessaThread{}, fmt.Errorf("cancel active Tessa run: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE tessa_whatsapp_ingress SET status='cancelled',reason='thread_archived',content=NULL,completed_at=NOW() WHERE client_id=$1 AND status='pending'`, clientID); err != nil {
+		return TessaThread{}, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE tessa_whatsapp_outbox SET status='cancelled',completed_at=NOW(),last_error_code='thread_archived'
+		WHERE client_id=$1 AND kind='answer' AND status IN ('pending','retry','processing')`, clientID); err != nil {
+		return TessaThread{}, err
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE tessa_threads SET status='archived', archived_at=NOW(), last_activity_at=NOW()
@@ -268,6 +299,9 @@ func (r *Repository) SendTessaMessage(
 		}
 		return response, nil
 	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM clients WHERE id=$1 FOR KEY SHARE`, clientID); err != nil {
+		return TessaSendMessageResponse{}, err
+	}
 	if err := requireTessaNoticeAcknowledgement(ctx, tx, clientID, currentNoticeRevision); err != nil {
 		return TessaSendMessageResponse{}, err
 	}
@@ -291,6 +325,13 @@ func (r *Repository) SendTessaMessage(
 		return response, nil
 	}
 	var activeRunID uuid.UUID
+	var waitingWhatsApp bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM tessa_whatsapp_ingress WHERE thread_id=$1 AND status='pending' AND expires_at>NOW())`, threadID).Scan(&waitingWhatsApp); err != nil {
+		return TessaSendMessageResponse{}, err
+	}
+	if waitingWhatsApp {
+		return TessaSendMessageResponse{}, ErrTessaRunInProgress
+	}
 	if err := tx.QueryRow(ctx, `
 		SELECT id FROM tessa_runs WHERE thread_id=$1 AND status IN ('queued','processing')
 	`, threadID).Scan(&activeRunID); err == nil {
@@ -298,6 +339,18 @@ func (r *Repository) SendTessaMessage(
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return TessaSendMessageResponse{}, fmt.Errorf("check active Tessa run: %w", err)
 	}
+	response, err := insertTessaTurnTx(ctx, tx, clientID, threadID, clientMessageID, content, primaryProvider, primaryModel, configHash, "web", lastSequence)
+	if err != nil {
+		return TessaSendMessageResponse{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return TessaSendMessageResponse{}, err
+	}
+	return response, nil
+}
+
+func insertTessaTurnTx(ctx context.Context, tx pgx.Tx, clientID, threadID, clientMessageID uuid.UUID, content, primaryProvider, primaryModel, configHash, sourceChannel string, lastSequence int64) (TessaSendMessageResponse, error) {
+	fingerprint := tessaMessageFingerprint(content)
 	messageID := uuid.New()
 	runID := uuid.New()
 	nextSequence := lastSequence + 1
@@ -306,9 +359,9 @@ func (r *Repository) SendTessaMessage(
 		INSERT INTO tessa_messages (
 			id,thread_id,client_id,sequence,sender_type,source_channel,
 			client_message_id,request_fingerprint,content
-		) VALUES ($1,$2,$3,$4,'provider','web',$5,$6,$7)
+		) VALUES ($1,$2,$3,$4,'provider',$8,$5,$6,$7)
 		RETURNING created_at
-	`, messageID, threadID, clientID, nextSequence, clientMessageID, fingerprint, content).Scan(
+	`, messageID, threadID, clientID, nextSequence, clientMessageID, fingerprint, content, sourceChannel).Scan(
 		&message.CreatedAt,
 	); err != nil {
 		return TessaSendMessageResponse{}, fmt.Errorf("insert Tessa message: %w", err)
@@ -336,11 +389,8 @@ func (r *Repository) SendTessaMessage(
 	if _, err := appendTessaEvent(ctx, tx, clientID, threadID, messageID, uuid.Nil, "message.created", map[string]any{"message_id": messageID.String()}); err != nil {
 		return TessaSendMessageResponse{}, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return TessaSendMessageResponse{}, fmt.Errorf("commit Tessa message: %w", err)
-	}
 	message.ID, message.ThreadID, message.Sequence = messageID.String(), threadID.String(), nextSequence
-	message.SenderType, message.SourceChannel, message.ClientMessageID, message.Content = "provider", "web", clientMessageID.String(), content
+	message.SenderType, message.SourceChannel, message.ClientMessageID, message.Content = "provider", sourceChannel, clientMessageID.String(), content
 	message.Presentation, message.EntityReferences = TessaMessagePresentation{}, []TessaEntityReference{}
 	run.ID, run.ThreadID, run.TriggerMessageID = runID.String(), threadID.String(), messageID.String()
 	return TessaSendMessageResponse{Message: message, Run: run}, nil
@@ -400,10 +450,8 @@ func loadIdempotentTessaSend(
 }
 
 func loadTessaSendResponse(ctx context.Context, tx pgx.Tx, clientID, threadID, messageID uuid.UUID) (TessaSendMessageResponse, error) {
-	message, err := scanTessaMessage(tx.QueryRow(ctx, `
-		SELECT id,thread_id,sequence,sender_type,source_channel,client_message_id,content,
-			presentation,entity_references,run_id,created_at
-		FROM tessa_messages WHERE id=$1 AND thread_id=$2 AND client_id=$3
+	message, err := scanTessaMessage(tx.QueryRow(ctx, tessaMessageRead+`
+		WHERE m.id=$1 AND m.thread_id=$2 AND m.client_id=$3
 	`, messageID, threadID, clientID))
 	if err != nil {
 		return TessaSendMessageResponse{}, err
@@ -485,12 +533,9 @@ type tessaReadQuerier interface {
 }
 
 func listTessaMessages(ctx context.Context, querier tessaReadQuerier, clientID, threadID uuid.UUID, before int64, limit int) ([]TessaMessage, bool, error) {
-	query := `
-		SELECT id,thread_id,sequence,sender_type,source_channel,client_message_id,content,
-			presentation,entity_references,run_id,created_at
-		FROM tessa_messages
-		WHERE thread_id=$1 AND client_id=$2 AND ($3::bigint=0 OR sequence<$3)
-		ORDER BY sequence DESC LIMIT $4
+	query := tessaMessageRead + `
+		WHERE m.thread_id=$1 AND m.client_id=$2 AND ($3::bigint=0 OR m.sequence<$3)
+		ORDER BY m.sequence DESC LIMIT $4
 	`
 	rows, err := querier.Query(ctx, query, threadID, clientID, before, limit+1)
 	if err != nil {
@@ -525,9 +570,10 @@ func scanTessaMessage(scanner tessaScanner) (TessaMessage, error) {
 	var id, threadID uuid.UUID
 	var clientMessageID, runID uuid.NullUUID
 	var presentationJSON, referencesJSON []byte
+	var deliveryJSON []byte
 	if err := scanner.Scan(
 		&id, &threadID, &message.Sequence, &message.SenderType, &message.SourceChannel,
-		&clientMessageID, &message.Content, &presentationJSON, &referencesJSON, &runID, &message.CreatedAt,
+		&clientMessageID, &message.Content, &presentationJSON, &referencesJSON, &runID, &message.CreatedAt, &deliveryJSON,
 	); err != nil {
 		return TessaMessage{}, err
 	}
@@ -542,6 +588,11 @@ func scanTessaMessage(scanner tessaScanner) (TessaMessage, error) {
 	message.EntityReferences = []TessaEntityReference{}
 	_ = json.Unmarshal(presentationJSON, &message.Presentation)
 	_ = json.Unmarshal(referencesJSON, &message.EntityReferences)
+	if len(deliveryJSON) > 0 {
+		if err := json.Unmarshal(deliveryJSON, &message.WhatsAppDelivery); err != nil {
+			return TessaMessage{}, err
+		}
+	}
 	return message, nil
 }
 

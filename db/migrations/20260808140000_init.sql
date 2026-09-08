@@ -3301,6 +3301,7 @@ ALTER TABLE ONLY public.services
 -- PostgreSQL database dump complete
 --
 
+SELECT pg_catalog.set_config('search_path', 'public, pg_catalog', false);
 
 -- migrate:down
 DROP SCHEMA public CASCADE;

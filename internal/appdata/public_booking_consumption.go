@@ -788,7 +788,7 @@ func (r *Repository) GetPublicBookingSummary(ctx context.Context, bookingToken s
 			b.agreement_title_snapshot, b.standalone_signature_required_snapshot,
 			b.reservation_expires_at, b.reservation_expired_at, b.reservation_expiry_reason,
 			COALESCE(latest_payment.public_token, ''), COALESCE(latest_payment.provider, ''),
-			COALESCE(latest_payment.reference, '')
+			COALESCE(latest_payment.reference, ''), COALESCE(cp.booking_contact_phone, '')
 		FROM bookings b
 		INNER JOIN client_profiles cp ON cp.client_id = b.client_id
 		INNER JOIN customers c ON c.id = b.customer_id
@@ -835,6 +835,7 @@ func (r *Repository) GetPublicBookingSummary(ctx context.Context, bookingToken s
 		&response.AgreementTemplateTitle, &response.StandaloneSignatureRequired,
 		&reservationExpiresAt, &reservationExpiredAt, &response.ReservationExpiryReason,
 		&response.PaymentToken, &response.PaymentProvider, &response.PaymentReference,
+		&response.ProviderContactPhone,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return PublicBookingSummaryResponse{}, ErrNotFound
@@ -870,11 +871,9 @@ func (r *Repository) GetPublicBookingSummary(ctx context.Context, bookingToken s
 	if reservationExpiredAt != nil {
 		response.ReservationExpiredAt = reservationExpiredAt.UTC().Format(time.RFC3339)
 	}
-	response.DeliveryStatus = PublicBookingDeliveryStatus{
-		ProviderInApp:    "available",
-		CustomerEmail:    "not_sent",
-		CustomerWhatsApp: consentDeliveryStatus(response.WhatsAppConsent),
-		CustomerSMS:      consentDeliveryStatus(response.SMSConsent),
+	response.DeliveryStatus, err = r.loadBookingDeliveryStatus(ctx, bookingID)
+	if err != nil {
+		return PublicBookingSummaryResponse{}, err
 	}
 	if !publicBookingSecured(response) {
 		response.VirtualJoinURL = ""
@@ -893,11 +892,4 @@ func publicBookingAgreementSatisfied(booking PublicBookingSummaryResponse) bool 
 
 func publicBookingSecured(booking PublicBookingSummaryResponse) bool {
 	return initialBookingObligationSatisfied(booking.PaymentStatus) && publicBookingAgreementSatisfied(booking)
-}
-
-func consentDeliveryStatus(consented bool) string {
-	if consented {
-		return "consented_not_sent"
-	}
-	return "not_requested"
 }

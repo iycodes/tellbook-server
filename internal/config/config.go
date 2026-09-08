@@ -37,6 +37,8 @@ type Config struct {
 	InboxAISemiPilotReplyDelay            time.Duration
 	InboxAIAutopilotPaymentWindow         time.Duration
 	TessaAIEnabled                        bool
+	TessaWhatsAppLinkingEnabled           bool
+	TessaWhatsAppConversationsEnabled     bool
 	TessaAIProviderAllowlist              []string
 	TessaAIPrimaryProvider                string
 	TessaAIFallbackProvider               string
@@ -126,6 +128,13 @@ type Config struct {
 	AuthCookieSecure                      bool
 	AuthRefreshTokenTTL                   time.Duration
 	AuthBcryptCost                        int
+	AuthEmailEnabled                      bool
+	AuthWhatsAppEnabled                   bool
+	AuthDeliveryEncryptionKeys            string
+	AuthDeliveryActiveKey                 string
+	AuthDestinationHMACKey                string
+	AuthDeliveryConcurrency               int
+	AuthDeliveryTimeout                   time.Duration
 	R2PrivateBucketName                   string
 	R2PublicBucketName                    string
 	R2AccountID                           string
@@ -134,7 +143,13 @@ type Config struct {
 	R2SecretAccessKey                     string
 	R2PublicBucketBaseURL                 string
 	NotificationEmailEnabled              bool
+	NotificationEmailConcurrency          int
+	NotificationEmailTimeout              time.Duration
+	WelcomeEmailEnabled                   bool
+	WelcomeEmailConcurrency               int
+	WelcomeEmailTimeout                   time.Duration
 	NotificationWhatsAppEnabled           bool
+	WhatsAppWorkerConcurrency             int
 	NotificationPlannerConcurrency        int
 	NotificationDestinationHMACKey        string
 	MetaAppID                             string
@@ -353,6 +368,8 @@ func Load() (Config, error) {
 		InboxAISemiPilotReplyDelay:            getEnvDuration("INBOX_AI_SEMI_PILOT_REPLY_DELAY", 800*time.Millisecond),
 		InboxAIAutopilotPaymentWindow:         getEnvDuration("INBOX_AI_AUTOPILOT_PAYMENT_WINDOW", 30*time.Minute),
 		TessaAIEnabled:                        tessaAIEnabled,
+		TessaWhatsAppLinkingEnabled:           getEnvBool("TESSA_WHATSAPP_LINKING_ENABLED", false),
+		TessaWhatsAppConversationsEnabled:     getEnvBool("TESSA_WHATSAPP_CONVERSATIONS_ENABLED", false),
 		TessaAIProviderAllowlist:              splitCSV(os.Getenv("TESSA_AI_PROVIDER_ALLOWLIST")),
 		TessaAIPrimaryProvider:                normalizeAIProvider(getEnv("TESSA_AI_PRIMARY_PROVIDER", AIProviderSelfHosted)),
 		TessaAIFallbackProvider:               normalizeAIProvider(os.Getenv("TESSA_AI_FALLBACK_PROVIDER")),
@@ -442,6 +459,13 @@ func Load() (Config, error) {
 		AuthCookieSecure:                      getEnvBool("AUTH_COOKIE_SECURE", false),
 		AuthRefreshTokenTTL:                   getEnvDuration("AUTH_REFRESH_TOKEN_TTL", 24*30*time.Hour),
 		AuthBcryptCost:                        getEnvInt("AUTH_BCRYPT_COST", 12),
+		AuthEmailEnabled:                      getEnvBool("AUTH_EMAIL_ENABLED", false),
+		AuthWhatsAppEnabled:                   getEnvBool("AUTH_WHATSAPP_ENABLED", false),
+		AuthDeliveryEncryptionKeys:            strings.TrimSpace(os.Getenv("AUTH_DELIVERY_ENCRYPTION_KEYS")),
+		AuthDeliveryActiveKey:                 strings.TrimSpace(os.Getenv("AUTH_DELIVERY_ACTIVE_KEY")),
+		AuthDestinationHMACKey:                strings.TrimSpace(os.Getenv("AUTH_DESTINATION_HMAC_KEY")),
+		AuthDeliveryConcurrency:               getEnvInt("AUTH_DELIVERY_CONCURRENCY", 4),
+		AuthDeliveryTimeout:                   getEnvDuration("AUTH_DELIVERY_TIMEOUT", 30*time.Second),
 		R2PrivateBucketName:                   strings.TrimSpace(os.Getenv("R2_PRIVATE_BUCKET_NAME")),
 		R2PublicBucketName:                    strings.TrimSpace(os.Getenv("R2_PUBLIC_BUCKET_NAME")),
 		R2AccountID:                           strings.TrimSpace(os.Getenv("R2_ACCOUNT_ID")),
@@ -450,7 +474,13 @@ func Load() (Config, error) {
 		R2SecretAccessKey:                     strings.TrimSpace(os.Getenv("R2_SECRET_ACCESS_KEY")),
 		R2PublicBucketBaseURL:                 strings.TrimSpace(os.Getenv("R2_PUBLIC_BUCKET_BASE_URL")),
 		NotificationEmailEnabled:              getEnvBool("NOTIFICATION_EMAIL_ENABLED", false),
+		NotificationEmailConcurrency:          getEnvInt("NOTIFICATION_EMAIL_CONCURRENCY", 4),
+		NotificationEmailTimeout:              getEnvDuration("NOTIFICATION_EMAIL_TIMEOUT", 30*time.Second),
+		WelcomeEmailEnabled:                   getEnvBool("WELCOME_EMAIL_ENABLED", false),
+		WelcomeEmailConcurrency:               getEnvInt("WELCOME_EMAIL_CONCURRENCY", 2),
+		WelcomeEmailTimeout:                   getEnvDuration("WELCOME_EMAIL_TIMEOUT", 30*time.Second),
 		NotificationWhatsAppEnabled:           getEnvBool("NOTIFICATION_WHATSAPP_ENABLED", false),
+		WhatsAppWorkerConcurrency:             getEnvInt("WHATSAPP_WORKER_CONCURRENCY", 4),
 		NotificationPlannerConcurrency:        getEnvInt("NOTIFICATION_PLANNER_CONCURRENCY", 4),
 		NotificationDestinationHMACKey:        strings.TrimSpace(os.Getenv("NOTIFICATION_DESTINATION_HMAC_KEY")),
 		MetaAppID:                             strings.TrimSpace(os.Getenv("META_APP_ID")),
@@ -813,6 +843,20 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("AUTH_COOKIE_SECURE must be true in production")
 		}
 	}
+	if cfg.AuthDeliveryConcurrency < 1 || cfg.AuthDeliveryConcurrency > 32 {
+		return Config{}, fmt.Errorf("AUTH_DELIVERY_CONCURRENCY must be between 1 and 32")
+	}
+	if cfg.AuthDeliveryTimeout < time.Second || cfg.AuthDeliveryTimeout > 2*time.Minute {
+		return Config{}, fmt.Errorf("AUTH_DELIVERY_TIMEOUT must be between 1s and 2m")
+	}
+	if cfg.AuthEmailEnabled || cfg.AuthWhatsAppEnabled {
+		if len(cfg.AuthDestinationHMACKey) < 32 {
+			return Config{}, fmt.Errorf("AUTH_DESTINATION_HMAC_KEY must be at least 32 bytes when auth delivery is enabled")
+		}
+		if _, err := secure.ParseKeyring(cfg.AuthDeliveryEncryptionKeys, cfg.AuthDeliveryActiveKey); err != nil {
+			return Config{}, fmt.Errorf("AUTH_DELIVERY_ENCRYPTION_KEYS: %w", err)
+		}
+	}
 	if err := validatePublicBaseURL(cfg.ClientPublicBaseURL); err != nil {
 		return Config{}, fmt.Errorf("CLIENT_PUBLIC_BASE_URL: %w", err)
 	}
@@ -847,14 +891,30 @@ func Load() (Config, error) {
 	}
 	runsAPI := cfg.ProcessRole == ProcessRoleAPI || cfg.ProcessRole == ProcessRoleAll
 	runsNotificationWorkers := cfg.ProcessRole == ProcessRoleWorker || cfg.ProcessRole == ProcessRoleAll
-	webhookRequested := cfg.MetaAppSecret != "" || cfg.MetaVerifyToken != ""
+	if cfg.TessaWhatsAppLinkingEnabled && (!cfg.TessaAIEnabled || !cfg.MetaWebhookConfigured() || !cfg.WhatsAppSendConfigured() || !cfg.NotificationContactFoundationConfigured()) {
+		return Config{}, fmt.Errorf("TESSA_WHATSAPP_LINKING_ENABLED requires Tessa, Meta webhook, WhatsApp sender and contact configuration")
+	}
+	if cfg.TessaWhatsAppConversationsEnabled {
+		if !cfg.TessaWhatsAppLinkingEnabled {
+			return Config{}, fmt.Errorf("TESSA_WHATSAPP_CONVERSATIONS_ENABLED requires TESSA_WHATSAPP_LINKING_ENABLED")
+		}
+		origin, err := url.Parse(cfg.ClientPublicBaseURL)
+		if err != nil || origin.Scheme != "https" || origin.Hostname() == "" || origin.User != nil || origin.RawQuery != "" || origin.Fragment != "" || (origin.Path != "" && origin.Path != "/") {
+			return Config{}, fmt.Errorf("TESSA_WHATSAPP_CONVERSATIONS_ENABLED requires an HTTPS CLIENT_PUBLIC_BASE_URL origin")
+		}
+	}
+	if runsNotificationWorkers && cfg.AuthEmailEnabled && !cfg.SMTPConfigured() {
+		return Config{}, fmt.Errorf("SMTP_USERNAME and SMTP_PASSWORD are required when email authentication is enabled")
+	}
+	webhookRequested := cfg.MetaAppSecret != "" || cfg.MetaVerifyToken != "" || cfg.AuthWhatsAppEnabled
 	if runsAPI && webhookRequested && !cfg.MetaWebhookConfigured() {
 		return Config{}, fmt.Errorf("META_APP_SECRET, META_VERIFY_TOKEN, WHATSAPP_BUSINESS_ACCOUNT_ID, and WABA_PHONE_NUMBER_ID must be configured together for the API webhook")
 	}
-	if runsAPI && webhookRequested && !cfg.NotificationContactFoundationConfigured() {
+	contactFoundationRequested := cfg.NotificationDestinationHMACKey != "" || cfg.WABABusinessPhoneE164 != ""
+	if runsAPI && contactFoundationRequested && !cfg.NotificationContactFoundationConfigured() {
 		return Config{}, fmt.Errorf("NOTIFICATION_DESTINATION_HMAC_KEY and WABA_BUSINESS_PHONE_E164 are required for WhatsApp verification and control messages")
 	}
-	sendingRequested := cfg.WABAToken != "" || len(cfg.WhatsAppEnabledTemplateKeys) > 0 || cfg.NotificationWhatsAppEnabled
+	sendingRequested := cfg.WABAToken != "" || len(cfg.WhatsAppEnabledTemplateKeys) > 0 || cfg.NotificationWhatsAppEnabled || cfg.AuthWhatsAppEnabled
 	if runsNotificationWorkers && sendingRequested && !cfg.WhatsAppSendConfigured() {
 		return Config{}, fmt.Errorf("WABA_TOKEN, WHATSAPP_BUSINESS_ACCOUNT_ID, and WABA_PHONE_NUMBER_ID must be configured together for WhatsApp workers")
 	}
@@ -870,13 +930,38 @@ func Load() (Config, error) {
 	if cfg.NotificationDestinationHMACKey != "" && len(cfg.NotificationDestinationHMACKey) < 32 {
 		return Config{}, fmt.Errorf("NOTIFICATION_DESTINATION_HMAC_KEY must be at least 32 bytes")
 	}
+	if runsNotificationWorkers && (cfg.NotificationWhatsAppEnabled || cfg.NotificationDestinationHMACKey != "") &&
+		len(cfg.NotificationDestinationHMACKey) < 32 {
+		return Config{}, fmt.Errorf("NOTIFICATION_DESTINATION_HMAC_KEY must be at least 32 bytes for WhatsApp status processing")
+	}
 	if cfg.NotificationPlannerConcurrency < 1 || cfg.NotificationPlannerConcurrency > 32 {
 		return Config{}, fmt.Errorf("NOTIFICATION_PLANNER_CONCURRENCY must be between 1 and 32")
 	}
-	if cfg.NotificationWhatsAppEnabled && runsNotificationWorkers {
+	if cfg.NotificationEmailConcurrency < 1 || cfg.NotificationEmailConcurrency > 32 {
+		return Config{}, fmt.Errorf("NOTIFICATION_EMAIL_CONCURRENCY must be between 1 and 32")
+	}
+	if cfg.WelcomeEmailConcurrency < 1 || cfg.WelcomeEmailConcurrency > 32 {
+		return Config{}, fmt.Errorf("WELCOME_EMAIL_CONCURRENCY must be between 1 and 32")
+	}
+	if cfg.WhatsAppWorkerConcurrency < 1 || cfg.WhatsAppWorkerConcurrency > 32 {
+		return Config{}, fmt.Errorf("WHATSAPP_WORKER_CONCURRENCY must be between 1 and 32")
+	}
+	if cfg.NotificationEmailTimeout < time.Second || cfg.NotificationEmailTimeout > 2*time.Minute {
+		return Config{}, fmt.Errorf("NOTIFICATION_EMAIL_TIMEOUT must be between 1s and 2m")
+	}
+	if cfg.WelcomeEmailTimeout < time.Second || cfg.WelcomeEmailTimeout > 2*time.Minute {
+		return Config{}, fmt.Errorf("WELCOME_EMAIL_TIMEOUT must be between 1s and 2m")
+	}
+	if (cfg.NotificationEmailEnabled || cfg.NotificationWhatsAppEnabled) && runsNotificationWorkers {
 		if len(cfg.NotificationDestinationHMACKey) < 32 {
-			return Config{}, fmt.Errorf("NOTIFICATION_DESTINATION_HMAC_KEY must be at least 32 bytes when WhatsApp notifications are enabled")
+			return Config{}, fmt.Errorf("NOTIFICATION_DESTINATION_HMAC_KEY must be at least 32 bytes when outbound notifications are enabled")
 		}
+	}
+	if cfg.NotificationEmailEnabled && runsNotificationWorkers && !cfg.SMTPConfigured() {
+		return Config{}, fmt.Errorf("SMTP_USERNAME and SMTP_PASSWORD are required when email notifications are enabled")
+	}
+	if cfg.WelcomeEmailEnabled && runsNotificationWorkers && !cfg.SMTPConfigured() {
+		return Config{}, fmt.Errorf("SMTP_USERNAME and SMTP_PASSWORD are required when welcome emails are enabled")
 	}
 	if cfg.PaymentsEnvironment != "" && cfg.PaymentsEnvironment != "test" && cfg.PaymentsEnvironment != "live" {
 		return Config{}, fmt.Errorf("PAYMENTS_ENVIRONMENT must be test or live")
@@ -985,6 +1070,10 @@ func (c Config) MetaWebhookConfigured() bool {
 
 func (c Config) WhatsAppSendConfigured() bool {
 	return c.WABAToken != "" && c.WhatsAppBusinessAccountID != "" && c.WABAPhoneNumberID != ""
+}
+
+func (c Config) SMTPConfigured() bool {
+	return strings.TrimSpace(c.SMTPUsername) != "" && strings.TrimSpace(c.SMTPPassword) != ""
 }
 
 func (c Config) NotificationContactFoundationConfigured() bool {

@@ -51,17 +51,16 @@ func (r *Repository) PrepareMarketplaceInboxAIBookingProposal(
 	if err != nil {
 		return InboxAIBookingActionResult{}, err
 	}
-	var fullName, email, phone, whatsapp string
+	var fullName, email, phone string
 	var customerDetailsRevision time.Time
 	if err := r.db.QueryRow(ctx, `
 		SELECT COALESCE(full_name,''),
 			CASE WHEN email_verified_at IS NOT NULL THEN COALESCE(email,'') ELSE '' END,
 			CASE WHEN phone_verified_at IS NOT NULL THEN COALESCE(phone_e164,'') ELSE '' END,
-			CASE WHEN whatsapp_verified_at IS NOT NULL THEN COALESCE(whatsapp_e164,'') ELSE '' END,
 			updated_at
 		FROM marketplace_customers WHERE id=$1
 	`, marketplaceCustomerID).Scan(
-		&fullName, &email, &phone, &whatsapp, &customerDetailsRevision,
+		&fullName, &email, &phone, &customerDetailsRevision,
 	); err != nil {
 		return InboxAIBookingActionResult{}, fmt.Errorf("load proposal customer details: %w", err)
 	}
@@ -143,7 +142,7 @@ func (r *Repository) PrepareMarketplaceInboxAIBookingProposal(
 		ServiceID: serviceID, StartsAt: startsAt,
 		Customer: BookingCustomerDetails{
 			FullName: strings.TrimSpace(fullName), Email: strings.TrimSpace(email),
-			Phone: normalizeInboxAIPhone(phone, whatsapp),
+			Phone: phone,
 		},
 		CustomerLocationToken: strings.TrimSpace(input.CustomerLocationToken),
 	})

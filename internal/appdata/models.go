@@ -151,6 +151,7 @@ type BookingDetailsResponse struct {
 	PaymentHistory         []BookingDetailPaymentItem    `json:"payment_history"`
 	RefundHistory          []BookingDetailRefundItem     `json:"refund_history"`
 	ChangeHistory          []BookingDetailEvent          `json:"change_history"`
+	DeliveryStatus         PublicBookingDeliveryStatus   `json:"delivery_status"`
 	AllowedActions         ProviderBookingAllowedActions `json:"allowed_actions"`
 }
 
@@ -446,6 +447,7 @@ type PublicProfileResponse struct {
 }
 
 type PublicProfile struct {
+	CustomerContactPhone    string  `json:"customer_contact_phone,omitempty"`
 	ClientID                string  `json:"client_id"`
 	BusinessName            string  `json:"business_name"`
 	HandleSlug              string  `json:"handle_slug"`
@@ -626,6 +628,7 @@ type CreatePublicBookingInput struct {
 }
 
 type PublicBookingSummaryResponse struct {
+	ProviderContactPhone         string                      `json:"provider_contact_phone,omitempty"`
 	BookingID                    string                      `json:"-"`
 	BookingToken                 string                      `json:"booking_token"`
 	Source                       string                      `json:"source"`
@@ -697,10 +700,18 @@ type CreatePublicBookingCheckoutInput struct {
 }
 
 type PublicBookingDeliveryStatus struct {
-	ProviderInApp    string `json:"provider_in_app"`
-	CustomerEmail    string `json:"customer_email"`
-	CustomerWhatsApp string `json:"customer_whatsapp"`
-	CustomerSMS      string `json:"customer_sms"`
+	ProviderInApp    BookingDeliveryChannelStatus `json:"provider_in_app"`
+	ProviderEmail    BookingDeliveryChannelStatus `json:"provider_email"`
+	ProviderWhatsApp BookingDeliveryChannelStatus `json:"provider_whatsapp"`
+	CustomerEmail    BookingDeliveryChannelStatus `json:"customer_email"`
+	CustomerWhatsApp BookingDeliveryChannelStatus `json:"customer_whatsapp"`
+	CustomerSMS      BookingDeliveryChannelStatus `json:"customer_sms"`
+}
+
+type BookingDeliveryChannelStatus struct {
+	Requested bool   `json:"requested"`
+	Eligible  bool   `json:"eligible"`
+	Status    string `json:"status"`
 }
 
 type PublicBookingCheckoutStateResponse struct {

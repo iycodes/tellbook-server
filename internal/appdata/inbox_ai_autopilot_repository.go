@@ -211,14 +211,13 @@ func loadInboxAIMissingCustomerFields(
 	q inboxQueryer,
 	marketplaceCustomerID uuid.UUID,
 ) ([]string, error) {
-	var fullName, email, phone, whatsapp string
+	var fullName, email, phone string
 	if err := q.QueryRow(ctx, `
 		SELECT COALESCE(full_name,''),
 			CASE WHEN email_verified_at IS NOT NULL THEN COALESCE(email,'') ELSE '' END,
-			CASE WHEN phone_verified_at IS NOT NULL THEN COALESCE(phone_e164,'') ELSE '' END,
-			CASE WHEN whatsapp_verified_at IS NOT NULL THEN COALESCE(whatsapp_e164,'') ELSE '' END
+			CASE WHEN phone_verified_at IS NOT NULL THEN COALESCE(phone_e164,'') ELSE '' END
 		FROM marketplace_customers WHERE id=$1
-	`, marketplaceCustomerID).Scan(&fullName, &email, &phone, &whatsapp); err != nil {
+	`, marketplaceCustomerID).Scan(&fullName, &email, &phone); err != nil {
 		return nil, fmt.Errorf("load authenticated booking details: %w", err)
 	}
 	missing := make([]string, 0, 3)
@@ -228,7 +227,7 @@ func loadInboxAIMissingCustomerFields(
 	if strings.TrimSpace(email) == "" {
 		missing = append(missing, "email")
 	}
-	if strings.TrimSpace(phone) == "" && strings.TrimSpace(whatsapp) == "" {
+	if strings.TrimSpace(phone) == "" {
 		missing = append(missing, "phone")
 	}
 	return missing, nil
@@ -462,14 +461,6 @@ func validateCurrentInboxAIBookingAction(
 		return ErrInboxAIProposalStale
 	}
 	return nil
-}
-
-func normalizeInboxAIPhone(phone, whatsapp string) string {
-	phone = strings.TrimSpace(phone)
-	if phone != "" {
-		return phone
-	}
-	return strings.TrimSpace(whatsapp)
 }
 
 func normalizedInboxAIProposalDate(raw string) (time.Time, error) {

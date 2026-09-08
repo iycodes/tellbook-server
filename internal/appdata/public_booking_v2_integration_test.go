@@ -288,7 +288,10 @@ func TestPublicQuoteBookingRoundTrip(t *testing.T) {
 	if booking.TotalAmountMinor != quote.TotalAmountMinor || booking.FulfillmentMode != "provider_location" {
 		t.Fatalf("booking does not match quote: %#v %#v", booking, quote)
 	}
-	if booking.Source != "marketplace" || !booking.WhatsAppConsent || booking.DeliveryStatus.CustomerWhatsApp != "consented_not_sent" {
+	if booking.Source != "marketplace" || !booking.WhatsAppConsent ||
+		!booking.DeliveryStatus.CustomerWhatsApp.Requested ||
+		booking.DeliveryStatus.CustomerWhatsApp.Eligible ||
+		booking.DeliveryStatus.CustomerWhatsApp.Status != "not_requested" {
 		t.Fatalf("booking origin or consent was not preserved: %#v", booking)
 	}
 	if !booking.EmailReminderConsent {

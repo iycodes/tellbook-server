@@ -32,7 +32,8 @@ func TestWebhookRepositoryStoresReceiptsIdempotently(t *testing.T) {
 		{
 			DedupeKey: statusKey, BusinessID: "222", PhoneNumberID: "333", EventKind: "status",
 			MessageID: "wamid.integration-status", MessageStatus: "sent",
-			ProviderTimestamp: &timestamp, ProcessingStatus: "pending",
+			ProviderTimestamp: &timestamp, CorrelationID: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+			ProcessingStatus: "pending",
 		},
 		{
 			DedupeKey: inboundKey, BusinessID: "222", PhoneNumberID: "333", EventKind: "inbound_message",
@@ -47,16 +48,21 @@ func TestWebhookRepositoryStoresReceiptsIdempotently(t *testing.T) {
 	}
 	var count int
 	var pendingProcessedAt, inboundProcessedAt *time.Time
+	var correlation string
 	if err := pool.QueryRow(ctx, `
 		SELECT COUNT(*),
 			MAX(processed_at) FILTER (WHERE dedupe_key=$1),
-			MAX(processed_at) FILTER (WHERE dedupe_key=$2)
+			MAX(processed_at) FILTER (WHERE dedupe_key=$2),
+			MAX(correlation_id) FILTER (WHERE dedupe_key=$1)
 		FROM meta_whatsapp_webhook_receipts
 		WHERE dedupe_key IN ($1,$2)
-	`, statusKey, inboundKey).Scan(&count, &pendingProcessedAt, &inboundProcessedAt); err != nil {
+	`, statusKey, inboundKey).Scan(&count, &pendingProcessedAt, &inboundProcessedAt, &correlation); err != nil {
 		t.Fatal(err)
 	}
 	if count != 2 || pendingProcessedAt != nil || inboundProcessedAt == nil {
 		t.Fatalf("stored rows count=%d pending_processed=%v inbound_processed=%v", count, pendingProcessedAt, inboundProcessedAt)
+	}
+	if correlation != "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" {
+		t.Fatalf("stored status correlation = %q", correlation)
 	}
 }

@@ -29,10 +29,18 @@ type Repository struct {
 	db               *pgxpool.Pool
 	destinationKey   []byte
 	enabledTemplates map[whatsapp.TemplateKey]struct{}
+	emailEnabled     bool
+	whatsAppEnabled  bool
 	now              func() time.Time
 }
 
-func NewRepository(db *pgxpool.Pool, destinationHMACKey string, enabledTemplateKeys []string) (*Repository, error) {
+func NewRepository(
+	db *pgxpool.Pool,
+	destinationHMACKey string,
+	enabledTemplateKeys []string,
+	emailEnabled bool,
+	whatsAppEnabled bool,
+) (*Repository, error) {
 	if db == nil || len(destinationHMACKey) < 32 {
 		return nil, errors.New("notification planner repository is unavailable")
 	}
@@ -49,6 +57,7 @@ func NewRepository(db *pgxpool.Pool, destinationHMACKey string, enabledTemplateK
 	}
 	return &Repository{
 		db: db, destinationKey: []byte(destinationHMACKey), enabledTemplates: enabled,
+		emailEnabled: emailEnabled, whatsAppEnabled: whatsAppEnabled,
 		now: func() time.Time { return time.Now().UTC() },
 	}, nil
 }
@@ -56,6 +65,7 @@ func NewRepository(db *pgxpool.Pool, destinationHMACKey string, enabledTemplateK
 type EventJob struct {
 	BookingEventID uuid.UUID
 	EventSequence  int64
+	Origin         string
 	AttemptCount   int
 	LeaseOwner     string
 }
@@ -122,7 +132,7 @@ func (r *Repository) ClaimEventJobs(ctx context.Context, owner string, batch int
 		SET status='processing',attempt_count=attempt_count+1,lease_owner=$2,
 			lease_expires_at=NOW()+($3::bigint*INTERVAL '1 millisecond'),updated_at=NOW()
 		FROM claimable WHERE job.booking_event_id=claimable.booking_event_id
-		RETURNING job.booking_event_id,job.event_sequence,job.attempt_count,job.lease_owner
+		RETURNING job.booking_event_id,job.event_sequence,job.origin,job.attempt_count,job.lease_owner
 	`, batch, owner, lease.Milliseconds())
 	if err != nil {
 		return nil, fmt.Errorf("claim notification event jobs: %w", err)
@@ -131,7 +141,9 @@ func (r *Repository) ClaimEventJobs(ctx context.Context, owner string, batch int
 	jobs := make([]EventJob, 0, batch)
 	for rows.Next() {
 		var job EventJob
-		if err := rows.Scan(&job.BookingEventID, &job.EventSequence, &job.AttemptCount, &job.LeaseOwner); err != nil {
+		if err := rows.Scan(
+			&job.BookingEventID, &job.EventSequence, &job.Origin, &job.AttemptCount, &job.LeaseOwner,
+		); err != nil {
 			return nil, fmt.Errorf("scan notification event job: %w", err)
 		}
 		jobs = append(jobs, job)

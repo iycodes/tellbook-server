@@ -76,6 +76,7 @@ func TestGenerateJSONParsesFencedJSON(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"choices": []map[string]any{
 				{
+					"finish_reason": "stop",
 					"message": map[string]any{
 						"content": "```json\n{\"message\":\"hello\"}\n```",
 					},
@@ -135,7 +136,8 @@ func TestGenerateJSONSchemaSendsStrictApplicationSchema(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"choices": []map[string]any{{
-				"message": map[string]any{"content": `{"protocol_version":1}`},
+				"finish_reason": "stop",
+				"message":       map[string]any{"content": `{"protocol_version":1}`},
 			}},
 		})
 	}))

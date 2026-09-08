@@ -109,6 +109,9 @@ func (r *Repository) AuthorizeDispatch(ctx context.Context, delivery Delivery) (
 	if err := tx.QueryRow(ctx, `
 		SELECT id FROM booking_domain_events WHERE booking_id=$1 ORDER BY sequence DESC LIMIT 1
 	`, current.BookingID).Scan(&latestEventID); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return Delivery{}, fmt.Errorf("load latest booking event for dispatch: %w", err)
+		}
 		if cancelErr := r.cancelUnauthorizedTx(ctx, tx, current, "booking_event_missing"); cancelErr != nil {
 			return Delivery{}, cancelErr
 		}
@@ -118,7 +121,10 @@ func (r *Repository) AuthorizeDispatch(ctx context.Context, delivery Delivery) (
 	if err != nil {
 		return Delivery{}, err
 	}
-	authorized, code := r.deliveryAuthorizedTx(ctx, tx, current, state)
+	authorized, code, err := r.deliveryAuthorizedTx(ctx, tx, current, state)
+	if err != nil {
+		return Delivery{}, err
+	}
 	if !authorized {
 		if err := r.cancelUnauthorizedTx(ctx, tx, current, code); err != nil {
 			return Delivery{}, err
@@ -129,10 +135,14 @@ func (r *Repository) AuthorizeDispatch(ctx context.Context, delivery Delivery) (
 		UPDATE notification_deliveries
 		SET status='dispatching',lease_owner='',lease_expires_at=NULL,
 			dispatch_authorized_at=NOW(),authorized_booking_event_sequence=$3,
-			authorized_preference_revision=$4,last_error_code='',updated_at=NOW()
+			authorized_preference_revision=$4,reconcile_after=NOW()+INTERVAL '15 minutes',
+			last_error_code='',updated_at=NOW()
 		WHERE id=$1 AND status='processing' AND lease_owner=$2
 	`, current.ID, current.LeaseOwner, state.CurrentBookingEventSequence, state.ProviderPreferenceRevision)
-	if err != nil || tag.RowsAffected() != 1 {
+	if err != nil {
+		return Delivery{}, fmt.Errorf("authorize notification dispatch: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
 		return Delivery{}, ErrDispatchNotAuthorized
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -148,7 +158,7 @@ func (r *Repository) deliveryAuthorizedTx(
 	tx pgx.Tx,
 	delivery Delivery,
 	state bookingState,
-) (bool, string) {
+) (bool, string, error) {
 	destination := ""
 	preferenceEnabled := false
 	switch delivery.AudienceType + ":" + delivery.Channel {
@@ -163,53 +173,68 @@ func (r *Repository) deliveryAuthorizedTx(
 		destination = state.CustomerEmail
 		preferenceEnabled = state.ConsentPolicyRevision == 1 && state.MarketplaceBookingEmail
 		if delivery.NotificationType == "appointment_reminder" {
-			preferenceEnabled = preferenceEnabled && state.EmailReminderConsent
+			preferenceEnabled = state.ConsentPolicyRevision == 1 && state.MarketplaceReminderEmail &&
+				state.EmailReminderConsent
 		}
 	case "customer:whatsapp":
+		if delivery.TemplateKey == string(whatsapp.TemplateUserReminder) && state.ProviderContactPhone == "" {
+			return false, "provider_contact_unavailable", nil
+		}
 		destination = state.CustomerWhatsApp
-		preferenceEnabled = state.ConsentPolicyRevision == 1 && state.MarketplaceBookingWhatsApp &&
+		preferenceEnabled = state.ConsentPolicyRevision == 1 && state.MarketplaceReminderWhatsApp &&
 			state.WhatsAppConsent && r.templateEnabled(whatsapp.TemplateKey(delivery.TemplateKey))
 	}
 	if !preferenceEnabled || destination == "" {
-		return false, "preference_or_destination_changed"
+		return false, "preference_or_destination_changed", nil
 	}
 	expectedHMAC := r.destinationFingerprint(delivery.Channel, destination)
 	if !hmacEqual(expectedHMAC, delivery.DestinationHMAC) {
-		return false, "destination_changed"
+		return false, "destination_changed", nil
 	}
 	var suppressed bool
 	if err := tx.QueryRow(ctx, `
 		SELECT EXISTS (SELECT 1 FROM notification_contact_suppressions
 		 WHERE channel=$1 AND destination_hmac=$2)
-	`, delivery.Channel, delivery.DestinationHMAC).Scan(&suppressed); err != nil || suppressed {
-		return false, "destination_suppressed"
+	`, delivery.Channel, delivery.DestinationHMAC).Scan(&suppressed); err != nil {
+		return false, "", fmt.Errorf("check notification suppression at dispatch: %w", err)
+	}
+	if suppressed {
+		return false, "destination_suppressed", nil
 	}
 	switch delivery.NotificationType {
 	case "provider_new_booking":
 		if !providerBookingStatusEligible(state.Status) || !bookingSecured(state) {
-			return false, "booking_not_secured"
+			return false, "booking_not_secured", nil
+		}
+	case "customer_booking_secured":
+		if delivery.AudienceType != "customer" || !providerBookingStatusEligible(state.Status) || !bookingSecured(state) {
+			return false, "booking_not_secured", nil
 		}
 	case "appointment_reminder":
 		if delivery.ReminderOccurrenceAt == nil || !delivery.ReminderOccurrenceAt.Equal(state.StartAt) ||
 			!bookingSecured(state) || !state.StartAt.After(r.now()) || isTerminalBookingStatus(state.Status) {
-			return false, "reminder_no_longer_eligible"
+			return false, "reminder_no_longer_eligible", nil
 		}
 		if delivery.AudienceType == "customer" && state.Status != "confirmed" {
-			return false, "customer_reminder_not_confirmed"
+			return false, "customer_reminder_not_confirmed", nil
 		}
 	case "customer_booking_received":
 		if isTerminalBookingStatus(state.Status) {
-			return false, "booking_terminal"
+			return false, "booking_terminal", nil
 		}
 	case "booking_rescheduled", "booking_cancelled", "booking_expired",
 		"payment_satisfied", "payment_failed", "payment_refunded", "payment_action_required":
-		if current, code := materialEventStillCurrentTx(ctx, tx, delivery, state); !current {
-			return false, code
+		current, code, err := materialEventStillCurrentTx(ctx, tx, delivery, state)
+		if err != nil {
+			return false, "", err
+		}
+		if !current {
+			return false, code, nil
 		}
 	default:
-		return false, "unsupported_notification_type"
+		return false, "unsupported_notification_type", nil
 	}
-	return true, ""
+	return true, "", nil
 }
 
 func materialEventStillCurrentTx(
@@ -217,36 +242,48 @@ func materialEventStillCurrentTx(
 	tx pgx.Tx,
 	delivery Delivery,
 	state bookingState,
-) (bool, string) {
+) (bool, string, error) {
 	if delivery.BookingEventID == nil {
-		return false, "booking_event_missing"
+		return false, "booking_event_missing", nil
 	}
 	var rawPayload []byte
 	if err := tx.QueryRow(ctx, `
 		SELECT payload FROM booking_domain_events WHERE id=$1 AND booking_id=$2
 	`, *delivery.BookingEventID, delivery.BookingID).Scan(&rawPayload); err != nil {
-		return false, "booking_event_missing"
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, "booking_event_missing", nil
+		}
+		return false, "", fmt.Errorf("load notification source event at dispatch: %w", err)
 	}
 	var payload eventPayload
 	if err := json.Unmarshal(rawPayload, &payload); err != nil {
-		return false, "booking_event_invalid"
+		return false, "booking_event_invalid", nil
 	}
 	switch delivery.NotificationType {
 	case "booking_rescheduled":
 		return !payload.PreviousStartsAt.IsZero() && payload.StartsAt.Equal(state.StartAt) &&
 				!payload.PreviousStartsAt.Equal(payload.StartsAt) && !isTerminalBookingStatus(state.Status),
-			"booking_changed_after_planning"
+			"booking_changed_after_planning", nil
 	case "booking_cancelled", "booking_expired":
-		currentType := eventNotificationType(state, bookingEvent{Payload: payload})
-		return payload.Status == state.Status && currentType == delivery.NotificationType,
-			"booking_changed_after_planning"
+		return payload.Status == state.Status && containsNotificationType(
+			eventNotificationTypes(state, bookingEvent{Payload: payload}), delivery.NotificationType,
+		), "booking_changed_after_planning", nil
 	case "payment_satisfied", "payment_failed", "payment_refunded", "payment_action_required":
-		currentType := eventNotificationType(state, bookingEvent{Payload: payload})
-		return payload.PaymentStatus == state.PaymentStatus && currentType == delivery.NotificationType,
-			"booking_changed_after_planning"
+		return payload.PaymentStatus == state.PaymentStatus && containsNotificationType(
+			eventNotificationTypes(state, bookingEvent{Payload: payload}), delivery.NotificationType,
+		), "booking_changed_after_planning", nil
 	default:
-		return false, "unsupported_notification_type"
+		return false, "unsupported_notification_type", nil
 	}
+}
+
+func containsNotificationType(types []string, target string) bool {
+	for _, typeName := range types {
+		if typeName == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Repository) cancelUnauthorizedTx(

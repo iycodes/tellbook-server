@@ -8,14 +8,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math/big"
 	"net/mail"
 	"regexp"
 	"strings"
 	"time"
 
+	"booking/go-server/internal/authchallenge"
 	"booking/go-server/internal/config"
-	"booking/go-server/internal/mailer"
 	"booking/go-server/internal/redisstore"
 
 	"github.com/google/uuid"
@@ -24,27 +23,20 @@ import (
 )
 
 var (
-	ErrInvalidChallenge      = errors.New("verification code is invalid or expired")
-	ErrDeliveryUnavailable   = errors.New("delivery channel is not available yet")
-	ErrChallengeTooSoon      = errors.New("wait before requesting another code")
-	ErrInvalidIdentifier     = errors.New("invalid identifier")
-	ErrCodeDelivery          = errors.New("code delivery failed")
+	ErrInvalidChallenge      = authchallenge.ErrInvalidChallenge
+	ErrDeliveryUnavailable   = authchallenge.ErrUnavailable
+	ErrChallengeTooSoon      = authchallenge.ErrTooSoon
+	ErrInvalidIdentifier     = authchallenge.ErrInvalidIdentifier
 	ErrInvalidPassword       = errors.New("identifier or password is incorrect")
 	ErrWeakPassword          = errors.New("password must be between 8 and 72 characters")
 	ErrIdentityAlreadyLinked = errors.New("identity is already linked to this account")
 	ErrAuthUnavailable       = errors.New("authentication is temporarily unavailable")
 )
 
-const (
-	challengeTTL             = 10 * time.Minute
-	challengeCooldown        = 45 * time.Second
-	maximumChallengeAttempts = 6
-)
-
 type Service struct {
 	repo              *Repository
 	cfg               config.Config
-	mailer            mailer.Sender
+	challenges        *authchallenge.Service
 	dummyPasswordHash []byte
 	sessionCache      interface {
 		CacheGet(context.Context, string, string, any) error
@@ -62,14 +54,14 @@ type Service struct {
 	principalFlight singleflight.Group
 }
 
-func NewService(repo *Repository, cfg config.Config, sender mailer.Sender) *Service {
+func NewService(repo *Repository, cfg config.Config, challenges *authchallenge.Service) *Service {
 	cost := cfg.AuthBcryptCost
 	if cost < bcrypt.MinCost || cost > bcrypt.MaxCost {
 		cost = bcrypt.DefaultCost
 	}
 	dummyHash, _ := bcrypt.GenerateFromPassword([]byte("tellbook-invalid-password-padding"), cost)
 	return &Service{
-		repo: repo, cfg: cfg, mailer: sender, dummyPasswordHash: dummyHash,
+		repo: repo, cfg: cfg, challenges: challenges, dummyPasswordHash: dummyHash,
 		sessionRepo: repo, sessionFallback: make(chan struct{}, 32),
 	}
 }
@@ -91,23 +83,26 @@ func (s *Service) ConfigureSessionCache(
 	s.sessionFallback = make(chan struct{}, fallbackMaxConcurrency)
 }
 
-type StartChallengeResult struct {
-	ChallengeID              uuid.UUID `json:"challenge_id"`
-	IdentifierType           string    `json:"identifier_type"`
-	DeliveryChannel          string    `json:"delivery_channel"`
-	DestinationHint          string    `json:"destination_hint"`
-	ExpiresInSeconds         int       `json:"expires_in_seconds"`
-	ResendAvailableInSeconds int       `json:"resend_available_in_seconds"`
+type StartChallengeResult = authchallenge.Response
+
+func (s *Service) AuthCapabilities() authchallenge.Capabilities {
+	return authchallenge.NewCapabilities(s.challenges, true)
 }
 
 func (s *Service) StartChallenge(ctx context.Context, rawIdentifier, requestedChannel string) (StartChallengeResult, error) {
-	return s.startChallenge(ctx, rawIdentifier, requestedChannel, "sign_in", nil)
+	if s.challenges == nil {
+		return StartChallengeResult{}, ErrDeliveryUnavailable
+	}
+	return s.challenges.Start(ctx, authchallenge.StartRequest{
+		Realm: authchallenge.RealmMarketplaceCustomer, RawIdentifier: rawIdentifier,
+		Channel: requestedChannel, Purpose: authchallenge.PurposeSignIn,
+	})
 }
 
 func (s *Service) StartIdentityLink(ctx context.Context, customerID uuid.UUID, rawIdentifier, requestedChannel string) (StartChallengeResult, error) {
-	identifierType, identifier, channel, err := normalizeIdentifier(rawIdentifier, requestedChannel)
+	identifierType, identifier, channel, err := authchallenge.NormalizeIdentifier(rawIdentifier, requestedChannel)
 	if err != nil {
-		return StartChallengeResult{}, fmt.Errorf("%w: %v", ErrInvalidIdentifier, err)
+		return StartChallengeResult{}, err
 	}
 	owner, ownerErr := s.repo.IdentityOwner(ctx, identifierType, identifier)
 	if ownerErr == nil {
@@ -122,7 +117,7 @@ func (s *Service) StartIdentityLink(ctx context.Context, customerID uuid.UUID, r
 			return StartChallengeResult{}, ErrIdentityAlreadyLinked
 		}
 		// The same phone contact may be verified for the other delivery channel.
-		return s.startNormalizedChallenge(ctx, identifierType, identifier, channel, "link_identity", &customerID)
+		return s.startIdentityLinkChallenge(ctx, identifier, channel, customerID)
 	}
 	if !errors.Is(ownerErr, ErrNotFound) {
 		return StartChallengeResult{}, ownerErr
@@ -132,124 +127,98 @@ func (s *Service) StartIdentityLink(ctx context.Context, customerID uuid.UUID, r
 	} else if !errors.Is(identityErr, ErrNotFound) {
 		return StartChallengeResult{}, identityErr
 	}
-	return s.startNormalizedChallenge(ctx, identifierType, identifier, channel, "link_identity", &customerID)
+	return s.startIdentityLinkChallenge(ctx, identifier, channel, customerID)
 }
 
-func (s *Service) startChallenge(ctx context.Context, rawIdentifier, requestedChannel, purpose string, targetCustomerID *uuid.UUID) (StartChallengeResult, error) {
-	identifierType, identifier, channel, err := normalizeIdentifier(rawIdentifier, requestedChannel)
-	if err != nil {
-		return StartChallengeResult{}, fmt.Errorf("%w: %v", ErrInvalidIdentifier, err)
-	}
-	return s.startNormalizedChallenge(ctx, identifierType, identifier, channel, purpose, targetCustomerID)
-}
-
-func (s *Service) startNormalizedChallenge(ctx context.Context, identifierType, identifier, channel, purpose string, targetCustomerID *uuid.UUID) (StartChallengeResult, error) {
-	if channel != "email" {
+func (s *Service) startIdentityLinkChallenge(ctx context.Context, identifier, channel string, customerID uuid.UUID) (StartChallengeResult, error) {
+	if s.challenges == nil {
 		return StartChallengeResult{}, ErrDeliveryUnavailable
 	}
-	if s.mailer == nil || !s.mailer.Enabled() {
-		return StartChallengeResult{}, ErrCodeDelivery
-	}
-	if latest, err := s.repo.LatestChallengeCreatedAt(ctx, identifierType, identifier); err == nil && time.Since(latest) < challengeCooldown {
-		return StartChallengeResult{}, ErrChallengeTooSoon
-	} else if err != nil && !errors.Is(err, ErrNotFound) {
-		return StartChallengeResult{}, err
-	}
-
-	code, codeHash, err := newSixDigitCode()
-	if err != nil {
-		return StartChallengeResult{}, err
-	}
-	now := time.Now().UTC()
-	challenge := Challenge{ID: uuid.New(), IdentifierType: identifierType, Identifier: identifier,
-		DeliveryChannel: channel, Purpose: purpose, TargetCustomerID: targetCustomerID,
-		CodeHash: codeHash, ExpiresAt: now.Add(challengeTTL), CreatedAt: now}
-	if err := s.repo.CreateChallenge(ctx, challenge); err != nil {
-		return StartChallengeResult{}, err
-	}
-	subject := "Your Tellbook sign-in code"
-	if purpose == "link_identity" {
-		subject = "Verify a contact for your Tellbook account"
-	}
-	if err := s.mailer.Send(ctx, mailer.Message{
-		ToEmail: identifier,
-		Subject: subject,
-		Text:    fmt.Sprintf("Use this code to continue to Tellbook:\n\n%s\n\nThis code expires in 10 minutes. If you did not request it, you can ignore this message.", code),
-	}); err != nil {
-		s.repo.DeleteChallenge(ctx, challenge.ID)
-		return StartChallengeResult{}, fmt.Errorf("%w: %v", ErrCodeDelivery, err)
-	}
-	return StartChallengeResult{ChallengeID: challenge.ID, IdentifierType: identifierType,
-		DeliveryChannel: channel, DestinationHint: maskIdentifier(identifierType, identifier),
-		ExpiresInSeconds:         int(challengeTTL.Seconds()),
-		ResendAvailableInSeconds: int(challengeCooldown.Seconds())}, nil
+	return s.challenges.Start(ctx, authchallenge.StartRequest{
+		Realm: authchallenge.RealmMarketplaceCustomer, RawIdentifier: identifier,
+		Channel: channel, Purpose: authchallenge.PurposeLinkIdentity, TargetAccountID: &customerID,
+	})
 }
 
 func (s *Service) ResendChallenge(ctx context.Context, challengeID uuid.UUID) (StartChallengeResult, error) {
-	challenge, err := s.repo.GetChallenge(ctx, challengeID)
-	if err != nil {
-		return StartChallengeResult{}, ErrInvalidChallenge
+	if s.challenges == nil {
+		return StartChallengeResult{}, ErrDeliveryUnavailable
 	}
-	if challenge.Purpose != "sign_in" {
-		return StartChallengeResult{}, ErrInvalidChallenge
-	}
-	return s.startNormalizedChallenge(ctx, challenge.IdentifierType, challenge.Identifier, challenge.DeliveryChannel, challenge.Purpose, nil)
+	return s.challenges.Resend(ctx, authchallenge.RealmMarketplaceCustomer, challengeID, authchallenge.PurposeSignIn, nil)
 }
 
 func (s *Service) ResendIdentityLink(ctx context.Context, customerID, challengeID uuid.UUID) (StartChallengeResult, error) {
-	challenge, err := s.repo.GetChallenge(ctx, challengeID)
-	if err != nil || challenge.Purpose != "link_identity" || challenge.TargetCustomerID == nil || *challenge.TargetCustomerID != customerID {
-		return StartChallengeResult{}, ErrInvalidChallenge
+	if s.challenges == nil {
+		return StartChallengeResult{}, ErrDeliveryUnavailable
 	}
-	return s.startNormalizedChallenge(ctx, challenge.IdentifierType, challenge.Identifier, challenge.DeliveryChannel, challenge.Purpose, &customerID)
+	return s.challenges.Resend(ctx, authchallenge.RealmMarketplaceCustomer, challengeID, authchallenge.PurposeLinkIdentity, &customerID)
 }
 
-func (s *Service) VerifyChallenge(ctx context.Context, challengeID uuid.UUID, rawCode, userAgent, ipAddress string) (Customer, string, error) {
-	challenge, err := s.repo.GetChallenge(ctx, challengeID)
-	if err != nil || challenge.ConsumedAt != nil || !challenge.ExpiresAt.After(time.Now().UTC()) || challenge.FailedAttempts >= maximumChallengeAttempts {
-		return Customer{}, "", ErrInvalidChallenge
+func (s *Service) ChallengeStatus(ctx context.Context, challengeID uuid.UUID) (StartChallengeResult, error) {
+	if s.challenges == nil {
+		return StartChallengeResult{}, ErrDeliveryUnavailable
 	}
-	rawCode = strings.TrimSpace(rawCode)
-	if !validSixDigitCode(rawCode) || !equalHash(challenge.CodeHash, hashToken(rawCode)) {
-		_ = s.repo.RecordFailedChallengeAttempt(ctx, challengeID)
-		return Customer{}, "", ErrInvalidChallenge
+	response, err := s.challenges.Status(ctx, authchallenge.RealmMarketplaceCustomer, challengeID, authchallenge.PurposeSignIn, nil)
+	if err != nil {
+		return StartChallengeResult{}, ErrInvalidChallenge
+	}
+	return response, nil
+}
+
+func (s *Service) IdentityLinkStatus(ctx context.Context, customerID, challengeID uuid.UUID) (StartChallengeResult, error) {
+	if s.challenges == nil {
+		return StartChallengeResult{}, ErrDeliveryUnavailable
+	}
+	response, err := s.challenges.Status(
+		ctx, authchallenge.RealmMarketplaceCustomer, challengeID,
+		authchallenge.PurposeLinkIdentity, &customerID,
+	)
+	if err != nil {
+		return StartChallengeResult{}, ErrInvalidChallenge
+	}
+	return response, nil
+}
+
+func (s *Service) VerifyChallenge(ctx context.Context, challengeID uuid.UUID, rawCode, userAgent, ipAddress string) (Customer, string, bool, error) {
+	if s.challenges == nil {
+		return Customer{}, "", false, ErrDeliveryUnavailable
+	}
+	challenge, err := s.challenges.Verify(ctx, authchallenge.RealmMarketplaceCustomer, challengeID, rawCode, authchallenge.PurposeSignIn, nil)
+	if err != nil {
+		return Customer{}, "", false, ErrInvalidChallenge
 	}
 	token, tokenHash, err := newOpaqueToken()
 	if err != nil {
-		return Customer{}, "", err
+		return Customer{}, "", false, err
 	}
 	now := time.Now().UTC()
 	session := Session{ID: uuid.New(), TokenHash: tokenHash, UserAgent: truncate(userAgent, 512),
 		IPAddress: truncate(ipAddress, 64), ExpiresAt: now.Add(s.cfg.AuthRefreshTokenTTL), LastUsedAt: now, CreatedAt: now}
-	customer, err := s.repo.CompleteChallenge(ctx, challenge, session)
+	customer, newAccount, err := s.repo.CompleteChallenge(ctx, challenge, session)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			return Customer{}, "", ErrInvalidChallenge
+			return Customer{}, "", false, ErrInvalidChallenge
 		}
-		return Customer{}, "", err
+		return Customer{}, "", false, err
 	}
 	_ = s.invalidateCustomerSessionsAfterCommit(ctx, customer.ID)
-	return customer, token, nil
+	return customer, token, newAccount, nil
 }
 
 func (s *Service) VerifyIdentityLink(ctx context.Context, customerID, challengeID uuid.UUID, rawCode string) (Customer, error) {
-	challenge, err := s.repo.GetChallenge(ctx, challengeID)
-	if err != nil || challenge.Purpose != "link_identity" || challenge.TargetCustomerID == nil ||
-		*challenge.TargetCustomerID != customerID || challenge.ConsumedAt != nil ||
-		!challenge.ExpiresAt.After(time.Now().UTC()) || challenge.FailedAttempts >= maximumChallengeAttempts {
+	if s.challenges == nil {
 		return Customer{}, ErrInvalidChallenge
 	}
-	rawCode = strings.TrimSpace(rawCode)
-	if !validSixDigitCode(rawCode) || !equalHash(challenge.CodeHash, hashToken(rawCode)) {
-		_ = s.repo.RecordFailedChallengeAttempt(ctx, challengeID)
+	challenge, err := s.challenges.Verify(ctx, authchallenge.RealmMarketplaceCustomer, challengeID, rawCode, authchallenge.PurposeLinkIdentity, &customerID)
+	if err != nil {
 		return Customer{}, ErrInvalidChallenge
 	}
-	customer, err := s.repo.CompleteIdentityLink(ctx, challenge)
+	customer, revokedHashes, err := s.repo.CompleteIdentityLink(ctx, challenge)
 	if errors.Is(err, ErrNotFound) {
 		return Customer{}, ErrInvalidChallenge
 	}
 	if err == nil {
-		_ = s.invalidateCustomerSessionsAfterCommit(ctx, customer.ID)
+		_ = s.invalidateTokenHashesAfterCommit(ctx, revokedHashes)
 	}
 	return customer, err
 }
@@ -264,7 +233,9 @@ func (s *Service) PasswordLogin(ctx context.Context, rawIdentifier, password, us
 		return Customer{}, "", err
 	}
 	var customerID uuid.UUID
+	compared := false
 	for _, candidate := range candidates {
+		compared = true
 		if bcrypt.CompareHashAndPassword([]byte(candidate.PasswordHash), []byte(password)) == nil {
 			customerID = candidate.CustomerID
 			break
@@ -272,7 +243,9 @@ func (s *Service) PasswordLogin(ctx context.Context, rawIdentifier, password, us
 	}
 	if customerID == uuid.Nil {
 		// Keep the no-account path close to the cost of a real password comparison.
-		_ = bcrypt.CompareHashAndPassword(s.dummyPasswordHash, []byte(password))
+		if !compared {
+			_ = bcrypt.CompareHashAndPassword(s.dummyPasswordHash, []byte(password))
+		}
 		return Customer{}, "", ErrInvalidPassword
 	}
 	token, tokenHash, err := newOpaqueToken()
@@ -286,6 +259,87 @@ func (s *Service) PasswordLogin(ctx context.Context, rawIdentifier, password, us
 	if err != nil {
 		return Customer{}, "", err
 	}
+	return customer, token, nil
+}
+
+type PasswordResetVerification struct {
+	ResetGrant       string `json:"reset_grant"`
+	ExpiresInSeconds int    `json:"expires_in_seconds"`
+}
+
+const passwordResetGrantTTL = 10 * time.Minute
+
+func (s *Service) StartPasswordReset(ctx context.Context, rawIdentifier, requestedChannel string) (StartChallengeResult, error) {
+	if s.challenges == nil {
+		return StartChallengeResult{}, ErrDeliveryUnavailable
+	}
+	identifierType, identifier, channel, err := authchallenge.NormalizeIdentifier(rawIdentifier, requestedChannel)
+	if err != nil {
+		return StartChallengeResult{}, err
+	}
+	// Apply the same bounded password work regardless of account existence.
+	_ = bcrypt.CompareHashAndPassword(s.dummyPasswordHash, []byte("password-reset-padding"))
+	candidate, err := s.repo.PasswordResetAccount(ctx, identifierType, identifier)
+	if err == nil {
+		return s.challenges.Start(ctx, authchallenge.StartRequest{
+			Realm: authchallenge.RealmMarketplaceCustomer, RawIdentifier: identifier,
+			Channel: channel, Purpose: authchallenge.PurposePasswordReset,
+			TargetAccountID: &candidate.CustomerID,
+		})
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return StartChallengeResult{}, err
+	}
+	return s.challenges.StartSyntheticPasswordReset(ctx, authchallenge.RealmMarketplaceCustomer, identifier, channel)
+}
+
+func (s *Service) VerifyPasswordReset(ctx context.Context, challengeID uuid.UUID, rawCode string) (PasswordResetVerification, error) {
+	if s.challenges == nil {
+		return PasswordResetVerification{}, ErrInvalidChallenge
+	}
+	challenge, err := s.challenges.VerifyPasswordReset(ctx, authchallenge.RealmMarketplaceCustomer, challengeID, rawCode)
+	if err != nil {
+		return PasswordResetVerification{}, ErrInvalidChallenge
+	}
+	rawGrant, grantHash, err := newOpaqueToken()
+	if err != nil {
+		return PasswordResetVerification{}, err
+	}
+	if err := s.repo.StorePasswordResetGrant(ctx, challenge, grantHash, time.Now().UTC().Add(passwordResetGrantTTL)); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return PasswordResetVerification{}, ErrInvalidChallenge
+		}
+		return PasswordResetVerification{}, err
+	}
+	return PasswordResetVerification{ResetGrant: rawGrant, ExpiresInSeconds: int(passwordResetGrantTTL.Seconds())}, nil
+}
+
+func (s *Service) CompletePasswordReset(ctx context.Context, rawGrant, newPassword, userAgent, ipAddress string) (Customer, string, error) {
+	if len(newPassword) < 8 || len(newPassword) > 72 || strings.TrimSpace(rawGrant) == "" {
+		return Customer{}, "", ErrInvalidChallenge
+	}
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), s.cfg.AuthBcryptCost)
+	if err != nil {
+		return Customer{}, "", fmt.Errorf("hash marketplace password: %w", err)
+	}
+	token, tokenHash, err := newOpaqueToken()
+	if err != nil {
+		return Customer{}, "", err
+	}
+	now := time.Now().UTC()
+	session := Session{
+		ID: uuid.New(), TokenHash: tokenHash, UserAgent: truncate(userAgent, 512),
+		IPAddress: truncate(ipAddress, 64), ExpiresAt: now.Add(s.cfg.AuthRefreshTokenTTL),
+		LastUsedAt: now, CreatedAt: now,
+	}
+	customer, revokedHashes, err := s.repo.CompletePasswordReset(ctx, hashToken(rawGrant), string(passwordHash), session)
+	if errors.Is(err, ErrNotFound) {
+		return Customer{}, "", ErrInvalidChallenge
+	}
+	if err != nil {
+		return Customer{}, "", err
+	}
+	_ = s.invalidateTokenHashesAfterCommit(ctx, revokedHashes)
 	return customer, token, nil
 }
 
@@ -385,6 +439,7 @@ func (s *Service) loadSessionPrincipal(ctx context.Context, tokenHash []byte) (S
 func validSessionPrincipal(principal SessionPrincipal, now time.Time) bool {
 	return principal.SessionID != uuid.Nil && principal.CustomerID != uuid.Nil &&
 		principal.SecurityRevision > 0 && principal.SessionRevision > 0 &&
+		principal.SecurityRevision == principal.SessionRevision &&
 		principal.ExpiresAt.After(now)
 }
 
@@ -404,19 +459,39 @@ func (s *Service) Logout(ctx context.Context, rawToken string) error {
 	return nil
 }
 
-func (s *Service) SetPassword(ctx context.Context, customerID uuid.UUID, password string) (Customer, error) {
-	if len(password) < 8 || len(password) > 72 {
+func (s *Service) SetPassword(ctx context.Context, customerID uuid.UUID, currentPassword, newPassword string) (Customer, error) {
+	if len(newPassword) < 8 || len(newPassword) > 72 {
 		return Customer{}, ErrWeakPassword
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), s.cfg.AuthBcryptCost)
+	currentHash, err := s.repo.PasswordHashByCustomerID(ctx, customerID)
+	if err != nil {
+		return Customer{}, err
+	}
+	if currentHash != "" && bcrypt.CompareHashAndPassword([]byte(currentHash), []byte(currentPassword)) != nil {
+		return Customer{}, ErrInvalidPassword
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), s.cfg.AuthBcryptCost)
 	if err != nil {
 		return Customer{}, fmt.Errorf("hash marketplace password: %w", err)
 	}
-	customer, err := s.repo.SetPassword(ctx, customerID, string(hash))
+	customer, revokedHashes, err := s.repo.SetPassword(ctx, customerID, string(hash))
 	if err == nil {
-		_ = s.invalidateCustomerSessionsAfterCommit(ctx, customerID)
+		_ = s.invalidateTokenHashesAfterCommit(ctx, revokedHashes)
 	}
 	return customer, err
+}
+
+func (s *Service) invalidateTokenHashesAfterCommit(ctx context.Context, hashes [][]byte) error {
+	if s.sessionCache == nil || len(hashes) == 0 {
+		return nil
+	}
+	identities := make([]string, len(hashes))
+	for index, tokenHash := range hashes {
+		identities[index] = hex.EncodeToString(tokenHash)
+	}
+	invalidateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	return s.sessionCache.CacheDelete(invalidateCtx, "marketplace_session", identities...)
 }
 
 func (s *Service) UpdateProfile(ctx context.Context, customerID uuid.UUID, input ProfileInput) (Customer, error) {
@@ -484,12 +559,12 @@ func normalizeIdentifier(rawIdentifier, requestedChannel string) (identifierType
 		return "", "", "", parseErr
 	}
 	switch requestedChannel {
-	case "", "sms":
-		return "phone", normalizedPhone, "sms", nil
+	case "":
+		return "phone", normalizedPhone, "", nil
 	case "whatsapp":
-		return "whatsapp", normalizedPhone, "whatsapp", nil
+		return "phone", normalizedPhone, "whatsapp", nil
 	default:
-		return "", "", "", errors.New("delivery_channel must be email, sms, or whatsapp")
+		return "", "", "", errors.New("phone identifiers must use WhatsApp delivery")
 	}
 }
 
@@ -520,31 +595,7 @@ func CustomerMatchesBookingContact(customer Customer, email, phone string) bool 
 	if err != nil {
 		return false
 	}
-	return (customer.PhoneVerifiedAt != nil && normalizedPhone == customer.Phone) ||
-		(customer.WhatsAppVerifiedAt != nil && normalizedPhone == customer.WhatsApp)
-}
-
-func maskIdentifier(identifierType, value string) string {
-	if identifierType == "email" {
-		parts := strings.SplitN(value, "@", 2)
-		if len(parts[0]) <= 2 {
-			return parts[0][:1] + "…@" + parts[1]
-		}
-		return parts[0][:2] + "…@" + parts[1]
-	}
-	if len(value) <= 6 {
-		return value
-	}
-	return value[:4] + "•••" + value[len(value)-3:]
-}
-
-func newSixDigitCode() (string, []byte, error) {
-	value, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
-	if err != nil {
-		return "", nil, err
-	}
-	code := fmt.Sprintf("%06d", value.Int64())
-	return code, hashToken(code), nil
+	return customer.PhoneVerifiedAt != nil && normalizedPhone == customer.Phone
 }
 
 func newOpaqueToken() (string, []byte, error) {
@@ -557,27 +608,6 @@ func newOpaqueToken() (string, []byte, error) {
 }
 
 func hashToken(value string) []byte { sum := sha256.Sum256([]byte(value)); return sum[:] }
-func equalHash(left, right []byte) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	var difference byte
-	for index := range left {
-		difference |= left[index] ^ right[index]
-	}
-	return difference == 0
-}
-func validSixDigitCode(value string) bool {
-	if len(value) != 6 {
-		return false
-	}
-	for _, character := range value {
-		if character < '0' || character > '9' {
-			return false
-		}
-	}
-	return true
-}
 func truncate(value string, limit int) string {
 	if len(value) <= limit {
 		return value

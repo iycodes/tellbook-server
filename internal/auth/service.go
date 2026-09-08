@@ -7,312 +7,330 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"math/big"
-	"mime"
 	"net"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"time"
 
+	"booking/go-server/internal/authchallenge"
 	"booking/go-server/internal/config"
-	"booking/go-server/internal/mailer"
 	"booking/go-server/internal/storage"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgconn"
 	"golang.org/x/crypto/bcrypt"
 )
 
 var (
-	ErrInvalidCredentials       = errors.New("invalid credentials")
-	ErrEmailTaken               = errors.New("email already in use")
-	ErrInvalidRefresh           = errors.New("invalid refresh token")
-	ErrInvalidAccess            = errors.New("invalid access token")
-	ErrInvalidResetToken        = errors.New("invalid password reset token")
-	ErrInvalidRegistrationToken = errors.New("invalid registration verification token")
+	ErrInvalidCredentials    = errors.New("invalid credentials")
+	ErrInvalidRefresh        = errors.New("invalid refresh token")
+	ErrInvalidAccess         = errors.New("invalid access token")
+	ErrInvalidResetToken     = errors.New("invalid password reset token")
+	ErrIdentityAlreadyLinked = errors.New("identity is already linked to this account")
+	ErrIdentityConflict      = errors.New("identity is already linked")
+	ErrWeakPassword          = errors.New("password must be between 8 and 72 characters")
 )
 
 type Service struct {
-	repo    *Repository
-	cfg     config.Config
-	storage *storage.R2Service
-	mailer  mailer.Sender
+	repo              *Repository
+	cfg               config.Config
+	storage           *storage.R2Service
+	challenges        *authchallenge.Service
+	dummyPasswordHash []byte
 }
 
-const (
-	verificationCodeTTL          = 15 * time.Minute
-	passwordResetCodeMaxAttempts = 5
-)
-
-func NewService(repo *Repository, cfg config.Config, storageService *storage.R2Service, mailerSender mailer.Sender) *Service {
-	return &Service{repo: repo, cfg: cfg, storage: storageService, mailer: mailerSender}
+func NewService(repo *Repository, cfg config.Config, storageService *storage.R2Service, challenges *authchallenge.Service) *Service {
+	cost := cfg.AuthBcryptCost
+	if cost < bcrypt.MinCost || cost > bcrypt.MaxCost {
+		cost = bcrypt.DefaultCost
+	}
+	dummyHash, _ := bcrypt.GenerateFromPassword([]byte("tellbook-invalid-password-padding"), cost)
+	return &Service{repo: repo, cfg: cfg, storage: storageService, challenges: challenges, dummyPasswordHash: dummyHash}
 }
 
-func (s *Service) StartRegistration(ctx context.Context, input registerInput) error {
-	if s.mailer == nil || !s.mailer.Enabled() {
-		return errors.New("email delivery is not configured")
-	}
+type CodeVerificationResult struct {
+	User               User
+	Pair               tokenPair
+	RefreshToken       string
+	IsNewAccount       bool
+	OnboardingRequired bool
+}
 
-	input.FullName = strings.TrimSpace(input.FullName)
-	input.Bio = strings.TrimSpace(input.Bio)
-	input.Email = normalizeEmail(input.Email)
-	input.Password = strings.TrimSpace(input.Password)
-	input.CoverImageDataURL = strings.TrimSpace(input.CoverImageDataURL)
-	input.CoverImageContentType = strings.TrimSpace(input.CoverImageContentType)
+func (s *Service) AuthCapabilities() authchallenge.Capabilities {
+	return authchallenge.NewCapabilities(s.challenges, true)
+}
 
-	if len(input.FullName) < 2 {
-		return fmt.Errorf("full_name must be at least 2 characters")
+func (s *Service) StartCodeChallenge(ctx context.Context, identifier, channel string) (authchallenge.Response, error) {
+	if s.challenges == nil {
+		return authchallenge.Response{}, authchallenge.ErrUnavailable
 	}
-	if !strings.Contains(input.Email, "@") {
-		return fmt.Errorf("email must be valid")
+	return s.challenges.Start(ctx, authchallenge.StartRequest{
+		Realm: authchallenge.RealmProvider, RawIdentifier: identifier,
+		Channel: channel, Purpose: authchallenge.PurposeSignIn,
+	})
+}
+
+func (s *Service) CodeChallengeStatus(ctx context.Context, challengeID uuid.UUID) (authchallenge.Response, error) {
+	if s.challenges == nil {
+		return authchallenge.Response{}, authchallenge.ErrUnavailable
 	}
-	if len(input.Password) < 8 {
-		return fmt.Errorf("password must be at least 8 characters")
+	return s.challenges.Status(ctx, authchallenge.RealmProvider, challengeID, authchallenge.PurposeSignIn, nil)
+}
+
+func (s *Service) ResendCodeChallenge(ctx context.Context, challengeID uuid.UUID) (authchallenge.Response, error) {
+	if s.challenges == nil {
+		return authchallenge.Response{}, authchallenge.ErrUnavailable
 	}
-	if input.CoverImageDataURL != "" {
-		if _, err := decodeRegistrationCover(input); err != nil {
-			return err
+	return s.challenges.Resend(ctx, authchallenge.RealmProvider, challengeID, authchallenge.PurposeSignIn, nil)
+}
+
+func (s *Service) StartIdentityLink(ctx context.Context, userID uuid.UUID, rawIdentifier, channel string) (authchallenge.Response, error) {
+	if s.challenges == nil {
+		return authchallenge.Response{}, authchallenge.ErrUnavailable
+	}
+	identityType, identifier, normalizedChannel, err := authchallenge.NormalizeIdentifier(rawIdentifier, channel)
+	if err != nil {
+		return authchallenge.Response{}, err
+	}
+	owner, ownerErr := s.repo.IdentityOwner(ctx, identityType, identifier)
+	if ownerErr == nil {
+		if owner != userID {
+			return authchallenge.Response{}, ErrIdentityConflict
 		}
+		return authchallenge.Response{}, ErrIdentityAlreadyLinked
 	}
-
-	if _, err := s.repo.GetUserByEmail(ctx, input.Email); err == nil {
-		return ErrEmailTaken
-	} else if !errors.Is(err, ErrNotFound) {
-		return err
+	if !errors.Is(ownerErr, ErrNotFound) {
+		return authchallenge.Response{}, ownerErr
 	}
-
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(input.Password), s.cfg.AuthBcryptCost)
+	hasType, err := s.repo.UserHasVerifiedIdentityType(ctx, userID, identityType)
 	if err != nil {
-		return fmt.Errorf("hash password: %w", err)
+		return authchallenge.Response{}, err
 	}
+	if hasType {
+		return authchallenge.Response{}, ErrIdentityConflict
+	}
+	return s.challenges.Start(ctx, authchallenge.StartRequest{
+		Realm: authchallenge.RealmProvider, RawIdentifier: identifier, Channel: normalizedChannel,
+		Purpose: authchallenge.PurposeLinkIdentity, TargetAccountID: &userID,
+	})
+}
 
-	rawToken, tokenHash, err := newSixDigitCode()
+func (s *Service) IdentityLinkStatus(ctx context.Context, userID, challengeID uuid.UUID) (authchallenge.Response, error) {
+	if s.challenges == nil {
+		return authchallenge.Response{}, authchallenge.ErrUnavailable
+	}
+	return s.challenges.Status(ctx, authchallenge.RealmProvider, challengeID, authchallenge.PurposeLinkIdentity, &userID)
+}
+
+func (s *Service) ResendIdentityLink(ctx context.Context, userID, challengeID uuid.UUID) (authchallenge.Response, error) {
+	if s.challenges == nil {
+		return authchallenge.Response{}, authchallenge.ErrUnavailable
+	}
+	return s.challenges.Resend(ctx, authchallenge.RealmProvider, challengeID, authchallenge.PurposeLinkIdentity, &userID)
+}
+
+func (s *Service) VerifyIdentityLink(ctx context.Context, userID, challengeID uuid.UUID, rawCode string) (User, error) {
+	if s.challenges == nil {
+		return User{}, authchallenge.ErrInvalidChallenge
+	}
+	challenge, err := s.challenges.Verify(ctx, authchallenge.RealmProvider, challengeID, rawCode, authchallenge.PurposeLinkIdentity, &userID)
 	if err != nil {
-		return err
+		return User{}, authchallenge.ErrInvalidChallenge
 	}
+	user, err := s.repo.CompleteIdentityLink(ctx, challenge)
+	if errors.Is(err, ErrNotFound) {
+		return User{}, authchallenge.ErrInvalidChallenge
+	}
+	return user, err
+}
 
+func (s *Service) VerifyCodeChallenge(ctx context.Context, challengeID uuid.UUID, rawCode string, meta sessionMetadata) (CodeVerificationResult, error) {
+	if s.challenges == nil {
+		return CodeVerificationResult{}, authchallenge.ErrUnavailable
+	}
+	challenge, err := s.challenges.Verify(ctx, authchallenge.RealmProvider, challengeID, rawCode, authchallenge.PurposeSignIn, nil)
+	if err != nil {
+		return CodeVerificationResult{}, err
+	}
+	refreshToken, refreshHash, err := newOpaqueToken()
+	if err != nil {
+		return CodeVerificationResult{}, err
+	}
 	now := time.Now().UTC()
-	pending := pendingRegistration{
-		ID:                    uuid.New(),
-		FullName:              input.FullName,
-		Bio:                   input.Bio,
-		Email:                 input.Email,
-		PasswordHash:          string(passwordHash),
-		CoverImageDataURL:     input.CoverImageDataURL,
-		CoverImageContentType: input.CoverImageContentType,
-		TokenHash:             tokenHash,
-		ExpiresAt:             now.Add(verificationCodeTTL),
-		CreatedAt:             now,
-		UpdatedAt:             now,
+	session := RefreshSession{
+		ID: uuid.New(), TokenHash: refreshHash, UserAgent: truncate(meta.UserAgent, 512),
+		IPAddress: truncate(meta.IPAddress, 64), ExpiresAt: now.Add(s.cfg.AuthRefreshTokenTTL),
+		LastUsedAt: now, CreatedAt: now,
 	}
-
-	if err := s.repo.UpsertPendingRegistration(ctx, pending); err != nil {
-		return err
-	}
-
-	if err := s.sendRegistrationVerificationEmail(ctx, pending, rawToken); err != nil {
-		_ = s.repo.DeletePendingRegistration(ctx, pending.ID)
-		return err
-	}
-
-	return nil
-}
-
-func (s *Service) ResendRegistrationVerification(ctx context.Context, email string) error {
-	if s.mailer == nil || !s.mailer.Enabled() {
-		return errors.New("email delivery is not configured")
-	}
-
-	pending, err := s.repo.GetPendingRegistrationByEmail(ctx, normalizeEmail(email))
+	user, isNewAccount, onboardingRequired, err := s.repo.CompleteCodeChallenge(ctx, challenge, session)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			return ErrInvalidRegistrationToken
+			return CodeVerificationResult{}, authchallenge.ErrInvalidChallenge
 		}
-		return err
+		return CodeVerificationResult{}, err
 	}
-
-	rawToken, tokenHash, err := newSixDigitCode()
+	accessToken, err := s.signAccessToken(user, now)
 	if err != nil {
-		return err
+		return CodeVerificationResult{}, err
 	}
-
-	now := time.Now().UTC()
-	if err := s.repo.UpdatePendingRegistrationToken(
-		ctx,
-		pending.ID,
-		tokenHash,
-		now.Add(verificationCodeTTL),
-		now,
-	); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return ErrInvalidRegistrationToken
-		}
-		return err
-	}
-
-	return s.sendRegistrationVerificationEmail(ctx, pending, rawToken)
-}
-
-func (s *Service) CompleteRegistration(
-	ctx context.Context,
-	email string,
-	rawToken string,
-	meta sessionMetadata,
-) (User, tokenPair, string, error) {
-	email = normalizeEmail(email)
-	rawToken = strings.TrimSpace(rawToken)
-	if email == "" || !isSixDigitCode(rawToken) {
-		return User{}, tokenPair{}, "", ErrInvalidRegistrationToken
-	}
-
-	pending, err := s.repo.GetPendingRegistrationByToken(ctx, email, hashToken(rawToken))
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return User{}, tokenPair{}, "", ErrInvalidRegistrationToken
-		}
-		return User{}, tokenPair{}, "", err
-	}
-
-	now := time.Now().UTC()
-	verifiedAt := now
-	user := userRecord{
-		User: User{
-			ID:              pending.ID,
-			FullName:        pending.FullName,
-			Bio:             pending.Bio,
-			Email:           pending.Email,
-			EmailVerifiedAt: &verifiedAt,
-			CreatedAt:       now,
-			UpdatedAt:       now,
-		},
-		PasswordHash: pending.PasswordHash,
-	}
-
-	var uploadedCoverObject storageObject
-	if pending.CoverImageDataURL != "" {
-		uploadedCoverObject, err = s.uploadRegistrationCover(ctx, user.ID, registerInput{
-			CoverImageDataURL:     pending.CoverImageDataURL,
-			CoverImageContentType: pending.CoverImageContentType,
-		})
-		if err != nil {
-			return User{}, tokenPair{}, "", err
-		}
-		user.CoverImageURL = uploadedCoverObject.URL
-	}
-
-	pair, refreshToken, refreshSession, err := s.prepareTokens(user.User, meta)
-	if err != nil {
-		if uploadedCoverObject.Key != "" {
-			_ = s.deleteRegistrationCover(ctx, uploadedCoverObject)
-		}
-		return User{}, tokenPair{}, "", err
-	}
-
-	if err := s.repo.PromotePendingRegistration(ctx, pending, user, refreshSession); err != nil {
-		if uploadedCoverObject.Key != "" {
-			_ = s.deleteRegistrationCover(ctx, uploadedCoverObject)
-		}
-		if isUniqueViolation(err) {
-			return User{}, tokenPair{}, "", ErrEmailTaken
-		}
-		if errors.Is(err, ErrNotFound) {
-			return User{}, tokenPair{}, "", ErrInvalidRegistrationToken
-		}
-		return User{}, tokenPair{}, "", err
-	}
-
-	return user.User, pair, refreshToken, nil
-}
-
-func (s *Service) sendRegistrationVerificationEmail(
-	ctx context.Context,
-	pending pendingRegistration,
-	rawToken string,
-) error {
-	if err := s.mailer.Send(ctx, mailer.Message{
-		ToEmail: pending.Email,
-		ToName:  pending.FullName,
-		Subject: "Verify your email",
-		Text: fmt.Sprintf(
-			"Hello %s,\n\nUse this code to finish creating your account:\n\n%s\n\nThis code expires in 15 minutes.\n",
-			pending.FullName,
-			rawToken,
-		),
-	}); err != nil {
-		return fmt.Errorf("send registration verification email: %w", err)
-	}
-
-	return nil
-}
-
-type registrationCoverPayload struct {
-	ContentType string
-	Data        []byte
-	Extension   string
-}
-
-type storageObject struct {
-	Key        string
-	BucketName string
-	URL        string
-}
-
-func (s *Service) uploadRegistrationCover(ctx context.Context, userID uuid.UUID, input registerInput) (storageObject, error) {
-	if s.storage == nil {
-		return storageObject{}, errors.New("image uploads are not configured")
-	}
-
-	payload, err := decodeRegistrationCover(input)
-	if err != nil {
-		return storageObject{}, err
-	}
-
-	bucketName := s.storage.PublicBucketName()
-	if bucketName == "" {
-		return storageObject{}, errors.New("public image storage is not configured")
-	}
-	objectKey := fmt.Sprintf("clients/%s/profiles/%s%s", userID.String(), uuid.NewString(), payload.Extension)
-
-	objectURL, err := s.storage.Upload(ctx, payload.Data, objectKey, payload.ContentType, bucketName)
-	if err != nil {
-		return storageObject{}, fmt.Errorf("upload registration cover: %w", err)
-	}
-
-	return storageObject{
-		Key:        objectKey,
-		BucketName: bucketName,
-		URL:        objectURL,
+	return CodeVerificationResult{
+		User: user, Pair: tokenPair{AccessToken: accessToken}, RefreshToken: refreshToken,
+		IsNewAccount: isNewAccount, OnboardingRequired: onboardingRequired,
 	}, nil
 }
 
-func (s *Service) deleteRegistrationCover(ctx context.Context, object storageObject) error {
-	if s.storage == nil || object.Key == "" {
-		return nil
-	}
-	return s.storage.Delete(ctx, object.Key, object.BucketName)
-}
-
 func (s *Service) Login(ctx context.Context, input loginInput, meta sessionMetadata) (User, tokenPair, string, error) {
-	record, err := s.repo.GetUserByEmail(ctx, normalizeEmail(input.Email))
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return User{}, tokenPair{}, "", ErrInvalidCredentials
-		}
-		return User{}, tokenPair{}, "", err
+	identifier := input.Identifier
+	if strings.TrimSpace(identifier) == "" {
+		identifier = input.Email
 	}
-
-	if err := bcrypt.CompareHashAndPassword([]byte(record.PasswordHash), []byte(input.Password)); err != nil {
+	_, normalizedIdentifier, _, err := authchallenge.NormalizeIdentifier(identifier, inferredPasswordChannel(identifier))
+	if err != nil {
+		_ = bcrypt.CompareHashAndPassword(s.dummyPasswordHash, []byte(input.Password))
 		return User{}, tokenPair{}, "", ErrInvalidCredentials
 	}
-
-	pair, refreshToken, err := s.issueTokens(ctx, record.User, meta)
+	candidates, err := s.repo.PasswordCandidates(ctx, normalizedIdentifier)
 	if err != nil {
 		return User{}, tokenPair{}, "", err
 	}
+	var userID uuid.UUID
+	compared := false
+	for _, candidate := range candidates {
+		compared = true
+		if bcrypt.CompareHashAndPassword([]byte(candidate.PasswordHash), []byte(input.Password)) == nil {
+			userID = candidate.UserID
+			break
+		}
+	}
+	if userID == uuid.Nil {
+		if !compared {
+			_ = bcrypt.CompareHashAndPassword(s.dummyPasswordHash, []byte(input.Password))
+		}
+		return User{}, tokenPair{}, "", ErrInvalidCredentials
+	}
+	user, err := s.repo.GetUserByID(ctx, userID)
+	if err != nil {
+		return User{}, tokenPair{}, "", err
+	}
+	pair, refreshToken, err := s.issueTokens(ctx, user, meta)
+	if err != nil {
+		return User{}, tokenPair{}, "", err
+	}
+	return user, pair, refreshToken, nil
+}
 
-	return record.User, pair, refreshToken, nil
+type PasswordResetVerification struct {
+	ResetGrant       string `json:"reset_grant"`
+	ExpiresInSeconds int    `json:"expires_in_seconds"`
+}
+
+type PasswordResetResult struct {
+	User         User
+	Pair         tokenPair
+	RefreshToken string
+}
+
+const passwordResetGrantTTL = 10 * time.Minute
+
+func (s *Service) StartPasswordReset(ctx context.Context, identifier, channel string) (authchallenge.Response, error) {
+	if s.challenges == nil {
+		return authchallenge.Response{}, authchallenge.ErrUnavailable
+	}
+	identifierType, normalized, normalizedChannel, err := authchallenge.NormalizeIdentifier(identifier, channel)
+	if err != nil {
+		return authchallenge.Response{}, err
+	}
+	// Apply the same bounded password work regardless of account existence.
+	_ = bcrypt.CompareHashAndPassword(s.dummyPasswordHash, []byte("password-reset-padding"))
+	candidate, err := s.repo.PasswordResetAccount(ctx, identifierType, normalized)
+	if err == nil {
+		return s.challenges.Start(ctx, authchallenge.StartRequest{
+			Realm: authchallenge.RealmProvider, RawIdentifier: normalized, Channel: normalizedChannel,
+			Purpose: authchallenge.PurposePasswordReset, TargetAccountID: &candidate.UserID,
+		})
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return authchallenge.Response{}, err
+	}
+	return s.challenges.StartSyntheticPasswordReset(ctx, authchallenge.RealmProvider, normalized, normalizedChannel)
+}
+
+func (s *Service) VerifyPasswordReset(ctx context.Context, challengeID uuid.UUID, rawCode string) (PasswordResetVerification, error) {
+	if s.challenges == nil {
+		return PasswordResetVerification{}, authchallenge.ErrInvalidChallenge
+	}
+	challenge, err := s.challenges.VerifyPasswordReset(ctx, authchallenge.RealmProvider, challengeID, rawCode)
+	if err != nil {
+		return PasswordResetVerification{}, authchallenge.ErrInvalidChallenge
+	}
+	rawGrant, grantHash, err := newOpaqueToken()
+	if err != nil {
+		return PasswordResetVerification{}, err
+	}
+	if err := s.repo.StorePasswordResetGrant(ctx, challenge, grantHash, time.Now().UTC().Add(passwordResetGrantTTL)); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return PasswordResetVerification{}, authchallenge.ErrInvalidChallenge
+		}
+		return PasswordResetVerification{}, err
+	}
+	return PasswordResetVerification{ResetGrant: rawGrant, ExpiresInSeconds: int(passwordResetGrantTTL.Seconds())}, nil
+}
+
+func (s *Service) CompletePasswordReset(ctx context.Context, rawGrant, newPassword string, meta sessionMetadata) (PasswordResetResult, error) {
+	if len(newPassword) < 8 || len(newPassword) > 72 || strings.TrimSpace(rawGrant) == "" {
+		return PasswordResetResult{}, ErrInvalidResetToken
+	}
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), s.cfg.AuthBcryptCost)
+	if err != nil {
+		return PasswordResetResult{}, fmt.Errorf("hash provider password: %w", err)
+	}
+	refreshToken, refreshHash, err := newOpaqueToken()
+	if err != nil {
+		return PasswordResetResult{}, err
+	}
+	now := time.Now().UTC()
+	session := RefreshSession{
+		ID: uuid.New(), TokenHash: refreshHash, UserAgent: truncate(meta.UserAgent, 512),
+		IPAddress: truncate(meta.IPAddress, 64), ExpiresAt: now.Add(s.cfg.AuthRefreshTokenTTL),
+		LastUsedAt: now, CreatedAt: now,
+	}
+	user, err := s.repo.CompletePasswordReset(ctx, hashToken(rawGrant), string(passwordHash), session)
+	if errors.Is(err, ErrNotFound) {
+		return PasswordResetResult{}, ErrInvalidResetToken
+	}
+	if err != nil {
+		return PasswordResetResult{}, err
+	}
+	accessToken, err := s.signAccessToken(user, now)
+	if err != nil {
+		return PasswordResetResult{}, err
+	}
+	return PasswordResetResult{User: user, Pair: tokenPair{AccessToken: accessToken}, RefreshToken: refreshToken}, nil
+}
+
+func (s *Service) UpdatePassword(ctx context.Context, userID uuid.UUID, currentPassword, newPassword string) (User, error) {
+	if len(newPassword) < 8 || len(newPassword) > 72 {
+		return User{}, ErrWeakPassword
+	}
+	currentHash, err := s.repo.PasswordHashByUserID(ctx, userID)
+	if err != nil {
+		return User{}, err
+	}
+	if currentHash != "" && bcrypt.CompareHashAndPassword([]byte(currentHash), []byte(currentPassword)) != nil {
+		return User{}, ErrInvalidCredentials
+	}
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), s.cfg.AuthBcryptCost)
+	if err != nil {
+		return User{}, fmt.Errorf("hash provider password: %w", err)
+	}
+	return s.repo.ChangePassword(ctx, userID, string(passwordHash))
+}
+
+func inferredPasswordChannel(identifier string) string {
+	if strings.Contains(strings.TrimSpace(identifier), "@") {
+		return authchallenge.ChannelEmail
+	}
+	return authchallenge.ChannelWhatsApp
 }
 
 func (s *Service) Refresh(ctx context.Context, rawRefreshToken string, meta sessionMetadata) (User, tokenPair, string, error) {
@@ -323,6 +341,9 @@ func (s *Service) Refresh(ctx context.Context, rawRefreshToken string, meta sess
 			return User{}, tokenPair{}, "", ErrInvalidRefresh
 		}
 		return User{}, tokenPair{}, "", err
+	}
+	if record.SessionRevision != record.User.SecurityRevision {
+		return User{}, tokenPair{}, "", ErrInvalidRefresh
 	}
 
 	nextRefreshToken, nextRefreshHash, err := newOpaqueToken()
@@ -385,6 +406,9 @@ func (s *Service) AuthenticateAccessToken(ctx context.Context, rawAccessToken st
 		}
 		return User{}, err
 	}
+	if claims.SecurityRevision < 1 || claims.SecurityRevision != user.SecurityRevision {
+		return User{}, ErrInvalidAccess
+	}
 
 	return user, nil
 }
@@ -394,104 +418,6 @@ func (s *Service) Logout(ctx context.Context, rawRefreshToken string) error {
 		return nil
 	}
 	return s.repo.DeleteRefreshSessionByTokenHash(ctx, hashToken(rawRefreshToken))
-}
-
-func (s *Service) SendPasswordReset(ctx context.Context, email string) error {
-	if s.mailer == nil || !s.mailer.Enabled() {
-		return errors.New("email delivery is not configured")
-	}
-
-	email = normalizeEmail(email)
-	record, err := s.repo.GetUserByEmail(ctx, email)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return nil
-		}
-		return err
-	}
-
-	if err := s.repo.DeletePasswordResetTokensByUserID(ctx, record.ID); err != nil {
-		return err
-	}
-
-	var rawToken string
-	for range passwordResetCodeMaxAttempts {
-		code, tokenHash, err := newSixDigitCode()
-		if err != nil {
-			return err
-		}
-
-		err = s.repo.CreatePasswordResetToken(
-			ctx,
-			record.ID,
-			tokenHash,
-			time.Now().UTC().Add(verificationCodeTTL),
-		)
-		if err == nil {
-			rawToken = code
-			break
-		}
-		if !isUniqueViolation(err) {
-			return err
-		}
-	}
-	if rawToken == "" {
-		return errors.New("could not allocate a unique password reset code")
-	}
-
-	if err := s.mailer.Send(ctx, mailer.Message{
-		ToEmail: record.Email,
-		ToName:  record.FullName,
-		Subject: "Reset your password",
-		Text: fmt.Sprintf(
-			"Hello %s,\n\nUse this code to reset your password:\n\n%s\n\nThis code expires in 15 minutes.\n",
-			record.FullName,
-			rawToken,
-		),
-	}); err != nil {
-		_ = s.repo.DeletePasswordResetTokensByUserID(ctx, record.ID)
-		return fmt.Errorf("send password reset email: %w", err)
-	}
-
-	return nil
-}
-
-func (s *Service) ResetPassword(ctx context.Context, rawToken, newPassword string) error {
-	rawToken = strings.TrimSpace(rawToken)
-	if !isSixDigitCode(rawToken) {
-		return ErrInvalidResetToken
-	}
-
-	newPassword = strings.TrimSpace(newPassword)
-	if len(newPassword) < 8 {
-		return fmt.Errorf("new_password must be at least 8 characters")
-	}
-
-	userID, err := s.repo.GetPasswordResetTokenUserID(ctx, hashToken(rawToken))
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return ErrInvalidResetToken
-		}
-		return err
-	}
-
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), s.cfg.AuthBcryptCost)
-	if err != nil {
-		return fmt.Errorf("hash password: %w", err)
-	}
-
-	now := time.Now().UTC()
-	if err := s.repo.UpdateUserPassword(ctx, userID, string(passwordHash), now); err != nil {
-		return err
-	}
-	if err := s.repo.DeletePasswordResetTokensByUserID(ctx, userID); err != nil {
-		return err
-	}
-	if err := s.repo.DeleteRefreshSessionsByUserID(ctx, userID); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func (s *Service) issueTokens(ctx context.Context, user User, meta sessionMetadata) (tokenPair, string, error) {
@@ -524,14 +450,15 @@ func (s *Service) prepareTokens(
 
 	now := time.Now().UTC()
 	refreshSession := RefreshSession{
-		ID:         uuid.New(),
-		UserID:     user.ID,
-		TokenHash:  refreshHash,
-		UserAgent:  truncate(meta.UserAgent, 512),
-		IPAddress:  truncate(meta.IPAddress, 64),
-		ExpiresAt:  now.Add(s.cfg.AuthRefreshTokenTTL),
-		LastUsedAt: now,
-		CreatedAt:  now,
+		ID:              uuid.New(),
+		UserID:          user.ID,
+		TokenHash:       refreshHash,
+		UserAgent:       truncate(meta.UserAgent, 512),
+		IPAddress:       truncate(meta.IPAddress, 64),
+		ExpiresAt:       now.Add(s.cfg.AuthRefreshTokenTTL),
+		LastUsedAt:      now,
+		CreatedAt:       now,
+		SessionRevision: user.SecurityRevision,
 	}
 
 	return tokenPair{
@@ -541,8 +468,9 @@ func (s *Service) prepareTokens(
 
 func (s *Service) signAccessToken(user User, issuedAt time.Time) (string, error) {
 	claims := AccessTokenClaims{
-		Email:    user.Email,
-		FullName: user.FullName,
+		Email:            user.Email,
+		FullName:         user.FullName,
+		SecurityRevision: user.SecurityRevision,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.ID.String(),
 			Issuer:    s.cfg.AuthIssuer,
@@ -568,73 +496,6 @@ func MetadataFromRequest(r *http.Request) sessionMetadata {
 	}
 }
 
-func normalizeEmail(email string) string {
-	return strings.ToLower(strings.TrimSpace(email))
-}
-
-func decodeRegistrationCover(input registerInput) (registrationCoverPayload, error) {
-	contentType := input.CoverImageContentType
-	rawBase64 := input.CoverImageDataURL
-
-	if strings.HasPrefix(rawBase64, "data:") {
-		parts := strings.SplitN(rawBase64, ",", 2)
-		if len(parts) != 2 {
-			return registrationCoverPayload{}, errors.New("cover_image_data_url must be a valid data URL")
-		}
-
-		metadata := strings.TrimPrefix(parts[0], "data:")
-		rawBase64 = parts[1]
-		if contentType == "" {
-			contentType = strings.TrimSuffix(metadata, ";base64")
-		}
-	}
-
-	contentType = strings.TrimSpace(contentType)
-	switch contentType {
-	case "image/jpeg", "image/png", "image/webp", "image/gif":
-	default:
-		return registrationCoverPayload{}, errors.New("cover image must be jpeg, png, webp, or gif")
-	}
-
-	data, err := base64.StdEncoding.DecodeString(rawBase64)
-	if err != nil {
-		data, err = base64.RawStdEncoding.DecodeString(rawBase64)
-	}
-	if err != nil {
-		return registrationCoverPayload{}, errors.New("cover image must be valid base64")
-	}
-
-	if len(data) == 0 {
-		return registrationCoverPayload{}, errors.New("cover image cannot be empty")
-	}
-	if len(data) > 4<<20 {
-		return registrationCoverPayload{}, errors.New("cover image must be 4 MB or smaller")
-	}
-
-	detectedContentType := http.DetectContentType(data)
-	if detectedContentType != contentType {
-		if contentType == "image/jpeg" && detectedContentType == "image/jpg" {
-			detectedContentType = contentType
-		}
-		if !strings.HasPrefix(detectedContentType, "image/") {
-			return registrationCoverPayload{}, errors.New("cover image content type is invalid")
-		}
-		contentType = detectedContentType
-	}
-
-	extensions, _ := mime.ExtensionsByType(contentType)
-	extension := ".bin"
-	if len(extensions) > 0 {
-		extension = extensions[0]
-	}
-
-	return registrationCoverPayload{
-		ContentType: contentType,
-		Data:        data,
-		Extension:   filepath.Clean(extension),
-	}, nil
-}
-
 func newOpaqueToken() (string, []byte, error) {
 	randomBytes := make([]byte, 32)
 	if _, err := rand.Read(randomBytes); err != nil {
@@ -643,28 +504,6 @@ func newOpaqueToken() (string, []byte, error) {
 
 	rawToken := base64.RawURLEncoding.EncodeToString(randomBytes)
 	return rawToken, hashToken(rawToken), nil
-}
-
-func newSixDigitCode() (string, []byte, error) {
-	value, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
-	if err != nil {
-		return "", nil, fmt.Errorf("generate verification code: %w", err)
-	}
-
-	code := fmt.Sprintf("%06d", value.Int64())
-	return code, hashToken(code), nil
-}
-
-func isSixDigitCode(value string) bool {
-	if len(value) != 6 {
-		return false
-	}
-	for _, character := range value {
-		if character < '0' || character > '9' {
-			return false
-		}
-	}
-	return true
 }
 
 func hashToken(rawToken string) []byte {
@@ -686,12 +525,4 @@ func clientIP(r *http.Request) string {
 	}
 
 	return host
-}
-
-func isUniqueViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) {
-		return false
-	}
-	return pgErr.Code == "23505"
 }

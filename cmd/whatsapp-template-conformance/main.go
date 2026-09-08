@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"time"
@@ -13,6 +14,8 @@ import (
 )
 
 func main() {
+	scope := flag.String("scope", "all", "template contract scope: all or auth")
+	flag.Parse()
 	if err := config.LoadDotEnv(); err != nil && !errors.Is(err, config.ErrNoEnvFileFound) && !errors.Is(err, os.ErrNotExist) {
 		fail("load .env", err)
 	}
@@ -22,9 +25,6 @@ func main() {
 	}
 	if !cfg.WhatsAppSendConfigured() {
 		fail("validate configuration", errors.New("WhatsApp outbound configuration is required"))
-	}
-	if err := whatsapp.ValidateEnabledTemplateKeys(cfg.WhatsAppEnabledTemplateKeys); err != nil {
-		fail("validate enabled templates", err)
 	}
 	client, err := whatsapp.NewClient(whatsapp.ClientConfig{
 		BaseURL: cfg.WhatsAppGraphBaseURL, GraphVersion: cfg.WhatsAppGraphVersion,
@@ -36,7 +36,19 @@ func main() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.WhatsAppHTTPTimeout+5*time.Second)
 	defer cancel()
-	report, err := client.ConformTemplates(ctx)
+	definitions := whatsapp.RegisteredTemplates()
+	if *scope == "auth" {
+		definition, ok := whatsapp.LookupTemplate(whatsapp.TemplateAuthCode)
+		if !ok {
+			fail("load auth template contract", errors.New("v_c_x is not registered"))
+		}
+		definitions = []whatsapp.TemplateDefinition{definition}
+	} else if *scope != "all" {
+		fail("validate scope", fmt.Errorf("unsupported template scope %q", *scope))
+	} else if err := whatsapp.ValidateEnabledTemplateKeys(cfg.WhatsAppEnabledTemplateKeys); err != nil {
+		fail("validate enabled templates", err)
+	}
+	report, err := client.ConformTemplateDefinitions(ctx, definitions)
 	if err != nil {
 		fail("check WhatsApp templates", err)
 	}

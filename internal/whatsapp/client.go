@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 const maxGraphResponseBytes = 1 << 20
@@ -105,6 +107,16 @@ type SendResult struct {
 	MessageID string
 }
 
+// RequestError identifies a failure that occurred before any Graph request was
+// issued. Callers may safely classify it as permanent without risking a
+// duplicate send.
+type RequestError struct {
+	Cause error
+}
+
+func (err *RequestError) Error() string { return "WhatsApp request is invalid: " + err.Cause.Error() }
+func (err *RequestError) Unwrap() error { return err.Cause }
+
 type graphSendResponse struct {
 	Messages []struct {
 		ID string `json:"id"`
@@ -113,15 +125,89 @@ type graphSendResponse struct {
 
 func (client *Client) SendTemplate(ctx context.Context, message TemplateMessage) (SendResult, error) {
 	if _, enabled := client.enabledTemplates[message.Key]; !enabled {
-		return SendResult{}, fmt.Errorf("WhatsApp template %q is not enabled", message.Key)
+		return SendResult{}, &RequestError{Cause: fmt.Errorf("template %q is not enabled", message.Key)}
 	}
 	payload, err := buildTemplateRequest(message)
 	if err != nil {
+		return SendResult{}, &RequestError{Cause: err}
+	}
+	return client.sendMessage(ctx, payload)
+}
+
+// SendText uses the same single-attempt transport and ambiguity classification as templates.
+func (client *Client) SendText(ctx context.Context, to, body, correlation string) (SendResult, error) {
+	normalized, err := normalizeInternationalE164(to)
+	correlationID, correlationErr := uuid.Parse(correlation)
+	if err != nil || strings.TrimSpace(body) == "" || len([]rune(body)) > 4096 || correlationErr != nil || correlationID == uuid.Nil {
+		return SendResult{}, &RequestError{Cause: errors.New("invalid WhatsApp text message")}
+	}
+	return client.sendMessage(ctx, map[string]any{"messaging_product": "whatsapp", "to": strings.TrimPrefix(normalized, "+"),
+		"type": "text", "text": map[string]any{"body": body, "preview_url": false}, "biz_opaque_callback_data": correlation})
+}
+
+type URLButton struct {
+	Label string
+	URL   string
+}
+
+// SendURLButton uses the same single-attempt transport and callback correlation
+// as text. A rejection never triggers a second send in a different format.
+func (client *Client) SendURLButton(ctx context.Context, to, body string, button URLButton, correlation string) (SendResult, error) {
+	normalized, err := normalizeInternationalE164(to)
+	id, idErr := uuid.Parse(correlation)
+	u, urlErr := url.Parse(button.URL)
+	if err != nil || idErr != nil || id == uuid.Nil || !utf8.ValidString(body) || strings.TrimSpace(body) == "" || utf8.RuneCountInString(body) > 1024 ||
+		!utf8.ValidString(button.Label) || strings.TrimSpace(button.Label) == "" || utf8.RuneCountInString(button.Label) > 20 ||
+		urlErr != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || containsControlCharacter(button.URL) {
+		return SendResult{}, &RequestError{Cause: errors.New("invalid WhatsApp URL button message")}
+	}
+	return client.sendMessage(ctx, map[string]any{
+		"messaging_product": "whatsapp", "recipient_type": "individual", "to": strings.TrimPrefix(normalized, "+"),
+		"type": "interactive", "biz_opaque_callback_data": correlation,
+		"interactive": map[string]any{"type": "cta_url", "body": map[string]string{"text": body},
+			"action": map[string]any{"name": "cta_url", "parameters": map[string]string{"display_text": button.Label, "url": button.URL}}},
+	})
+}
+
+func (client *Client) sendMessage(ctx context.Context, payload any) (SendResult, error) {
+	responseBody, err := client.postMessage(ctx, payload)
+	if err != nil {
 		return SendResult{}, err
 	}
+	var decoded graphSendResponse
+	if err := json.Unmarshal(responseBody, &decoded); err != nil || len(decoded.Messages) != 1 || strings.TrimSpace(decoded.Messages[0].ID) == "" {
+		return SendResult{}, &TransportError{Cause: errors.New("WhatsApp Graph success response has no message ID"), Ambiguous: true}
+	}
+	return SendResult{MessageID: decoded.Messages[0].ID}, nil
+}
+
+type TypingSender interface {
+	SendTyping(context.Context, string) error
+}
+
+// SendTyping marks the verified inbound WAMID read and signals typing. This is
+// one request with no internal retry, on the configured receiving phone only.
+func (client *Client) SendTyping(ctx context.Context, inboundMessageID string) error {
+	if strings.TrimSpace(inboundMessageID) == "" || len(inboundMessageID) > 512 {
+		return &RequestError{Cause: errors.New("invalid WhatsApp typing source")}
+	}
+	response, err := client.postMessage(ctx, map[string]any{"messaging_product": "whatsapp", "status": "read", "message_id": inboundMessageID, "typing_indicator": map[string]string{"type": "text"}})
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Success bool `json:"success"`
+	}
+	if err = json.Unmarshal(response, &result); err != nil || !result.Success {
+		return errors.New("WhatsApp typing was not acknowledged")
+	}
+	return nil
+}
+
+func (client *Client) postMessage(ctx context.Context, payload any) ([]byte, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return SendResult{}, fmt.Errorf("encode WhatsApp template request: %w", err)
+		return nil, &RequestError{Cause: fmt.Errorf("encode message request: %w", err)}
 	}
 	request, err := http.NewRequestWithContext(
 		ctx,
@@ -130,7 +216,7 @@ func (client *Client) SendTemplate(ctx context.Context, message TemplateMessage)
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		return SendResult{}, fmt.Errorf("create WhatsApp template request: %w", err)
+		return nil, &RequestError{Cause: fmt.Errorf("create message request: %w", err)}
 	}
 	request.Header.Set("Authorization", "Bearer "+client.accessToken)
 	request.Header.Set("Content-Type", "application/json")
@@ -141,30 +227,26 @@ func (client *Client) SendTemplate(ctx context.Context, message TemplateMessage)
 	request = request.WithContext(httptrace.WithClientTrace(request.Context(), trace))
 	response, err := client.httpClient.Do(request)
 	if err != nil {
-		return SendResult{}, &TransportError{Cause: err, Ambiguous: wroteRequest.Load()}
+		return nil, &TransportError{Cause: err, Ambiguous: wroteRequest.Load()}
 	}
 	defer response.Body.Close()
 	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, maxGraphResponseBytes+1))
 	if readErr != nil {
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			return SendResult{}, decodeGraphError(response.StatusCode, response.Header, nil)
+			return nil, decodeGraphError(response.StatusCode, response.Header, nil)
 		}
-		return SendResult{}, &TransportError{Cause: readErr, Ambiguous: true}
+		return nil, &TransportError{Cause: readErr, Ambiguous: true}
 	}
 	if len(responseBody) > maxGraphResponseBytes {
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			return SendResult{}, decodeGraphError(response.StatusCode, response.Header, nil)
+			return nil, decodeGraphError(response.StatusCode, response.Header, nil)
 		}
-		return SendResult{}, &TransportError{Cause: errors.New("WhatsApp Graph response exceeds limit"), Ambiguous: response.StatusCode < 300}
+		return nil, &TransportError{Cause: errors.New("WhatsApp Graph response exceeds limit"), Ambiguous: response.StatusCode < 300}
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return SendResult{}, decodeGraphError(response.StatusCode, response.Header, responseBody)
+		return nil, decodeGraphError(response.StatusCode, response.Header, responseBody)
 	}
-	var decoded graphSendResponse
-	if err := json.Unmarshal(responseBody, &decoded); err != nil || len(decoded.Messages) != 1 || strings.TrimSpace(decoded.Messages[0].ID) == "" {
-		return SendResult{}, &TransportError{Cause: errors.New("WhatsApp Graph success response has no message ID"), Ambiguous: true}
-	}
-	return SendResult{MessageID: decoded.Messages[0].ID}, nil
+	return responseBody, nil
 }
 
 type ErrorClass string

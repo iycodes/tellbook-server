@@ -7,32 +7,16 @@ import (
 )
 
 type Customer struct {
-	ID                 uuid.UUID  `json:"id"`
-	FullName           string     `json:"full_name"`
-	Email              string     `json:"email,omitempty"`
-	Phone              string     `json:"phone,omitempty"`
-	WhatsApp           string     `json:"whatsapp,omitempty"`
-	EmailVerifiedAt    *time.Time `json:"email_verified_at,omitempty"`
-	PhoneVerifiedAt    *time.Time `json:"phone_verified_at,omitempty"`
-	WhatsAppVerifiedAt *time.Time `json:"whatsapp_verified_at,omitempty"`
-	Birthday           string     `json:"birthday,omitempty"`
-	HasPassword        bool       `json:"has_password"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
-}
-
-type Challenge struct {
-	ID               uuid.UUID
-	IdentifierType   string
-	Identifier       string
-	DeliveryChannel  string
-	Purpose          string
-	TargetCustomerID *uuid.UUID
-	CodeHash         []byte
-	FailedAttempts   int
-	ExpiresAt        time.Time
-	ConsumedAt       *time.Time
-	CreatedAt        time.Time
+	ID              uuid.UUID  `json:"id"`
+	FullName        string     `json:"full_name"`
+	Email           string     `json:"email,omitempty"`
+	Phone           string     `json:"phone,omitempty"`
+	EmailVerifiedAt *time.Time `json:"email_verified_at,omitempty"`
+	PhoneVerifiedAt *time.Time `json:"phone_verified_at,omitempty"`
+	Birthday        string     `json:"birthday,omitempty"`
+	HasPassword     bool       `json:"has_password"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 type Session struct {
@@ -104,11 +88,13 @@ type SavedAddressLocation struct {
 }
 
 type NotificationPreferences struct {
-	BookingEmail    bool      `json:"booking_email"`
-	BookingSMS      bool      `json:"booking_sms"`
-	BookingWhatsApp bool      `json:"booking_whatsapp"`
-	MarketingEmail  bool      `json:"marketing_email"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	BookingEmail      bool      `json:"booking_email"`
+	BookingSMS        bool      `json:"booking_sms"`
+	BookingWhatsApp   bool      `json:"booking_whatsapp"`
+	MarketingEmail    bool      `json:"marketing_email"`
+	EmailAvailable    bool      `json:"email_available"`
+	WhatsAppAvailable bool      `json:"whatsapp_available"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 type NotificationPreferencesInput struct {
@@ -116,6 +102,11 @@ type NotificationPreferencesInput struct {
 	BookingSMS      bool `json:"booking_sms"`
 	BookingWhatsApp bool `json:"booking_whatsapp"`
 	MarketingEmail  bool `json:"marketing_email"`
+}
+
+type NotificationDeliveryCapabilities struct {
+	EmailReminderAvailable    bool `json:"email_reminder_available"`
+	WhatsAppReminderAvailable bool `json:"whatsapp_reminder_available"`
 }
 
 type ProfileInput struct {

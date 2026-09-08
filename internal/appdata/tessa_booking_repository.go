@@ -1,17 +1,17 @@
 package appdata
 
 import (
+	"booking/go-server/internal/tessa"
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
-const tessaBookingResultLimit = 8
+const tessaBookingResultLimit = tessa.MaxSearchResults
 
 type tessaBookingRecord struct {
 	ID                          uuid.UUID
@@ -56,22 +56,84 @@ func (record tessaBookingRecord) lifecycle() BookingLifecycle {
 	})
 }
 
+// Counts and lists share tenant, overlap, status, literal-search, and upcoming
+// predicates. The list's LIMIT is deliberately outside this shared filter.
+const tessaBookingFilterSQL = `
+	WHERE b.client_id=$1 AND b.start_at<$3 AND b.end_at>$2
+		AND (cardinality($4::text[])=0 OR LOWER(BTRIM(b.status))=ANY($4::text[]))
+		AND ($5='' OR b.title ILIKE '%'||$5||'%' ESCAPE '\' OR COALESCE(customer.full_name,'') ILIKE '%'||$5||'%' ESCAPE '\'
+			OR b.id::text=$5)
+		AND ($6 OR LOWER(BTRIM(b.status))<>ALL(ARRAY['cancelled','canceled','declined','expired','no_show']))
+		AND ($7::timestamptz IS NULL OR b.start_at >= $7)
+		AND CASE $8::text
+			WHEN 'any' THEN TRUE
+			WHEN 'unpaid' THEN b.payment_status<>ALL(ARRAY['deposit_paid_balance_due','paid_in_full'])
+			WHEN 'balance_due' THEN b.payment_status='deposit_paid_balance_due'
+			WHEN 'paid_in_full' THEN b.payment_status='paid_in_full'
+			ELSE FALSE END
+		AND LOWER(BTRIM(b.status))<>ALL($9::text[])
+`
+
+type TessaBookingFilter struct {
+	Query                      string
+	Statuses, ExcludedStatuses []string
+	PaymentState               string
+	StartsNotBefore            *time.Time
+}
+
+func (filter TessaBookingFilter) queryArgs(clientID uuid.UUID, from, to time.Time, includeTerminal bool) []any {
+	statusValues := func(values []string) []string {
+		result := make([]string, 0, len(values)+1)
+		cancelled := false
+		for _, value := range values {
+			if value == "cancelled" || value == "canceled" {
+				cancelled = true
+			} else {
+				result = append(result, value)
+			}
+		}
+		if cancelled {
+			result = append(result, "cancelled", "canceled")
+		}
+		return result
+	}
+	state := filter.PaymentState
+	if state == "" {
+		state = "any"
+	}
+	return []any{clientID, from.UTC(), to.UTC(), statusValues(filter.Statuses), escapeTessaLikeQuery(filter.Query), includeTerminal, filter.StartsNotBefore, state, statusValues(filter.ExcludedStatuses)}
+}
+
+type TessaBookingCount struct {
+	From          string `json:"from"`
+	To            string `json:"to"`
+	Timezone      string `json:"timezone"`
+	TotalBookings int64  `json:"total_bookings"`
+	Exact         bool   `json:"exact"`
+}
+
+func (r *Repository) CountTessaBookings(ctx context.Context, clientID uuid.UUID, from, to time.Time, filter TessaBookingFilter) (TessaBookingCount, error) {
+	result := TessaBookingCount{From: from.Format(time.DateOnly), To: to.AddDate(0, 0, -1).Format(time.DateOnly), Timezone: from.Location().String(), Exact: true}
+	err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM bookings b
+		LEFT JOIN customers customer ON customer.id=b.customer_id AND customer.client_id=b.client_id
+	`+tessaBookingFilterSQL, filter.queryArgs(clientID, from, to, true)...).Scan(&result.TotalBookings)
+	if err != nil {
+		return TessaBookingCount{}, fmt.Errorf("count Tessa bookings: %w", err)
+	}
+	return result, nil
+}
+
 func (r *Repository) SearchTessaBookings(
 	ctx context.Context,
 	clientID uuid.UUID,
 	from, to time.Time,
-	statuses []string,
-	query string,
+	filter TessaBookingFilter,
 	limit int,
 	includeTerminal bool,
 ) (TessaBookingSearchResult, error) {
 	if limit < 1 || limit > tessaBookingResultLimit {
 		limit = tessaBookingResultLimit
 	}
-	if statuses == nil {
-		statuses = []string{}
-	}
-	query = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(strings.TrimSpace(query))
 	rows, err := r.db.Query(ctx, `
 		SELECT b.id,b.service_id,b.title,COALESCE(customer.full_name,''),b.start_at,b.end_at,
 			COALESCE(NULLIF(BTRIM(b.timezone),''),NULLIF(BTRIM(profile.timezone),''),'Africa/Lagos'),
@@ -81,13 +143,8 @@ func (r *Repository) SearchTessaBookings(
 		FROM bookings b
 		LEFT JOIN customers customer ON customer.id=b.customer_id AND customer.client_id=b.client_id
 		LEFT JOIN client_profiles profile ON profile.client_id=b.client_id
-		WHERE b.client_id=$1 AND b.start_at<$3 AND b.end_at>$2
-			AND (cardinality($4::text[])=0 OR LOWER(BTRIM(b.status))=ANY($4::text[]))
-			AND ($5='' OR b.title ILIKE '%'||$5||'%' ESCAPE '\' OR COALESCE(customer.full_name,'') ILIKE '%'||$5||'%' ESCAPE '\'
-				OR b.id::text=$5)
-			AND ($6 OR LOWER(BTRIM(b.status))<>ALL(ARRAY['cancelled','canceled','declined','expired','no_show']))
-		ORDER BY b.start_at,b.id LIMIT $7
-	`, clientID, from.UTC(), to.UTC(), statuses, query, includeTerminal, limit+1)
+	`+tessaBookingFilterSQL+` ORDER BY b.start_at,b.id LIMIT $10
+	`, append(filter.queryArgs(clientID, from, to, includeTerminal), limit+1)...)
 	if err != nil {
 		return TessaBookingSearchResult{}, fmt.Errorf("search Tessa bookings: %w", err)
 	}
@@ -206,6 +263,7 @@ func (r *Repository) GetTessaAvailability(
 	ctx context.Context,
 	clientID uuid.UUID,
 	serviceID uuid.UUID,
+	serviceQuery string,
 	from time.Time,
 	days int,
 ) (TessaAvailabilityResult, error) {
@@ -219,9 +277,10 @@ func (r *Repository) GetTessaAvailability(
 		FROM services service INNER JOIN client_profiles profile ON profile.client_id=service.client_id
 		WHERE service.client_id=$1 AND service.status='published' AND service.is_active
 			AND NOT COALESCE(service.is_hidden,FALSE) AND ($2::uuid='00000000-0000-0000-0000-000000000000' OR service.id=$2)
+			AND ($3='' OR service.title ILIKE '%'||$3||'%' ESCAPE '\')
 		ORDER BY service.sort_order,service.title,service.id LIMIT 4
 	`
-	rows, err := r.db.Query(ctx, query, clientID, serviceID)
+	rows, err := r.db.Query(ctx, query, clientID, serviceID, escapeTessaLikeQuery(serviceQuery))
 	if err != nil {
 		return TessaAvailabilityResult{}, fmt.Errorf("list Tessa availability services: %w", err)
 	}
@@ -239,7 +298,7 @@ func (r *Repository) GetTessaAvailability(
 		return TessaAvailabilityResult{}, err
 	}
 	rows.Close()
-	if serviceID != uuid.Nil && len(services) == 0 {
+	if (serviceID != uuid.Nil || serviceQuery != "") && len(services) == 0 {
 		return TessaAvailabilityResult{}, ErrNotFound
 	}
 	hasMoreServices := len(services) > 3

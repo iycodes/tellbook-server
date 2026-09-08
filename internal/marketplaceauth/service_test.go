@@ -6,13 +6,10 @@ import (
 	"time"
 )
 
-func TestSessionValidationPolicyRevalidatesCommands(t *testing.T) {
-	if sessionRequiresFreshValidation(http.MethodGet) || sessionRequiresFreshValidation(http.MethodHead) {
-		t.Fatal("read-only requests should accept a bounded positive session cache entry")
-	}
-	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+func TestSessionValidationPolicyRevalidatesEveryProtectedRequest(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
 		if !sessionRequiresFreshValidation(method) {
-			t.Fatalf("%s should revalidate the session in PostgreSQL", method)
+			t.Fatalf("%s should revalidate revoked sessions in PostgreSQL", method)
 		}
 	}
 }
@@ -22,8 +19,8 @@ func TestNormalizeIdentifier(t *testing.T) {
 		name, input, channel, wantType, wantIdentifier, wantChannel string
 	}{
 		{"email", " Customer@Example.COM ", "email", "email", "customer@example.com", "email"},
-		{"nigerian local phone", "0803 555 0147", "sms", "phone", "+2348035550147", "sms"},
-		{"whatsapp", "+234-803-555-0147", "whatsapp", "whatsapp", "+2348035550147", "whatsapp"},
+		{"phone lookup", "0803 555 0147", "", "phone", "+2348035550147", ""},
+		{"whatsapp", "+234-803-555-0147", "whatsapp", "phone", "+2348035550147", "whatsapp"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

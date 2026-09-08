@@ -21,6 +21,7 @@
 		"auth_and_account": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
 		"provider_application": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
 		"booking_contention": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
+		"notification_phase_a": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
 		"inbox_and_tessa": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
 		"idle_sse_10000": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
 		"controlled_event_burst": { "requests": 0, "failures": 0, "intentional_rejections": 0, "evidence": "" },
@@ -36,6 +37,8 @@
 		"no_database_heartbeat_work": false,
 		"no_sustained_pool_saturation": false,
 		"no_queue_or_event_lag_growth": false,
+		"notification_channel_isolation": false,
+		"notification_webhook_phone_isolation": false,
 		"no_unbounded_memory_growth": false,
 		"bundle_budgets_passed": false
 	}

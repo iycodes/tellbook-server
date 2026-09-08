@@ -45,7 +45,7 @@ func TestWebhookVerificationHandshake(t *testing.T) {
 func TestWebhookPersistsConfiguredPhoneStatusWithoutRawContent(t *testing.T) {
 	store := &webhookStoreStub{}
 	handler, secret := newTestWebhookHandler(t, store)
-	body := `{"object":"whatsapp_business_account","entry":[{"id":"222","changes":[{"field":"messages","value":{"messaging_product":"whatsapp","metadata":{"phone_number_id":"333"},"statuses":[{"id":"wamid.status-1","status":"delivered","timestamp":"1788523200"}],"messages":[{"id":"wamid.inbound-1","from":"2348012345678","timestamp":"1788523201","type":"text","text":{"body":"private body"}}]}}]}]}`
+	body := `{"object":"whatsapp_business_account","entry":[{"id":"222","changes":[{"field":"messages","value":{"messaging_product":"whatsapp","metadata":{"phone_number_id":"333"},"statuses":[{"id":"wamid.status-1","status":"delivered","timestamp":"1788523200","biz_opaque_callback_data":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}],"messages":[{"id":"wamid.inbound-1","from":"2348012345678","timestamp":"1788523201","type":"text","text":{"body":"private body"}}]}}]}]}`
 	response := sendSignedWebhook(handler, secret, body)
 	if response.Code != http.StatusOK || response.Body.String() != `{"accepted":true}` {
 		t.Fatalf("response = %d %q", response.Code, response.Body.String())
@@ -56,17 +56,30 @@ func TestWebhookPersistsConfiguredPhoneStatusWithoutRawContent(t *testing.T) {
 	if store.receipts[0].MessageStatus != "delivered" || store.receipts[0].ProcessingStatus != "pending" {
 		t.Fatalf("status receipt = %#v", store.receipts[0])
 	}
+	if store.receipts[0].CorrelationID != "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" {
+		t.Fatalf("status correlation = %q", store.receipts[0].CorrelationID)
+	}
 	if store.receipts[1].EventKind != "inbound_message" || store.receipts[1].ProcessingStatus != "completed" {
 		t.Fatalf("inbound receipt = %#v", store.receipts[1])
 	}
-	if store.receipts[1].control.kind != "" {
-		t.Fatalf("ordinary inbound text was classified as a control: %#v", store.receipts[1].control)
+	if store.receipts[1].control.kind != "tessa_onboarding" {
+		t.Fatal("text was not routed to transient, gated onboarding")
 	}
 	for _, receipt := range store.receipts {
 		encoded := receipt.MessageID + receipt.MessageStatus + receipt.ProviderErrorCode
 		if strings.Contains(encoded, "private body") || strings.Contains(encoded, "2348012345678") {
 			t.Fatalf("receipt retained inbound content or sender: %#v", receipt)
 		}
+	}
+}
+
+func TestWebhookDropsMalformedOpaqueCorrelation(t *testing.T) {
+	store := &webhookStoreStub{}
+	handler, secret := newTestWebhookHandler(t, store)
+	body := `{"object":"whatsapp_business_account","entry":[{"id":"222","changes":[{"field":"messages","value":{"messaging_product":"whatsapp","metadata":{"phone_number_id":"333"},"statuses":[{"id":"wamid.status-invalid-correlation","status":"sent","timestamp":"1788523200","biz_opaque_callback_data":"not-a-delivery-id"}]}}]}]}`
+	response := sendSignedWebhook(handler, secret, body)
+	if response.Code != http.StatusOK || len(store.receipts) != 1 || store.receipts[0].CorrelationID != "" {
+		t.Fatalf("malformed correlation response=%d receipts=%#v", response.Code, store.receipts)
 	}
 }
 

@@ -222,7 +222,7 @@ func (r *Repository) GetMarketplaceCustomerBooking(
 			(NULLIF(BTRIM(b.agreement_title_snapshot), '') IS NOT NULL OR b.standalone_signature_required_snapshot),
 			b.cancellation_notice_minutes_snapshot, b.cancellation_refund_bps_snapshot,
 			b.reschedule_notice_minutes_snapshot, b.reschedule_fee_minor_snapshot,
-			b.automated_reschedule_snapshot
+			b.automated_reschedule_snapshot, COALESCE(profile.booking_contact_phone, '')
 		FROM bookings b
 		INNER JOIN client_profiles profile ON profile.client_id=b.client_id
 		INNER JOIN client_profile_handles handle ON handle.client_id=b.client_id
@@ -273,6 +273,7 @@ func (r *Repository) GetMarketplaceCustomerBooking(
 		&detail.ConversationID, &detail.ReviewID, &servicePublished, &agreementRequired,
 		&cancellationNoticeMinutes, &cancellationRefundBPS, &rescheduleNoticeMinutes,
 		&rescheduleFeeMinor, &automatedReschedule,
+		&detail.ProviderContactPhone,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return MarketplaceBookingDetail{}, ErrNotFound
@@ -321,6 +322,10 @@ func (r *Repository) GetMarketplaceCustomerBooking(
 	detail.PaymentHistory = paymentHistory
 	detail.RefundHistory = refundHistory
 	detail.ChangeHistory = changeHistory
+	detail.DeliveryStatus, err = r.loadBookingDeliveryStatus(ctx, bookingID)
+	if err != nil {
+		return MarketplaceBookingDetail{}, err
+	}
 	return detail, nil
 }
 

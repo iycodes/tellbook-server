@@ -58,13 +58,16 @@ The seed command creates a demo provider user plus related profile, services, cl
 
 - `GET /v1/healthz`
 - `GET /v1/meta/markets`
-- `POST /v1/auth/register`
-- `POST /v1/auth/register/verify`
-- `POST /v1/auth/register/resend`
-- `POST /v1/auth/login`
-- `POST /v1/auth/session`
-- `POST /v1/auth/password/forgot`
+- `GET /v1/auth/capabilities`
+- `POST /v1/auth/code`
+- `GET /v1/auth/code/{challengeID}`
+- `POST /v1/auth/code/resend`
+- `POST /v1/auth/verify`
+- `POST /v1/auth/password`
+- `POST /v1/auth/password/reset/code`
+- `POST /v1/auth/password/reset/verify`
 - `POST /v1/auth/password/reset`
+- `POST /v1/auth/session`
 - `POST /v1/auth/logout`
 - `GET /v1/app/profile`
 - `PUT /v1/app/profile`
@@ -80,18 +83,18 @@ Profile market settings are stored as one all-or-nothing tuple: country, currenc
 
 ## Auth behavior
 
-- register stores a short-lived pending registration and sends an email verification code
-- successful registration verification and login set short-lived access and long-lived refresh cookies; both are `HttpOnly`
-- register accepts optional `bio`, `cover_image_data_url`, and `cover_image_content_type`
-- pending registration password hashes and verification token hashes are stored in `auth_pending_registrations`
+- email or WhatsApp code verification signs into an existing account or creates a passwordless account
+- verification and password sign-in set short-lived access and long-lived refresh cookies; both are `HttpOnly`
+- passwords are optional and can be added, changed, or recovered through the same auth surface
+- authentication codes are queued for durable delivery and stored only as hashes; delivery payloads are encrypted until terminal handling
 - `POST /v1/auth/session` validates the access cookie and rotates the refresh token only when the access cookie has expired
 - refresh tokens are stored hashed in `auth_refresh_sessions`
-- password reset tokens are stored hashed in `auth_password_reset_tokens`
+- verified password recovery uses a short-lived, single-use hashed grant in `auth_password_reset_grants`
 - `POST /v1/auth/logout` revokes the current refresh token cookie
 
 ## Optional R2 setup
 
-If you want registration cover images stored in Cloudflare R2, set:
+If you want application media stored in Cloudflare R2, set:
 
 - `R2_PRIVATE_BUCKET_NAME`
 - `R2_PUBLIC_BUCKET_NAME` if you want public assets separated
@@ -116,6 +119,18 @@ Optional overrides, if you do not want the defaults:
 - `SMTP_SECURITY` defaults to `tls`
 - `SMTP_INSECURE_SKIP_VERIFY` defaults to `false`
 - `SMTP_CONNECT_TIMEOUT` defaults to `10s`
+
+Durable booking email delivery is separately gated by `NOTIFICATION_EMAIL_ENABLED` on worker processes. It requires `NOTIFICATION_DESTINATION_HMAC_KEY`, reuses at most `NOTIFICATION_EMAIL_CONCURRENCY` dedicated SMTP connections (default `4`), and bounds each attempt with `NOTIFICATION_EMAIL_TIMEOUT` (default `30s`). Its pool is isolated from synchronous authentication and agreement email so a notification backlog cannot consume their SMTP capacity. Keep the flag disabled until the target SMTP sandbox or inbox has passed acceptance testing.
+
+New-account welcome email delivery is gated independently by `WELCOME_EMAIL_ENABLED` on worker processes. It snapshots the active audience template when a verified provider or email-based marketplace account is first created, then sends that immutable assignment using a dedicated SMTP pool. `WELCOME_EMAIL_CONCURRENCY` defaults to `2` and `WELCOME_EMAIL_TIMEOUT` defaults to `30s`; this keeps a welcome backlog isolated from authentication and booking-notification delivery. Templates are versioned in `welcome_email_templates`, while `welcome_email_jobs` contains the exact assigned subject and bodies. No historical accounts are backfilled automatically.
+
+Passwordless authentication uses one encrypted durable queue for the provider and marketplace realms. `AUTH_EMAIL_ENABLED` and `AUTH_WHATSAPP_ENABLED` are independent capability flags; disabled channels are omitted from both APIs and both modals. WhatsApp auth uses an auth-only sender allowlist containing `v_c_x`, never `WHATSAPP_ENABLED_TEMPLATE_KEYS`. Before enabling it, run `make auth-whatsapp-template-conformance` and complete the authorized real-recipient journey in [`docs/operations/auth-whatsapp.md`](docs/operations/auth-whatsapp.md). Email transport can be certified for both realms with `AUTH_EMAIL_TEST_DESTINATION=authorized@example.com make auth-email-live-conformance`; this sends two real messages and must only target a consenting recipient. The raw destination and code exist only inside the short-lived encrypted queue payload and are cleared after provider acceptance or any terminal outcome.
+
+Durable WhatsApp booking delivery is separately gated by `NOTIFICATION_WHATSAPP_ENABLED`. Worker processes use `WHATSAPP_WORKER_CONCURRENCY` (default `4`) and `WHATSAPP_HTTP_TIMEOUT` for bounded Graph API calls. Verified Meta delivery callbacks continue to be processed whenever the WABA and phone-number IDs are configured, even while outbound delivery is disabled, so rollout changes do not strand statuses. Keep outbound disabled until the enabled templates have passed recipient and callback acceptance testing. Customer reminders additionally require a verified business contact explicitly shared with booked customers.
+
+The repeatable Phase A load/failure gate, queue health snapshot, gradual-enable checklist, and incident actions are documented in [`docs/operations/notification-phase-a.md`](docs/operations/notification-phase-a.md).
+
+Verified business customer contact, independent public/booking sharing permissions, and the resolved customer-reminder phone parameter are documented in [`docs/operations/business-customer-contact.md`](docs/operations/business-customer-contact.md).
 
 ## Optional Paystack setup
 

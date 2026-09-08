@@ -60,7 +60,7 @@ func (generator *tessaRetryGenerator) GenerateJSON(
 		if generator.synthesizing == 1 {
 			return aierror.Transient("test Tessa synthesis", aierror.KindUnavailable, errors.New("unavailable"))
 		}
-		value.Content = "Tellbook uses your availability settings when calculating booking times."
+		value.Parts = []tessa.AnswerPart{{Text: "Tellbook uses your availability settings when calculating booking times."}}
 		return nil
 	default:
 		return fmt.Errorf("unexpected Tessa destination %T", destination)
@@ -75,17 +75,27 @@ func (generator *tessaRetryGenerator) callCounts() (int, int) {
 
 func (tessaScheduleGenerator) GenerateJSON(
 	_ context.Context,
-	_, _ string,
+	_, prompt string,
 	destination any,
 ) error {
 	switch value := destination.(type) {
 	case *tessa.Plan:
 		*value = tessa.Plan{
 			Scope: "in_scope", Intent: "schedule", AnswerMode: "tools",
-			Tools: []tessa.ToolRequest{{Name: "get_schedule", From: "2026-09-01", To: "2026-09-01"}},
+			Tools: []tessa.ToolRequest{{Name: "get_schedule", Period: "custom", TimeScope: "period", From: "2026-09-01", To: "2026-09-01"}},
 		}
 	case *tessa.Answer:
-		value.Content = "You have one consultation on your schedule."
+		var input tessa.SynthesisInput
+		if err := json.Unmarshal([]byte(prompt[strings.Index(prompt, "{"):]), &input); err != nil {
+			return err
+		}
+		var result TessaBookingSearchResult
+		if err := json.Unmarshal(input.Evidence[0].Result, &result); err != nil {
+			return err
+		}
+		for _, booking := range result.Items {
+			value.Parts = append(value.Parts, tessa.AnswerPart{EntityID: booking.BookingID, Text: "You have one consultation on your schedule."})
+		}
 	default:
 		return fmt.Errorf("unexpected Tessa destination %T", destination)
 	}
@@ -126,7 +136,7 @@ func (generator *tessaIntegrationGenerator) GenerateJSON(
 			Tools: []tessa.ToolRequest{{Name: "search_tellbook_help", Query: "booking availability"}},
 		}
 	case *tessa.Answer:
-		value.Content = "Tellbook uses your availability settings when calculating booking times."
+		value.Parts = []tessa.AnswerPart{{Text: "Tellbook uses your availability settings when calculating booking times."}}
 	default:
 		return fmt.Errorf("unexpected Tessa destination %T", destination)
 	}
@@ -739,6 +749,16 @@ func TestTessaBookingReadsAreTenantScopedAndContactFree(t *testing.T) {
 	if _, err := repo.GetTessaBooking(ctx, otherClientID, bookingID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-tenant error = %v, want not found", err)
 	}
+	from, to, _ := tessaDateRange("2026-09-01", "2026-09-01", "Africa/Lagos")
+	checkedAt := time.Date(2026, 9, 1, 9, 30, 0, 0, time.UTC)
+	day, err := repo.SearchTessaBookings(ctx, clientID, from, to, TessaBookingFilter{}, 8, false)
+	if err != nil || len(day.Items) != 1 {
+		t.Fatal(day, err)
+	}
+	next, err := repo.SearchTessaBookings(ctx, clientID, from, to, TessaBookingFilter{StartsNotBefore: &checkedAt}, 8, false)
+	if err != nil || len(next.Items) != 0 {
+		t.Fatal("past start returned as upcoming", next, err)
+	}
 	payload, err := json.Marshal(detail)
 	if err != nil {
 		t.Fatal(err)
@@ -824,6 +844,26 @@ func TestTessaScheduleToolPersistsSafeNavigationEvidence(t *testing.T) {
 	if answer.Presentation.Kind != "navigation_actions" || len(answer.EntityReferences) != 1 ||
 		answer.EntityReferences[0].ID != bookingID.String() {
 		t.Fatalf("answer navigation = %+v / %+v", answer.Presentation, answer.EntityReferences)
+	}
+	followup, err := repo.SendTessaMessage(ctx, clientID, uuid.MustParse(bootstrap.Thread.ID), uuid.New(), "Has that booking been paid?", "self_hosted", "test", tessaTestConfigHash, "test-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, recent, err := worker.loadContext(ctx, tessaClaimedRun{ClientID: clientID, ThreadID: uuid.MustParse(bootstrap.Thread.ID), TriggerMessageID: uuid.MustParse(followup.Message.ID)})
+	if err != nil || len(recent) != 2 || len(recent[1].References) != 1 || recent[1].References[0].ID != bookingID.String() {
+		t.Fatal("follow-up lost committed booking reference", recent, err)
+	}
+	previous, err := worker.loadPreviousTessaTools(ctx, tessaClaimedRun{ClientID: clientID, ThreadID: uuid.MustParse(bootstrap.Thread.ID), TriggerMessageID: uuid.MustParse(followup.Message.ID)})
+	if err != nil || len(previous) != 1 || previous[0].Name != "get_schedule" {
+		t.Fatal("follow-up lost exact query scope", previous, err)
+	}
+	isolated, err := worker.loadPreviousTessaTools(ctx, tessaClaimedRun{ClientID: uuid.New(), ThreadID: uuid.MustParse(bootstrap.Thread.ID), TriggerMessageID: uuid.MustParse(followup.Message.ID)})
+	if err != nil || len(isolated) != 0 {
+		t.Fatal("previous query scope crossed tenants", isolated, err)
+	}
+	before, err := worker.loadPreviousTessaTools(ctx, tessaClaimedRun{ClientID: clientID, ThreadID: uuid.MustParse(bootstrap.Thread.ID), TriggerMessageID: uuid.MustParse(response.Message.ID)})
+	if err != nil || len(before) != 0 {
+		t.Fatal("future answer changed an earlier run's query context", before, err)
 	}
 	var safeResult string
 	if err := pool.QueryRow(ctx, `

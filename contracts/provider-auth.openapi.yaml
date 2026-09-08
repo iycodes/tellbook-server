@@ -1,0 +1,290 @@
+openapi: 3.1.0
+info:
+  title: Tellbook Provider Authentication API
+  version: 1.0.0
+servers:
+  - url: /v1
+paths:
+  /auth/capabilities:
+    get:
+      operationId: getProviderAuthCapabilities
+      security: []
+      responses:
+        '200':
+          description: Currently available provider sign-in methods.
+          content:
+            application/json:
+              schema: { $ref: './auth.schemas.yaml#/components/schemas/AuthCapabilities' }
+  /auth/code:
+    post:
+      operationId: startProviderAuthCode
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/CodeStartInput' }
+      responses:
+        '202': { $ref: '#/components/responses/AuthChallengeAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/AuthRateLimited' }
+  /auth/code/{challengeID}:
+    get:
+      operationId: getProviderAuthCodeStatus
+      security: []
+      parameters:
+        - name: challengeID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { $ref: '#/components/responses/AuthChallengeReady' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /auth/code/resend:
+    post:
+      operationId: resendProviderAuthCode
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/CodeResendInput' }
+      responses:
+        '202': { $ref: '#/components/responses/AuthChallengeAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/AuthRateLimited' }
+  /auth/verify:
+    post:
+      operationId: verifyProviderAuthCode
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/CodeVerifyInput' }
+      responses:
+        '200':
+          description: Provider session created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProviderCodeSessionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /auth/password:
+    post:
+      operationId: signInProviderWithPassword
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/PasswordSignInInput' }
+      responses:
+        '200':
+          description: Provider session created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProviderSessionResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/password/reset/code:
+    post:
+      operationId: startProviderPasswordReset
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/PasswordResetStartInput' }
+      responses:
+        '202': { $ref: '#/components/responses/AuthChallengeAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/AuthRateLimited' }
+  /auth/password/reset/verify:
+    post:
+      operationId: verifyProviderPasswordReset
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/PasswordResetVerifyInput' }
+      responses:
+        '200':
+          description: Single-use reset grant.
+          content:
+            application/json:
+              schema: { $ref: './auth.schemas.yaml#/components/schemas/PasswordResetVerifyResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /auth/password/reset:
+    post:
+      operationId: completeProviderPasswordReset
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/PasswordResetCompleteInput' }
+      responses:
+        '200':
+          description: Password updated and a replacement session created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProviderSessionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /auth/session:
+    post:
+      operationId: getOrRefreshProviderSession
+      security: []
+      responses:
+        '200':
+          description: Current provider session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProviderSessionResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/logout:
+    post:
+      operationId: logoutProvider
+      security: []
+      responses:
+        '204': { description: Provider session ended. }
+        '500': { $ref: '#/components/responses/BadRequest' }
+  /app/me/identities/code:
+    post:
+      operationId: startProviderIdentityLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/CodeStartInput' }
+      responses:
+        '202': { $ref: '#/components/responses/AuthChallengeAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/BadRequest' }
+  /app/me/password:
+    patch:
+      operationId: updateProviderPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/PasswordUpdateInput' }
+      responses:
+        '200':
+          description: Password updated; existing sessions are revoked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProviderIdentityLinkResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /app/me/identities/code/{challengeID}:
+    get:
+      operationId: getProviderIdentityLinkStatus
+      parameters:
+        - name: challengeID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { $ref: '#/components/responses/AuthChallengeReady' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /app/me/identities/code/resend:
+    post:
+      operationId: resendProviderIdentityLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/CodeResendInput' }
+      responses:
+        '202': { $ref: '#/components/responses/AuthChallengeAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /app/me/identities/verify:
+    post:
+      operationId: verifyProviderIdentityLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/CodeVerifyInput' }
+      responses:
+        '200':
+          description: Identity linked; existing sessions are revoked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProviderIdentityLinkResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/BadRequest' }
+components:
+  securitySchemes:
+    providerAccess:
+      type: apiKey
+      in: cookie
+      name: booking_access
+    providerRefresh:
+      type: apiKey
+      in: cookie
+      name: booking_refresh
+  responses:
+    BadRequest:
+      description: Provider authentication request failed.
+      content:
+        application/json:
+          schema: { $ref: './auth.schemas.yaml#/components/schemas/Error' }
+    Unauthorized:
+      description: Provider credentials or session are invalid.
+      content:
+        application/json:
+          schema: { $ref: './auth.schemas.yaml#/components/schemas/Error' }
+    AuthChallengeAccepted:
+      description: Challenge queued without disclosing account existence.
+      content:
+        application/json:
+          schema: { $ref: './auth.schemas.yaml#/components/schemas/ChallengeResponse' }
+    AuthChallengeReady:
+      description: Current delivery and verification state for the challenge.
+      content:
+        application/json:
+          schema: { $ref: './auth.schemas.yaml#/components/schemas/ChallengeResponse' }
+    AuthRateLimited:
+      description: Authentication request limit reached.
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 1 } }
+      content:
+        application/json:
+          schema: { $ref: './auth.schemas.yaml#/components/schemas/Error' }
+  schemas:
+    Provider:
+      type: object
+      additionalProperties: false
+      required: [id, full_name, bio, has_password, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        full_name: { type: string }
+        bio: { type: string }
+        cover_image_url: { type: string }
+        email: { type: string, format: email }
+        email_verified_at: { type: string, format: date-time }
+        has_password: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ProviderSessionResponse:
+      type: object
+      additionalProperties: false
+      required: [user]
+      properties:
+        user: { $ref: '#/components/schemas/Provider' }
+    ProviderCodeSessionResponse:
+      type: object
+      additionalProperties: false
+      required: [user, is_new_account, onboarding_required]
+      properties:
+        user: { $ref: '#/components/schemas/Provider' }
+        is_new_account: { type: boolean }
+        onboarding_required: { type: boolean }
+    ProviderIdentityLinkResponse:
+      type: object
+      additionalProperties: false
+      required: [user, reauthentication_required]
+      properties:
+        user: { $ref: '#/components/schemas/Provider' }
+        reauthentication_required: { type: boolean, const: true }

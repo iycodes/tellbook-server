@@ -10,6 +10,7 @@ const REQUIRED_SCENARIOS = [
 	'auth_and_account',
 	'provider_application',
 	'booking_contention',
+	'notification_phase_a',
 	'inbox_and_tessa',
 	'idle_sse_10000',
 	'controlled_event_burst',
@@ -26,6 +27,8 @@ const REQUIRED_ASSERTIONS = [
 	'no_database_heartbeat_work',
 	'no_sustained_pool_saturation',
 	'no_queue_or_event_lag_growth',
+	'notification_channel_isolation',
+	'notification_webhook_phone_isolation',
 	'no_unbounded_memory_growth',
 	'bundle_budgets_passed'
 ];

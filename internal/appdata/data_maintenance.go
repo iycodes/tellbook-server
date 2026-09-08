@@ -95,26 +95,19 @@ func pruneMaintenanceTask(
 }
 
 var dataMaintenanceTasks = []dataMaintenanceTask{
+	{name: "provider_customer_contact_challenges", query: `
+		WITH expired AS (
+			SELECT id FROM provider_customer_contact_challenges WHERE expires_at<$1
+			ORDER BY expires_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM provider_customer_contact_challenges item USING expired WHERE item.id=expired.id
+	`},
 	{name: "resolved_locations", query: `
 		WITH expired AS (
 			SELECT id FROM resolved_locations WHERE expires_at<$1
 			ORDER BY expires_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
 		)
 		DELETE FROM resolved_locations item USING expired WHERE item.id=expired.id
-	`},
-	{name: "provider_pending_registrations", query: `
-		WITH expired AS (
-			SELECT id FROM auth_pending_registrations WHERE expires_at<$1
-			ORDER BY expires_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
-		)
-		DELETE FROM auth_pending_registrations item USING expired WHERE item.id=expired.id
-	`},
-	{name: "provider_password_resets", query: `
-		WITH expired AS (
-			SELECT id FROM auth_password_reset_tokens WHERE expires_at<$1
-			ORDER BY expires_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
-		)
-		DELETE FROM auth_password_reset_tokens item USING expired WHERE item.id=expired.id
 	`},
 	{name: "provider_refresh_sessions", query: `
 		WITH expired AS (
@@ -123,11 +116,37 @@ var dataMaintenanceTasks = []dataMaintenanceTask{
 		)
 		DELETE FROM auth_refresh_sessions item USING expired WHERE item.id=expired.id
 	`},
+	{name: "provider_auth_challenges", query: `
+		WITH expired AS (
+			SELECT id FROM provider_auth_challenges
+			WHERE COALESCE(verify_expires_at,delivery_deadline)<$1::timestamptz-INTERVAL '24 hours'
+			ORDER BY COALESCE(verify_expires_at,delivery_deadline),id
+			LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM provider_auth_challenges item USING expired WHERE item.id=expired.id
+	`},
+	{name: "terminal_auth_code_delivery_jobs", query: `
+			WITH expired AS (
+			SELECT id FROM auth_code_delivery_jobs
+			WHERE status IN ('accepted','sent','delivered','unknown','failed','expired')
+			  AND COALESCE(completed_at,updated_at)<$1::timestamptz-INTERVAL '24 hours'
+			ORDER BY COALESCE(completed_at,updated_at),id LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+			DELETE FROM auth_code_delivery_jobs item USING expired WHERE item.id=expired.id
+		`},
+	{name: "auth_password_reset_grants", query: `
+			WITH expired AS (
+				SELECT id FROM auth_password_reset_grants WHERE expires_at<$1
+				ORDER BY expires_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
+			)
+			DELETE FROM auth_password_reset_grants item USING expired WHERE item.id=expired.id
+		`},
 	{name: "marketplace_auth_challenges", query: `
 		WITH expired AS (
 			SELECT id FROM marketplace_auth_challenges
-			WHERE expires_at<$1::timestamptz-INTERVAL '24 hours'
-			ORDER BY expires_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
+			WHERE COALESCE(verify_expires_at,delivery_deadline)<$1::timestamptz-INTERVAL '24 hours'
+			ORDER BY COALESCE(verify_expires_at,delivery_deadline),id
+			LIMIT $2 FOR UPDATE SKIP LOCKED
 		)
 		DELETE FROM marketplace_auth_challenges item USING expired WHERE item.id=expired.id
 	`},
@@ -209,12 +228,106 @@ var dataMaintenanceTasks = []dataMaintenanceTask{
 	{name: "terminal_notification_deliveries", query: `
 		WITH expired AS (
 			SELECT id FROM notification_deliveries
-			WHERE status IN ('failed','deleted','cancelled','read','delivered')
+			WHERE (status IN ('failed','deleted','cancelled','read','delivered')
+			       OR (channel='email' AND status='accepted'))
 			  AND completed_at<$1::timestamptz-INTERVAL '90 days'
 			ORDER BY completed_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
 		)
 		DELETE FROM notification_deliveries delivery USING expired
 		WHERE delivery.id=expired.id
+	`},
+	{name: "terminal_welcome_email_jobs", query: `
+		WITH expired AS (
+			SELECT id FROM welcome_email_jobs
+			WHERE status IN ('accepted','failed')
+			  AND completed_at<$1::timestamptz-INTERVAL '90 days'
+			ORDER BY completed_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM welcome_email_jobs job USING expired WHERE job.id=expired.id
+	`},
+	{name: "orphaned_notification_dispatches", query: `
+		WITH expired AS (
+			SELECT id FROM notification_deliveries
+			WHERE status IN ('dispatching','unknown') AND reconcile_after<$1
+			ORDER BY reconcile_after,id LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		UPDATE notification_deliveries delivery
+		SET status='manual_review',reconcile_after=NULL,
+			provider_status='manual_review',provider_status_at=$1,
+			last_error_code='dispatch_outcome_unknown',updated_at=$1
+		FROM expired WHERE delivery.id=expired.id
+	`},
+	// Remove children before their receipt/challenge parents. Parent cleanup must
+	// never cascade through runnable work or shorten answer-delivery retention.
+	{name: "terminal_tessa_whatsapp_outbox", query: `
+		WITH expired AS (
+			SELECT id FROM tessa_whatsapp_outbox
+			WHERE status IN ('accepted','sent','delivered','read','failed','cancelled','expired','manual_review')
+			  AND updated_at<$1::timestamptz-INTERVAL '90 days'
+			ORDER BY updated_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM tessa_whatsapp_outbox item USING expired WHERE item.id=expired.id
+	`},
+	{name: "terminal_tessa_whatsapp_ingress", query: `
+		WITH expired AS (
+			SELECT q.id FROM tessa_whatsapp_ingress q
+			WHERE q.status<>'pending' AND q.completed_at<$1::timestamptz-INTERVAL '30 days'
+			  AND NOT EXISTS (SELECT 1 FROM tessa_runs r WHERE r.id=q.run_id AND r.status IN ('queued','processing'))
+			  AND NOT EXISTS (SELECT 1 FROM tessa_whatsapp_outbox d WHERE d.source_receipt_id=q.source_receipt_id)
+			ORDER BY q.completed_at,q.id LIMIT $2 FOR UPDATE OF q SKIP LOCKED
+		)
+		DELETE FROM tessa_whatsapp_ingress item USING expired WHERE item.id=expired.id
+	`},
+	{name: "expired_tessa_whatsapp_onboarding", query: `
+		WITH expired AS (
+			SELECT s.id FROM tessa_whatsapp_onboarding s
+			WHERE s.expires_at<$1::timestamptz-INTERVAL '24 hours'
+			  AND NOT EXISTS (SELECT 1 FROM tessa_whatsapp_outbox d WHERE d.onboarding_id=s.id)
+			ORDER BY s.expires_at,s.id LIMIT $2 FOR UPDATE OF s SKIP LOCKED
+		)
+		DELETE FROM tessa_whatsapp_onboarding item USING expired WHERE item.id=expired.id
+	`},
+	{name: "expired_tessa_whatsapp_link_challenges", query: `
+		WITH expired AS (
+			SELECT q.id FROM tessa_whatsapp_link_challenges q
+			WHERE q.expires_at<$1::timestamptz-INTERVAL '24 hours'
+			  AND NOT EXISTS (SELECT 1 FROM tessa_whatsapp_outbox d WHERE d.challenge_id=q.id)
+			ORDER BY q.expires_at,q.id LIMIT $2 FOR UPDATE OF q SKIP LOCKED
+		)
+		DELETE FROM tessa_whatsapp_link_challenges item USING expired WHERE item.id=expired.id
+	`},
+	{name: "expired_tessa_whatsapp_email_challenges", query: `
+		WITH expired AS (
+			SELECT q.id FROM tessa_whatsapp_email_challenges q
+			WHERE q.expires_at<$1::timestamptz-INTERVAL '24 hours'
+			  AND NOT EXISTS (SELECT 1 FROM auth_code_delivery_jobs j WHERE j.tessa_link_challenge_id=q.id)
+			  AND NOT EXISTS (SELECT 1 FROM tessa_whatsapp_onboarding s WHERE s.challenge_id=q.id)
+			ORDER BY q.expires_at,q.id LIMIT $2 FOR UPDATE OF q SKIP LOCKED
+		)
+		DELETE FROM tessa_whatsapp_email_challenges item USING expired WHERE item.id=expired.id
+	`},
+	{name: "terminal_tessa_whatsapp_security_events", query: `
+		WITH expired AS (
+			SELECT e.id FROM tessa_whatsapp_security_events e
+			WHERE e.created_at<$1::timestamptz-INTERVAL '90 days'
+			  AND e.email_deadline<$1
+			  AND NOT EXISTS (SELECT 1 FROM auth_code_delivery_jobs j WHERE j.tessa_security_event_id=e.id)
+			ORDER BY e.created_at,e.id LIMIT $2 FOR UPDATE OF e SKIP LOCKED
+		)
+		DELETE FROM tessa_whatsapp_security_events item USING expired WHERE item.id=expired.id
+	`},
+	{name: "terminal_whatsapp_webhook_receipts", query: `
+		WITH expired AS (
+			SELECT id FROM meta_whatsapp_webhook_receipts
+			WHERE processing_status IN ('completed','dead_letter')
+			  AND processed_at<$1::timestamptz-INTERVAL '30 days'
+			  AND NOT EXISTS (SELECT 1 FROM tessa_whatsapp_outbox d WHERE d.source_receipt_id=meta_whatsapp_webhook_receipts.id)
+			  AND NOT EXISTS (SELECT 1 FROM tessa_whatsapp_ingress q WHERE q.source_receipt_id=meta_whatsapp_webhook_receipts.id)
+			  AND NOT EXISTS (SELECT 1 FROM tessa_whatsapp_email_challenges q WHERE q.source_receipt_id=meta_whatsapp_webhook_receipts.id)
+			ORDER BY processed_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM meta_whatsapp_webhook_receipts receipt USING expired
+		WHERE receipt.id=expired.id
 	`},
 	{name: "terminal_notification_in_app_jobs", query: `
 		WITH expired AS (

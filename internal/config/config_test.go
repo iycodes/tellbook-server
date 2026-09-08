@@ -33,11 +33,23 @@ func setRequiredConfig(t *testing.T) {
 		"META_APP_ID", "META_APP_SECRET", "META_VERIFY_TOKEN", "WABA_TOKEN",
 		"WHATSAPP_BUSINESS_ACCOUNT_ID", "WABA_PHONE_NUMBER_ID",
 		"NOTIFICATION_DESTINATION_HMAC_KEY", "WHATSAPP_ENABLED_TEMPLATE_KEYS",
+		"SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM_EMAIL",
+		"AUTH_DELIVERY_ENCRYPTION_KEYS", "AUTH_DELIVERY_ACTIVE_KEY", "AUTH_DESTINATION_HMAC_KEY",
 	} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("NOTIFICATION_EMAIL_ENABLED", "false")
+	t.Setenv("AUTH_EMAIL_ENABLED", "false")
+	t.Setenv("AUTH_WHATSAPP_ENABLED", "false")
+	t.Setenv("AUTH_DELIVERY_CONCURRENCY", "4")
+	t.Setenv("AUTH_DELIVERY_TIMEOUT", "30s")
+	t.Setenv("NOTIFICATION_EMAIL_CONCURRENCY", "4")
+	t.Setenv("NOTIFICATION_EMAIL_TIMEOUT", "30s")
+	t.Setenv("WELCOME_EMAIL_ENABLED", "false")
+	t.Setenv("WELCOME_EMAIL_CONCURRENCY", "2")
+	t.Setenv("WELCOME_EMAIL_TIMEOUT", "30s")
 	t.Setenv("NOTIFICATION_WHATSAPP_ENABLED", "false")
+	t.Setenv("WHATSAPP_WORKER_CONCURRENCY", "4")
 	t.Setenv("NOTIFICATION_PLANNER_CONCURRENCY", "4")
 	t.Setenv("WHATSAPP_GRAPH_BASE_URL", "https://graph.facebook.com")
 	t.Setenv("WHATSAPP_GRAPH_VERSION", "v24.0")
@@ -70,6 +82,8 @@ func setRequiredConfig(t *testing.T) {
 	t.Setenv("OPENAI_COMPAT_TEMPERATURE", "")
 	t.Setenv("OPENAI_COMPAT_TOP_P", "")
 	t.Setenv("TESSA_AI_ENABLED", "false")
+	t.Setenv("TESSA_WHATSAPP_LINKING_ENABLED", "false")
+	t.Setenv("TESSA_WHATSAPP_CONVERSATIONS_ENABLED", "false")
 	t.Setenv("TESSA_AI_PROVIDER_ALLOWLIST", "")
 	t.Setenv("TESSA_AI_PRIMARY_PROVIDER", AIProviderSelfHosted)
 	t.Setenv("TESSA_AI_FALLBACK_PROVIDER", "")
@@ -121,6 +135,66 @@ func TestLoadValidatesNotificationPlannerConcurrency(t *testing.T) {
 	t.Setenv("NOTIFICATION_PLANNER_CONCURRENCY", "0")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "NOTIFICATION_PLANNER_CONCURRENCY") {
 		t.Fatalf("Load() invalid notification planner concurrency error = %v", err)
+	}
+}
+
+func TestLoadValidatesAuthCodeDeliveryConfiguration(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("PROCESS_ROLE", ProcessRoleAPI)
+	t.Setenv("AUTH_EMAIL_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "AUTH_DESTINATION_HMAC_KEY") {
+		t.Fatalf("Load() missing auth HMAC key error = %v", err)
+	}
+	t.Setenv("AUTH_DESTINATION_HMAC_KEY", strings.Repeat("h", 32))
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "AUTH_DELIVERY_ENCRYPTION_KEYS") {
+		t.Fatalf("Load() missing auth encryption key error = %v", err)
+	}
+	t.Setenv("AUTH_DELIVERY_ENCRYPTION_KEYS", `{"v1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}`)
+	t.Setenv("AUTH_DELIVERY_ACTIVE_KEY", "v1")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() rejected API auth email configuration: %v", err)
+	}
+
+	t.Setenv("AUTH_WHATSAPP_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "API webhook") {
+		t.Fatalf("Load() enabled API WhatsApp auth without webhook readiness: %v", err)
+	}
+	t.Setenv("META_APP_SECRET", "meta-app-secret-at-least-sixteen")
+	t.Setenv("META_VERIFY_TOKEN", "verify-token-at-least-sixteen")
+	t.Setenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "222222222")
+	t.Setenv("WABA_PHONE_NUMBER_ID", "333333333")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() rejected webhook-ready API WhatsApp auth: %v", err)
+	}
+}
+
+func TestLoadRequiresOutboundReadinessForAuthWhatsAppWorker(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("PROCESS_ROLE", ProcessRoleWorker)
+	t.Setenv("AUTH_WHATSAPP_ENABLED", "true")
+	t.Setenv("AUTH_DESTINATION_HMAC_KEY", strings.Repeat("h", 32))
+	t.Setenv("AUTH_DELIVERY_ENCRYPTION_KEYS", `{"v1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}`)
+	t.Setenv("AUTH_DELIVERY_ACTIVE_KEY", "v1")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WhatsApp workers") {
+		t.Fatalf("Load() enabled worker WhatsApp auth without sender readiness: %v", err)
+	}
+	t.Setenv("WABA_TOKEN", "access-token")
+	t.Setenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "222222222")
+	t.Setenv("WABA_PHONE_NUMBER_ID", "333333333")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() rejected sender-ready worker WhatsApp auth: %v", err)
+	}
+}
+
+func TestLoadRequiresSMTPForAuthEmailWorker(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("PROCESS_ROLE", ProcessRoleWorker)
+	t.Setenv("AUTH_EMAIL_ENABLED", "true")
+	t.Setenv("AUTH_DESTINATION_HMAC_KEY", strings.Repeat("h", 32))
+	t.Setenv("AUTH_DELIVERY_ENCRYPTION_KEYS", `{"v1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}`)
+	t.Setenv("AUTH_DELIVERY_ACTIVE_KEY", "v1")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SMTP_USERNAME") {
+		t.Fatalf("Load() auth email worker without SMTP error = %v", err)
 	}
 }
 
@@ -189,6 +263,82 @@ func TestLoadValidatesWhatsAppWorkerConfigurationIndependently(t *testing.T) {
 	}
 	if cfg.MetaWebhookConfigured() || !cfg.WhatsAppSendConfigured() {
 		t.Fatalf("unexpected worker Meta readiness: webhook=%t send=%t", cfg.MetaWebhookConfigured(), cfg.WhatsAppSendConfigured())
+	}
+}
+
+func TestLoadValidatesWhatsAppWorkerConcurrency(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("WHATSAPP_WORKER_CONCURRENCY", "0")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WHATSAPP_WORKER_CONCURRENCY") {
+		t.Fatalf("Load() invalid WhatsApp worker concurrency error = %v", err)
+	}
+}
+
+func TestLoadRequiresDestinationHMACForWhatsAppStatusWorker(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("PROCESS_ROLE", ProcessRoleWorker)
+	t.Setenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "222222222")
+	t.Setenv("WABA_PHONE_NUMBER_ID", "333333333")
+	t.Setenv("NOTIFICATION_WHATSAPP_ENABLED", "true")
+	t.Setenv("WABA_TOKEN", "access-token")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WhatsApp status processing") {
+		t.Fatalf("Load() missing status-worker HMAC error = %v", err)
+	}
+}
+
+func TestLoadRequiresDestinationHMACForEmailWorker(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("PROCESS_ROLE", ProcessRoleWorker)
+	t.Setenv("NOTIFICATION_EMAIL_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "NOTIFICATION_DESTINATION_HMAC_KEY") {
+		t.Fatalf("Load() missing email destination HMAC key error = %v", err)
+	}
+	t.Setenv("NOTIFICATION_DESTINATION_HMAC_KEY", strings.Repeat("k", 32))
+	t.Setenv("SMTP_USERNAME", "notifications@example.com")
+	t.Setenv("SMTP_PASSWORD", "smtp-password")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load() rejected enabled email worker configuration: %v", err)
+	}
+}
+
+func TestLoadValidatesEmailWorkerLimitsAndSMTP(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("PROCESS_ROLE", ProcessRoleWorker)
+	t.Setenv("NOTIFICATION_EMAIL_ENABLED", "true")
+	t.Setenv("NOTIFICATION_DESTINATION_HMAC_KEY", strings.Repeat("k", 32))
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SMTP_USERNAME") {
+		t.Fatalf("Load() missing SMTP configuration error = %v", err)
+	}
+	t.Setenv("SMTP_USERNAME", "notifications@example.com")
+	t.Setenv("SMTP_PASSWORD", "smtp-password")
+	t.Setenv("NOTIFICATION_EMAIL_CONCURRENCY", "0")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "NOTIFICATION_EMAIL_CONCURRENCY") {
+		t.Fatalf("Load() invalid email concurrency error = %v", err)
+	}
+	t.Setenv("NOTIFICATION_EMAIL_CONCURRENCY", "4")
+	t.Setenv("NOTIFICATION_EMAIL_TIMEOUT", "500ms")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "NOTIFICATION_EMAIL_TIMEOUT") {
+		t.Fatalf("Load() invalid email timeout error = %v", err)
+	}
+}
+
+func TestLoadValidatesWelcomeEmailWorkerLimitsAndSMTP(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("PROCESS_ROLE", ProcessRoleWorker)
+	t.Setenv("WELCOME_EMAIL_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SMTP_USERNAME") {
+		t.Fatalf("Load() missing welcome SMTP configuration error = %v", err)
+	}
+	t.Setenv("SMTP_USERNAME", "welcome@example.com")
+	t.Setenv("SMTP_PASSWORD", "smtp-password")
+	t.Setenv("WELCOME_EMAIL_CONCURRENCY", "0")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WELCOME_EMAIL_CONCURRENCY") {
+		t.Fatalf("Load() invalid welcome concurrency error = %v", err)
+	}
+	t.Setenv("WELCOME_EMAIL_CONCURRENCY", "2")
+	t.Setenv("WELCOME_EMAIL_TIMEOUT", "500ms")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WELCOME_EMAIL_TIMEOUT") {
+		t.Fatalf("Load() invalid welcome timeout error = %v", err)
 	}
 }
 
@@ -420,6 +570,39 @@ func TestLoadReadsAndValidatesTessaAIControls(t *testing.T) {
 	t.Setenv("TESSA_AI_EXTERNAL_PROCESSING_APPROVED", "false")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() enabled an external Tessa fallback without approval")
+	}
+}
+
+func TestTessaWhatsAppConversationRollout(t *testing.T) {
+	setRequiredConfig(t)
+	cfg, err := Load()
+	if err != nil || cfg.TessaWhatsAppConversationsEnabled {
+		t.Fatal("chat must default off", err)
+	}
+	t.Setenv("TESSA_WHATSAPP_CONVERSATIONS_ENABLED", "true")
+	if _, err = Load(); err == nil || !strings.Contains(err.Error(), "TESSA_WHATSAPP_LINKING_ENABLED") {
+		t.Fatal("chat bypassed linking gate", err)
+	}
+	t.Setenv("TESSA_AI_ENABLED", "true")
+	t.Setenv("TESSA_AI_PROVIDER_ALLOWLIST", "10000000-0000-4000-8000-000000000001")
+	t.Setenv("TESSA_WHATSAPP_LINKING_ENABLED", "true")
+	t.Setenv("META_APP_SECRET", strings.Repeat("a", 32))
+	t.Setenv("META_VERIFY_TOKEN", strings.Repeat("b", 32))
+	t.Setenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "100")
+	t.Setenv("WABA_PHONE_NUMBER_ID", "19990001")
+	t.Setenv("WABA_BUSINESS_PHONE_E164", "+2348000000000")
+	t.Setenv("WABA_TOKEN", "test-token")
+	t.Setenv("NOTIFICATION_DESTINATION_HMAC_KEY", strings.Repeat("k", 32))
+	for _, origin := range []string{"http://localhost:5275", "https://user:pass@provider.example.invalid", "https://provider.example.invalid/path"} {
+		t.Setenv("CLIENT_PUBLIC_BASE_URL", origin)
+		if _, err = Load(); err == nil {
+			t.Fatal("unsafe reply origin accepted")
+		}
+	}
+	t.Setenv("CLIENT_PUBLIC_BASE_URL", "https://provider.example.invalid")
+	cfg, err = Load()
+	if err != nil || !cfg.TessaWhatsAppConversationsEnabled {
+		t.Fatal("valid controlled rollout rejected", err)
 	}
 }
 

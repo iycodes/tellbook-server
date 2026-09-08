@@ -7,6 +7,285 @@ servers:
 security:
   - marketplaceSession: []
 paths:
+  /auth/capabilities:
+    get:
+      operationId: getMarketplaceAuthCapabilities
+      security: []
+      responses:
+        '200':
+          description: Currently available marketplace sign-in methods.
+          content:
+            application/json:
+              schema: { $ref: './auth.schemas.yaml#/components/schemas/AuthCapabilities' }
+  /auth/code:
+    post:
+      operationId: startMarketplaceAuthCode
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/CodeStartInput' }
+      responses:
+        '202': { $ref: '#/components/responses/AuthChallengeAccepted' }
+        '400': { $ref: '#/components/responses/BadAuthRequest' }
+        '429': { $ref: '#/components/responses/AuthRateLimited' }
+  /auth/code/{challengeID}:
+    get:
+      operationId: getMarketplaceAuthCodeStatus
+      security: []
+      parameters:
+        - name: challengeID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { $ref: '#/components/responses/AuthChallengeReady' }
+        '400': { $ref: '#/components/responses/BadAuthRequest' }
+  /auth/code/resend:
+    post:
+      operationId: resendMarketplaceAuthCode
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/CodeResendInput' }
+      responses:
+        '202': { $ref: '#/components/responses/AuthChallengeAccepted' }
+        '400': { $ref: '#/components/responses/BadAuthRequest' }
+        '429': { $ref: '#/components/responses/AuthRateLimited' }
+  /auth/verify:
+    post:
+      operationId: verifyMarketplaceAuthCode
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/CodeVerifyInput' }
+      responses:
+        '200':
+          description: Marketplace session created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MarketplaceCodeSessionResponse' }
+        '400': { $ref: '#/components/responses/BadAuthRequest' }
+  /auth/password:
+    post:
+      operationId: marketplacePasswordSignIn
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/PasswordSignInInput' }
+      responses:
+        '200':
+          description: Marketplace session created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MarketplaceSessionResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/password/reset/code:
+    post:
+      operationId: startMarketplacePasswordReset
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/PasswordResetStartInput' }
+      responses:
+        '202': { $ref: '#/components/responses/AuthChallengeAccepted' }
+        '400': { $ref: '#/components/responses/BadAuthRequest' }
+        '429': { $ref: '#/components/responses/AuthRateLimited' }
+  /auth/password/reset/verify:
+    post:
+      operationId: verifyMarketplacePasswordReset
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/PasswordResetVerifyInput' }
+      responses:
+        '200':
+          description: Single-use reset grant.
+          content:
+            application/json:
+              schema: { $ref: './auth.schemas.yaml#/components/schemas/PasswordResetVerifyResponse' }
+        '400': { $ref: '#/components/responses/BadAuthRequest' }
+  /auth/password/reset:
+    post:
+      operationId: completeMarketplacePasswordReset
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/PasswordResetCompleteInput' }
+      responses:
+        '200':
+          description: Password updated and a replacement session created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MarketplaceSessionResponse' }
+        '400': { $ref: '#/components/responses/BadAuthRequest' }
+  /auth/session:
+    get:
+      operationId: getMarketplaceSession
+      security: []
+      responses:
+        '200':
+          description: Current marketplace session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MarketplaceSessionResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: refreshMarketplaceSession
+      security: []
+      responses:
+        '200':
+          description: Current marketplace session.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MarketplaceSessionResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /auth/logout:
+    post:
+      operationId: logoutMarketplace
+      security: []
+      responses:
+        '204': { description: Marketplace session ended. }
+  /me/identities/code:
+    post:
+      operationId: startMarketplaceIdentityLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/CodeStartInput' }
+      responses:
+        '202': { $ref: '#/components/responses/AuthChallengeAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /me/identities/code/{challengeID}:
+    get:
+      operationId: getMarketplaceIdentityLinkStatus
+      parameters:
+        - name: challengeID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { $ref: '#/components/responses/AuthChallengeReady' }
+        '400': { $ref: '#/components/responses/BadAuthRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /me/identities/code/resend:
+    post:
+      operationId: resendMarketplaceIdentityLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/CodeResendInput' }
+      responses:
+        '202': { $ref: '#/components/responses/AuthChallengeAccepted' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /me/identities/verify:
+    post:
+      operationId: verifyMarketplaceIdentityLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/CodeVerifyInput' }
+      responses:
+        '200':
+          description: Identity linked to the current customer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MarketplaceIdentityLinkResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/BadAuthRequest' }
+  /me/password:
+    patch:
+      operationId: updateMarketplacePassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: './auth.schemas.yaml#/components/schemas/PasswordUpdateInput' }
+      responses:
+        '200':
+          description: Password updated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MarketplacePasswordResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /me/notification-preferences:
+    get:
+      operationId: getMarketplaceNotificationPreferences
+      responses:
+        '200':
+          description: Customer notification preferences filtered by real channel capability.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPreferencesResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      operationId: updateMarketplaceNotificationPreferences
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotificationPreferencesInput' }
+      responses:
+        '200':
+          description: Updated customer notification preferences.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPreferencesResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /bookings/claims:
+    post:
+      operationId: claimMarketplaceBooking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [booking_token]
+              properties:
+                booking_token: { type: string, minLength: 1 }
+      responses:
+        '200':
+          description: Booking atomically linked to the matching verified customer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BookingClaimResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Verified customer identity does not match the booking contact. }
+        '409': { description: Booking is already owned by another customer. }
+  /bookings/{bookingID}:
+    get:
+      operationId: getMarketplaceBooking
+      parameters:
+        - name: bookingID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Owned booking detail including committed notification delivery state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MarketplaceBookingDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Booking is not owned by the current customer. }
   /saved-providers:
     get:
       operationId: listMarketplaceSavedProviders
@@ -104,12 +383,149 @@ components:
       required: true
       schema: { type: string, format: uuid }
   responses:
+    AuthChallengeAccepted:
+      description: Challenge accepted without disclosing account existence.
+      content:
+        application/json:
+          schema: { $ref: './auth.schemas.yaml#/components/schemas/ChallengeResponse' }
+    AuthChallengeReady:
+      description: Current delivery and verification state for the challenge.
+      content:
+        application/json:
+          schema: { $ref: './auth.schemas.yaml#/components/schemas/ChallengeResponse' }
+    BadAuthRequest:
+      description: Invalid authentication request.
+      content:
+        application/json:
+          schema: { $ref: './auth.schemas.yaml#/components/schemas/Error' }
+    AuthRateLimited:
+      description: Authentication request limit reached.
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 1 } }
+      content:
+        application/json:
+          schema: { $ref: './auth.schemas.yaml#/components/schemas/Error' }
     Unauthorized:
       description: Marketplace customer session is missing or invalid.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
   schemas:
+    MarketplaceCustomer:
+      type: object
+      additionalProperties: false
+      required: [id, full_name, has_password, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        full_name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string, pattern: '^\\+[1-9][0-9]{9,14}$' }
+        email_verified_at: { type: string, format: date-time }
+        phone_verified_at: { type: string, format: date-time }
+        birthday: { type: string, format: date }
+        has_password: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    MarketplaceSessionResponse:
+      type: object
+      additionalProperties: false
+      required: [customer]
+      properties:
+        customer: { $ref: '#/components/schemas/MarketplaceCustomer' }
+    MarketplaceCodeSessionResponse:
+      type: object
+      additionalProperties: false
+      required: [customer, is_new_account, onboarding_required]
+      properties:
+        customer: { $ref: '#/components/schemas/MarketplaceCustomer' }
+        is_new_account: { type: boolean }
+        onboarding_required: { type: boolean }
+    MarketplacePasswordInput:
+      type: object
+      additionalProperties: false
+      required: [new_password]
+      properties:
+        current_password: { type: string, maxLength: 72 }
+        new_password: { type: string, minLength: 8, maxLength: 72 }
+    MarketplacePasswordResponse:
+      type: object
+      additionalProperties: false
+      required: [message, customer, reauthentication_required]
+      properties:
+        message: { type: string }
+        customer: { $ref: '#/components/schemas/MarketplaceCustomer' }
+        reauthentication_required: { type: boolean, const: true }
+    MarketplaceIdentityLinkResponse:
+      type: object
+      additionalProperties: false
+      required: [customer, reauthentication_required]
+      properties:
+        customer: { $ref: '#/components/schemas/MarketplaceCustomer' }
+        reauthentication_required: { type: boolean, const: true }
+    BookingDeliveryChannelStatus:
+      type: object
+      additionalProperties: false
+      required: [requested, eligible, status]
+      properties:
+        requested: { type: boolean }
+        eligible: { type: boolean }
+        status:
+          type: string
+          enum: [not_requested, pending, accepted, sent, delivered, read, failed, unknown, manual_review, cancelled]
+    BookingDeliveryStatus:
+      type: object
+      additionalProperties: false
+      required: [provider_in_app, provider_email, provider_whatsapp, customer_email, customer_whatsapp, customer_sms]
+      properties:
+        provider_in_app: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        provider_email: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        provider_whatsapp: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        customer_email: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        customer_whatsapp: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        customer_sms: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+    NotificationPreferences:
+      type: object
+      additionalProperties: false
+      required: [booking_email, booking_sms, booking_whatsapp, marketing_email, email_available, whatsapp_available, updated_at]
+      properties:
+        booking_email: { type: boolean }
+        booking_sms: { type: boolean }
+        booking_whatsapp: { type: boolean }
+        marketing_email: { type: boolean }
+        email_available: { type: boolean }
+        whatsapp_available: { type: boolean }
+        updated_at: { type: string, format: date-time }
+    NotificationPreferencesInput:
+      type: object
+      additionalProperties: false
+      required: [booking_email, booking_sms, booking_whatsapp, marketing_email]
+      properties:
+        booking_email: { type: boolean }
+        booking_sms: { type: boolean }
+        booking_whatsapp: { type: boolean }
+        marketing_email: { type: boolean }
+    NotificationPreferencesResponse:
+      type: object
+      additionalProperties: false
+      required: [preferences]
+      properties:
+        preferences: { $ref: '#/components/schemas/NotificationPreferences' }
+    BookingClaimResponse:
+      type: object
+      additionalProperties: false
+      required: [booking_id]
+      properties:
+        booking_id: { type: string, format: uuid }
+    MarketplaceBookingDetail:
+      type: object
+      additionalProperties: true
+      required: [id, delivery_status]
+      properties:
+        id: { type: string, format: uuid }
+        provider_contact_phone:
+          type: string
+          description: Current verified business contact, only when sharing with booked customers is enabled. Access is restricted to the booking owner.
+        delivery_status: { $ref: '#/components/schemas/BookingDeliveryStatus' }
     Error:
       type: object
       required: [error]

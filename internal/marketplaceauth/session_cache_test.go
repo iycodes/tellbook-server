@@ -114,7 +114,7 @@ func (metrics *fakeSessionCacheMetrics) ObserveCacheRequest(_, outcome string) {
 func TestAuthenticatePrincipalCachesOnlyMinimalPrincipal(t *testing.T) {
 	principal := SessionPrincipal{
 		SessionID: uuid.New(), CustomerID: uuid.New(), ExpiresAt: time.Now().Add(time.Hour),
-		SecurityRevision: 3, SessionRevision: 2,
+		SecurityRevision: 3, SessionRevision: 3,
 	}
 	repository := &fakeSessionRepository{principal: principal}
 	cache := newFakeSessionCache()
@@ -144,6 +144,16 @@ func TestAuthenticatePrincipalCachesOnlyMinimalPrincipal(t *testing.T) {
 	cache.mu.Unlock()
 	if metrics.outcomes["miss"] != 1 || metrics.outcomes["hit"] != 1 {
 		t.Fatalf("cache outcomes = %+v", metrics.outcomes)
+	}
+}
+
+func TestValidSessionPrincipalRejectsSecurityRevisionMismatch(t *testing.T) {
+	principal := SessionPrincipal{
+		SessionID: uuid.New(), CustomerID: uuid.New(), ExpiresAt: time.Now().Add(time.Hour),
+		SecurityRevision: 2, SessionRevision: 1,
+	}
+	if validSessionPrincipal(principal, time.Now()) {
+		t.Fatal("session survived a security revision change")
 	}
 }
 

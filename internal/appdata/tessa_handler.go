@@ -46,6 +46,14 @@ func (h *Handler) getTessaBootstrap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "tessa_bootstrap_failed", "Could not open Tessa.")
 		return
 	}
+	if h.tessaWhatsApp != nil {
+		state, stateErr := h.tessaWhatsApp.State(r.Context(), clientID)
+		if stateErr != nil {
+			writeError(w, 500, "tessa_bootstrap_failed", "Could not load the WhatsApp connection.")
+			return
+		}
+		response.WhatsApp = &state
+	}
 	writeJSON(w, http.StatusOK, response)
 }
 

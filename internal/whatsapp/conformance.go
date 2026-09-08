@@ -41,11 +41,15 @@ type graphTemplate struct {
 }
 
 func (client *Client) ConformTemplates(ctx context.Context) (TemplateConformanceReport, error) {
+	return client.ConformTemplateDefinitions(ctx, RegisteredTemplates())
+}
+
+func (client *Client) ConformTemplateDefinitions(ctx context.Context, definitions []TemplateDefinition) (TemplateConformanceReport, error) {
 	templates, err := client.fetchTemplates(ctx)
 	if err != nil {
 		return TemplateConformanceReport{}, err
 	}
-	return ConformTemplateInventory(RegisteredTemplates(), templates), nil
+	return ConformTemplateInventory(definitions, templates), nil
 }
 
 func (client *Client) fetchTemplates(ctx context.Context) ([]graphTemplate, error) {
@@ -168,8 +172,12 @@ func validateTemplateComponents(report *TemplateConformanceReport, identity stri
 	if definition.FooterText != "" {
 		expectedFooterCount = 1
 	}
-	if bodyCount != 1 || footerCount != expectedFooterCount || buttonsCount != 1 ||
-		len(template.Components) != 2+expectedFooterCount {
+	expectedButtonsCount := 0
+	if definition.ButtonText != "" || definition.ButtonURL != "" || len(definition.ButtonParameters) > 0 {
+		expectedButtonsCount = 1
+	}
+	if bodyCount != 1 || footerCount != expectedFooterCount || buttonsCount != expectedButtonsCount ||
+		len(template.Components) != 1+expectedFooterCount+expectedButtonsCount {
 		report.Errors = append(report.Errors, fmt.Sprintf("%s: component contract changed", identity))
 	}
 }

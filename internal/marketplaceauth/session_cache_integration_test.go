@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"os"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -44,24 +42,25 @@ func TestSessionCacheInvalidationAcrossPostgresAndRedis(t *testing.T) {
 	t.Cleanup(func() { _ = cache.Close() })
 
 	primaryEmail := "marketplace-cache-" + uuid.NewString() + "@example.com"
-	linkedPhone := fmt.Sprintf("+2348%09d", time.Now().UnixNano()%1_000_000_000)
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), `DELETE FROM marketplace_auth_challenges WHERE identifier IN ($1,$2)`, primaryEmail, linkedPhone)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM marketplace_auth_challenges WHERE identifier=$1`, primaryEmail)
 		_, _ = pool.Exec(context.Background(), `DELETE FROM marketplace_customers WHERE email=$1`, primaryEmail)
 	})
 
 	repo := NewRepository(pool)
-	sender := &captureMailer{}
+	challenges := newTestChallengeService(t, pool)
+	sender := startTestAuthWorker(t, challenges)
 	service := NewService(repo, config.Config{
 		AuthRefreshTokenTTL: 30 * 24 * time.Hour, AuthBcryptCost: 10,
-	}, sender)
+	}, challenges)
 	service.ConfigureSessionCache(cache, 4, nil)
 	challenge, err := service.StartChallenge(ctx, primaryEmail, "email")
 	if err != nil {
 		t.Fatal(err)
 	}
-	code := regexp.MustCompile(`\b\d{6}\b`).FindString(sender.message.Text)
-	customer, rawToken, err := service.VerifyChallenge(ctx, challenge.ChallengeID, code, "integration-test", "127.0.0.1")
+	code := awaitAuthCode(t, sender)
+	awaitMarketplaceChallengeReady(t, service, challenge.ChallengeID)
+	customer, rawToken, _, err := service.VerifyChallenge(ctx, challenge.ChallengeID, code, "integration-test", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,29 +91,10 @@ func TestSessionCacheInvalidationAcrossPostgresAndRedis(t *testing.T) {
 	assertInvalidated("profile update")
 
 	cachePrincipal()
-	if _, err := service.SetPassword(ctx, customer.ID, "correct horse battery staple"); err != nil {
+	if _, err := service.SetPassword(ctx, customer.ID, "", "correct horse battery staple"); err != nil {
 		t.Fatal(err)
 	}
 	assertInvalidated("password update")
-
-	cachePrincipal()
-	linkCode, linkHash, err := newSixDigitCode()
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC()
-	linkChallenge := Challenge{
-		ID: uuid.New(), IdentifierType: "phone", Identifier: linkedPhone,
-		DeliveryChannel: "sms", Purpose: "link_identity", TargetCustomerID: &customer.ID,
-		CodeHash: linkHash, ExpiresAt: now.Add(challengeTTL), CreatedAt: now,
-	}
-	if err := repo.CreateChallenge(ctx, linkChallenge); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := service.VerifyIdentityLink(ctx, customer.ID, linkChallenge.ID, linkCode); err != nil {
-		t.Fatal(err)
-	}
-	assertInvalidated("identity link")
 
 	cachePrincipal()
 	if err := service.Logout(ctx, rawToken); err != nil {

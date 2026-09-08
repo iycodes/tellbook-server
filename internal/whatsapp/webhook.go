@@ -15,6 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -40,6 +43,7 @@ type WebhookReceipt struct {
 	MessageStatus     string
 	ProviderTimestamp *time.Time
 	ProviderErrorCode string
+	CorrelationID     string
 	ProcessingStatus  string
 	control           inboundControl
 }
@@ -48,6 +52,7 @@ type inboundControl struct {
 	kind   string
 	token  string
 	sender string
+	text   string
 }
 
 type WebhookReceiptStore interface {
@@ -174,10 +179,11 @@ type webhookEnvelope struct {
 					PhoneNumberID string `json:"phone_number_id"`
 				} `json:"metadata"`
 				Statuses []struct {
-					ID        string `json:"id"`
-					Status    string `json:"status"`
-					Timestamp string `json:"timestamp"`
-					Errors    []struct {
+					ID            string `json:"id"`
+					Status        string `json:"status"`
+					Timestamp     string `json:"timestamp"`
+					CorrelationID string `json:"biz_opaque_callback_data"`
+					Errors        []struct {
 						Code int `json:"code"`
 					} `json:"errors"`
 				} `json:"statuses"`
@@ -261,10 +267,11 @@ func countEntryEvents(entry struct {
 				PhoneNumberID string `json:"phone_number_id"`
 			} `json:"metadata"`
 			Statuses []struct {
-				ID        string `json:"id"`
-				Status    string `json:"status"`
-				Timestamp string `json:"timestamp"`
-				Errors    []struct {
+				ID            string `json:"id"`
+				Status        string `json:"status"`
+				Timestamp     string `json:"timestamp"`
+				CorrelationID string `json:"biz_opaque_callback_data"`
+				Errors        []struct {
 					Code int `json:"code"`
 				} `json:"errors"`
 			} `json:"statuses"`
@@ -288,10 +295,11 @@ func countEntryEvents(entry struct {
 }
 
 func normalizeStatusReceipt(businessID, phoneNumberID string, status struct {
-	ID        string `json:"id"`
-	Status    string `json:"status"`
-	Timestamp string `json:"timestamp"`
-	Errors    []struct {
+	ID            string `json:"id"`
+	Status        string `json:"status"`
+	Timestamp     string `json:"timestamp"`
+	CorrelationID string `json:"biz_opaque_callback_data"`
+	Errors        []struct {
 		Code int `json:"code"`
 	} `json:"errors"`
 }) (WebhookReceipt, error) {
@@ -308,6 +316,12 @@ func normalizeStatusReceipt(businessID, phoneNumberID string, status struct {
 	if len(status.Errors) > 0 && status.Errors[0].Code != 0 {
 		errorCode = strconv.Itoa(status.Errors[0].Code)
 	}
+	correlationID := boundedWebhookValue(strings.ToLower(status.CorrelationID), 36)
+	if correlationID != "" {
+		if _, err := uuid.Parse(correlationID); err != nil {
+			correlationID = ""
+		}
+	}
 	dedupeKey := receiptDedupeKey(phoneNumberID, messageID, messageStatus, strconv.FormatInt(timestamp.Unix(), 10), errorCode)
 	processingStatus := "completed"
 	if actionableMessageStatus(messageStatus) {
@@ -316,7 +330,8 @@ func normalizeStatusReceipt(businessID, phoneNumberID string, status struct {
 	return WebhookReceipt{
 		DedupeKey: dedupeKey, BusinessID: businessID, PhoneNumberID: phoneNumberID,
 		EventKind: "status", MessageID: messageID, MessageStatus: messageStatus,
-		ProviderTimestamp: &timestamp, ProviderErrorCode: errorCode, ProcessingStatus: processingStatus,
+		ProviderTimestamp: &timestamp, ProviderErrorCode: errorCode, CorrelationID: correlationID,
+		ProcessingStatus: processingStatus,
 	}, nil
 }
 
@@ -358,15 +373,30 @@ func classifyInboundControl(sender, messageType, body string) inboundControl {
 		return inboundControl{}
 	}
 	command := strings.TrimSpace(body)
+	if strings.EqualFold(command, "TESSA DISCONNECT") {
+		return inboundControl{kind: "tessa_disconnect", sender: sender}
+	}
+	parts := strings.Fields(command)
+	if len(parts) == 3 && strings.EqualFold(parts[0], "TESSA") && strings.EqualFold(parts[1], "LINK") && validVerificationToken(parts[2]) {
+		return inboundControl{kind: "tessa_link", token: parts[2], sender: sender}
+	}
 	if strings.EqualFold(command, "STOP") {
 		return inboundControl{kind: "stop", sender: sender}
 	}
 	if strings.EqualFold(command, "START") {
 		return inboundControl{kind: "start", sender: sender}
 	}
-	parts := strings.Fields(command)
+	parts = strings.Fields(command)
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "VERIFY") || !validVerificationToken(parts[1]) {
-		return inboundControl{}
+		// Transient onboarding input only; neither the receipt nor transcripts retain it.
+		text := command
+		if !utf8.ValidString(text) || utf8.RuneCountInString(text) > 4000 {
+			text = ""
+		}
+		if len(command) > 320 {
+			command = ""
+		}
+		return inboundControl{kind: "tessa_onboarding", sender: sender, token: command, text: text}
 	}
 	return inboundControl{kind: "verify", token: parts[1], sender: sender}
 }

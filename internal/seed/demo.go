@@ -2,6 +2,7 @@ package seed
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -117,7 +118,7 @@ func SeedDemoProvider(ctx context.Context, tx pgx.Tx, input Input) (Result, erro
 func getExistingClientEmail(ctx context.Context, tx pgx.Tx, clientID uuid.UUID) (string, bool, error) {
 	const query = `SELECT email FROM clients WHERE id = $1`
 
-	var email string
+	var email sql.NullString
 	err := tx.QueryRow(ctx, query, clientID).Scan(&email)
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -126,7 +127,7 @@ func getExistingClientEmail(ctx context.Context, tx pgx.Tx, clientID uuid.UUID) 
 		return "", false, fmt.Errorf("select existing client: %w", err)
 	}
 
-	return email, true, nil
+	return email.String, true, nil
 }
 
 func pickSeedEmail(inputEmail, existingEmail string, clientExists bool) string {
@@ -148,7 +149,6 @@ func pickSeedPassword(inputPassword string, clientExists bool) string {
 func resetProviderData(ctx context.Context, tx pgx.Tx, clientID uuid.UUID) error {
 	queries := []string{
 		`DELETE FROM auth_refresh_sessions WHERE client_id = $1`,
-		`DELETE FROM auth_password_reset_tokens WHERE client_id = $1`,
 		`DELETE FROM payouts WHERE client_id = $1`,
 		`DELETE FROM payment_allocations WHERE client_id = $1`,
 		`DELETE FROM payment_adjustments WHERE payment_id IN (SELECT id FROM payments WHERE client_id = $1)`,
@@ -221,6 +221,21 @@ func upsertUser(ctx context.Context, tx pgx.Tx, input Input, passwordHash []byte
 	)
 	if err != nil {
 		return fmt.Errorf("upsert user: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO provider_auth_identities (
+			client_id, identity_type, normalized_identifier, verified_at
+		)
+		SELECT id, 'email', lower(btrim(email)), email_verified_at
+		FROM clients
+		WHERE id = $1 AND email IS NOT NULL AND email_verified_at IS NOT NULL
+		ON CONFLICT ON CONSTRAINT provider_auth_identities_client_type_unique
+		DO UPDATE SET
+			normalized_identifier = EXCLUDED.normalized_identifier,
+			verified_at = EXCLUDED.verified_at,
+			updated_at = NOW()
+	`, input.ClientID); err != nil {
+		return fmt.Errorf("upsert provider email identity: %w", err)
 	}
 
 	return nil
@@ -551,6 +566,21 @@ func insertConversations(
 			updated_at=EXCLUDED.updated_at
 	`, marketplaceCustomerID, "marketplace-sarah-"+clientID.String()+"@example.com", now); err != nil {
 		return fmt.Errorf("insert native inbox marketplace customer: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO marketplace_customer_identities (
+			marketplace_customer_id, identifier_type, normalized_identifier, verified_at
+		)
+		SELECT id, 'email', lower(btrim(email)), email_verified_at
+		FROM marketplace_customers
+		WHERE id=$1 AND email IS NOT NULL AND email_verified_at IS NOT NULL
+		ON CONFLICT ON CONSTRAINT marketplace_customer_identities_customer_type_unique
+		DO UPDATE SET
+			normalized_identifier=EXCLUDED.normalized_identifier,
+			verified_at=EXCLUDED.verified_at,
+			updated_at=NOW()
+	`, marketplaceCustomerID); err != nil {
+		return fmt.Errorf("insert native inbox marketplace customer identity: %w", err)
 	}
 
 	bookingID := bookingIDs["event_today"]

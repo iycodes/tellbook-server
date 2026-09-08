@@ -18,6 +18,35 @@ type scriptedGenerator struct {
 	fill  func(int, any) error
 }
 
+func TestWhatsAppAnswerLimitIsEnforcedBeforeCommit(t *testing.T) {
+	for _, test := range []struct {
+		channel string
+		length  int
+		valid   bool
+	}{
+		{"whatsapp", 1024, true}, {"whatsapp", 1025, false}, {"web", 4000, true},
+	} {
+		generator := &scriptedGenerator{fill: func(_ int, out any) error {
+			out.(*Answer).Parts = []AnswerPart{{Text: strings.Repeat("😀", test.length)}}
+			return nil
+		}}
+		service, err := NewService(Provider{Name: "local", Model: "test", Generator: generator, Timeout: time.Second}, nil, 12000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		answer, err := service.GenerateAnswer(context.Background(), service.Primary(), SynthesisInput{SourceChannel: test.channel, MaxAnswerCharacters: 9000})
+		if (err == nil) != test.valid {
+			t.Fatalf("channel=%s length=%d error=%v", test.channel, test.length, err)
+		}
+		if test.valid && utf8.RuneCountInString(answer.Content) != test.length {
+			t.Fatal("answer was truncated")
+		}
+		if !test.valid && generator.calls != 2 {
+			t.Fatalf("repair attempts=%d", generator.calls)
+		}
+	}
+}
+
 func (generator *scriptedGenerator) GenerateJSON(_ context.Context, _, _ string, destination any) error {
 	generator.calls++
 	return generator.fill(generator.calls, destination)
@@ -153,7 +182,7 @@ func TestGenerateAnswerRepairsEmptyContentOnce(t *testing.T) {
 	generator := &scriptedGenerator{fill: func(call int, destination any) error {
 		answer := destination.(*Answer)
 		if call == 2 {
-			answer.Content = "You can review it from Bookings."
+			answer.Parts = []AnswerPart{{Text: "You can review it from Bookings."}}
 		}
 		return nil
 	}}
@@ -213,9 +242,10 @@ func TestGeneratePlanUsesStrictSchemaAndReturnsNormalizedPlan(t *testing.T) {
 }
 
 func TestPlanInputDropsOldestMessagesToHonorConfiguredLimit(t *testing.T) {
+	const budget = tessaconfig.MinimumInputTokens + 100
 	service, err := NewService(Provider{
 		Name: "local", Model: "test", Generator: &scriptedGenerator{}, Timeout: time.Second,
-	}, nil, 3000)
+	}, nil, budget)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,8 +267,8 @@ func TestPlanInputDropsOldestMessagesToHonorConfiguredLimit(t *testing.T) {
 	if len(fitted.RecentMessages) >= len(recent) {
 		t.Fatalf("recent messages were not bounded: %d", len(fitted.RecentMessages))
 	}
-	if got := estimateInputTokens(planningSystemPrompt+planningPromptPrefix+planningRepairSuffix, string(payload)); got > 3000 {
-		t.Fatalf("estimated input tokens = %d, want <= 3000", got)
+	if got := estimateInputTokens(planningSystemPrompt+planningPromptPrefix+planningRepairSuffix, string(payload)); got > budget {
+		t.Fatalf("estimated input tokens = %d, want <= %d", got, budget)
 	}
 }
 
@@ -295,7 +325,7 @@ func TestMinimumInputTokensAlwaysFitsTheStaticPlanningRequest(t *testing.T) {
 func TestValidatePlanAcceptsBoundedBookingTools(t *testing.T) {
 	plan := Plan{
 		Scope: "in_scope", Intent: "schedule", AnswerMode: "tools",
-		Tools: []ToolRequest{{Name: "get_schedule", From: "2026-08-30", To: "2026-09-05"}},
+		Tools: []ToolRequest{{Name: "get_schedule", Period: "custom", TimeScope: "period", From: "2026-08-30", To: "2026-09-05"}},
 	}
 	if err := ValidatePlan(plan); err != nil {
 		t.Fatalf("ValidatePlan() error = %v", err)
@@ -310,6 +340,9 @@ func TestValidatePlanRejectsUnsafeBookingArguments(t *testing.T) {
 		{Name: "get_availability", From: "2026-08-30", To: "2026-10-01"},
 	}
 	for _, request := range tests {
+		if dateRangeTool(request.Name) {
+			request.Period = "custom"
+		}
 		plan := Plan{Scope: "in_scope", Intent: "booking_search", AnswerMode: "tools", Tools: []ToolRequest{request}}
 		if err := ValidatePlan(plan); err == nil {
 			t.Fatalf("ValidatePlan() accepted %+v", request)
@@ -319,19 +352,22 @@ func TestValidatePlanRejectsUnsafeBookingArguments(t *testing.T) {
 
 func TestValidatePlanAcceptsBoundedOperationalTools(t *testing.T) {
 	requests := []ToolRequest{
-		{Name: "search_services", Query: "consultation", Status: "published", Limit: 8},
+		{Name: "search_services", Selection: "list", Query: "consultation", Status: "published", Limit: 8},
 		{Name: "get_service", ServiceID: "10000000-0000-4000-8000-000000000001"},
-		{Name: "search_customers", Query: "Ada", Limit: 8},
+		{Name: "search_customers", Selection: "top", Query: "Ada", Limit: 8},
 		{Name: "get_customer_booking_summary", CustomerID: "20000000-0000-4000-8000-000000000001"},
 		{Name: "get_payment_summary", From: "2026-08-01", To: "2026-08-30"},
 		{Name: "get_booking_payment_status", BookingID: "30000000-0000-4000-8000-000000000001"},
 		{Name: "get_payout_summary", From: "2026-08-01", To: "2026-08-30"},
-		{Name: "get_booking_metrics", From: "2026-08-01", To: "2026-08-30", ComparePrevious: true},
+		{Name: "get_booking_metrics", Metric: "summary", TimeScope: "period", From: "2026-08-01", To: "2026-08-30", ComparePrevious: true},
 		{Name: "get_inbox_summary"},
 		{Name: "get_review_summary", From: "2026-08-01", To: "2026-08-30"},
 		{Name: "get_public_profile_status"},
 	}
 	for _, request := range requests {
+		if dateRangeTool(request.Name) {
+			request.Period = "custom"
+		}
 		plan := Plan{Scope: "in_scope", Intent: "operations", AnswerMode: "tools", Tools: []ToolRequest{request}}
 		if err := ValidatePlan(plan); err != nil {
 			t.Fatalf("ValidatePlan() rejected %+v: %v", request, err)
@@ -341,15 +377,18 @@ func TestValidatePlanAcceptsBoundedOperationalTools(t *testing.T) {
 
 func TestValidatePlanRejectsUnsafeOperationalArguments(t *testing.T) {
 	requests := []ToolRequest{
-		{Name: "search_services", Status: "deleted", Limit: 8},
-		{Name: "search_customers", Query: "Ada", Limit: 9},
+		{Name: "search_services", Selection: "list", Status: "deleted", Limit: 8},
+		{Name: "search_customers", Selection: "top", Query: "Ada", Limit: 26},
 		{Name: "get_customer_booking_summary", CustomerID: "not-a-customer"},
 		{Name: "get_payout_summary", Query: "all accounts"},
 		{Name: "get_payout_summary", From: "2025-01-01", To: "2026-08-30"},
-		{Name: "get_booking_metrics", From: "2025-01-01", To: "2026-08-30"},
+		{Name: "get_booking_metrics", Metric: "summary", TimeScope: "period", From: "2025-01-01", To: "2026-08-30"},
 		{Name: "get_review_summary", From: "2026-08-30", To: "2026-08-01"},
 	}
 	for _, request := range requests {
+		if dateRangeTool(request.Name) {
+			request.Period = "custom"
+		}
 		plan := Plan{Scope: "in_scope", Intent: "operations", AnswerMode: "tools", Tools: []ToolRequest{request}}
 		if err := ValidatePlan(plan); err == nil {
 			t.Fatalf("ValidatePlan() accepted %+v", request)

@@ -12,6 +12,10 @@ const (
 	TemplateUserReminder            TemplateKey = "user_reminder"
 	TemplateProviderBookingReminder TemplateKey = "provider_booking_reminder"
 	TemplateProviderNewBooking      TemplateKey = "provider_new_booking"
+	TemplateBookingStatusUpdate     TemplateKey = "booking_status_update"
+	TemplateProviderAccountCreated  TemplateKey = "provider_account_created"
+	TemplateUserAccountCreated      TemplateKey = "user_account_created"
+	TemplateAuthCode                TemplateKey = "v_c_x"
 )
 
 type TemplateDefinition struct {
@@ -36,10 +40,10 @@ var templateRegistry = map[TemplateKey]TemplateDefinition{
 			"If you need to make changes, please manage your booking below.",
 		BodyParameters: []string{
 			"customer_name", "service_title", "provider_name", "appointment_datetime",
-			"booking_location", "phone", "amount_due",
+			"booking_location", "provider_contact_phone", "amount_due",
 		},
 		ButtonText: "Manage Booking", ButtonURL: "https://tellbook.africa/bookings{{1}}",
-		ButtonParameters: []string{"booking_route_suffix"}, RequiresContractHold: true,
+		ButtonParameters: []string{"booking_route_suffix"},
 	},
 	TemplateProviderBookingReminder: {
 		Key: TemplateProviderBookingReminder, Name: "provider_booking_reminder", Language: "en", Category: "UTILITY",
@@ -67,6 +71,36 @@ var templateRegistry = map[TemplateKey]TemplateDefinition{
 		ButtonText: "View Booking", ButtonURL: "https://tellbook.app/bookings{{1}}",
 		ButtonParameters: []string{"booking_route_suffix"},
 	},
+	TemplateBookingStatusUpdate: {
+		Key: TemplateBookingStatusUpdate, Name: "booking_status_update", Language: "en", Category: "UTILITY",
+		BodyText: "Hello {{1}}, booking {{2}} has been updated.\n\n" +
+			"Update: {{3}}\nService: {{4}}\nDate & time: {{5}}\n\n" +
+			"Please review the booking in Tellbook if action is required.",
+		BodyParameters: []string{
+			"recipient_name", "booking_reference", "update_summary", "service_title",
+			"appointment_datetime",
+		},
+		FooterText: "Tellbook booking notification",
+	},
+	TemplateProviderAccountCreated: {
+		Key: TemplateProviderAccountCreated, Name: "provider_account_created", Language: "en", Category: "UTILITY",
+		BodyText: "Hello {{1}}, this confirms that your Tellbook provider account was created successfully. " +
+			"If you did not create this account, please contact Tellbook support.",
+		BodyParameters: []string{"provider_name"},
+		FooterText:     "Tellbook account notification",
+	},
+	TemplateUserAccountCreated: {
+		Key: TemplateUserAccountCreated, Name: "user_account_created", Language: "en", Category: "UTILITY",
+		BodyText: "Hello {{1}}, this confirms that your Tellbook account was created successfully. " +
+			"If you did not create this account, please contact Tellbook support.",
+		BodyParameters: []string{"user_name"},
+		FooterText:     "Tellbook account notification",
+	},
+	TemplateAuthCode: {
+		Key: TemplateAuthCode, Name: "v_c_x", Language: "en", Category: "UTILITY",
+		BodyText:       "Reminder, Quick check before we lock this in.\n\n{{1}}\n\nThank you.",
+		BodyParameters: []string{"code_instruction"},
+	},
 }
 
 func RegisteredTemplates() []TemplateDefinition {
@@ -74,6 +108,10 @@ func RegisteredTemplates() []TemplateDefinition {
 		TemplateUserReminder,
 		TemplateProviderBookingReminder,
 		TemplateProviderNewBooking,
+		TemplateBookingStatusUpdate,
+		TemplateProviderAccountCreated,
+		TemplateUserAccountCreated,
+		TemplateAuthCode,
 	}
 	definitions := make([]TemplateDefinition, 0, len(keys))
 	for _, key := range keys {
@@ -158,18 +196,21 @@ func buildTemplateRequest(message TemplateMessage) (templateRequest, error) {
 	if len(message.Values.OpaqueCallbackData) > 512 || containsControlCharacter(message.Values.OpaqueCallbackData) {
 		return templateRequest{}, errors.New("opaque callback data is invalid")
 	}
+	components := []templateComponent{{Type: "body", Parameters: body}}
+	if len(definition.ButtonParameters) > 0 {
+		components = append(components, templateComponent{
+			Type: "button", SubType: "url", Index: "0", Parameters: button,
+		})
+	}
 	return templateRequest{
 		MessagingProduct: "whatsapp",
 		RecipientType:    "individual",
 		To:               to,
 		Type:             "template",
 		Template: templatePayload{
-			Name:     definition.Name,
-			Language: templateLanguage{Code: definition.Language},
-			Components: []templateComponent{
-				{Type: "body", Parameters: body},
-				{Type: "button", SubType: "url", Index: "0", Parameters: button},
-			},
+			Name:       definition.Name,
+			Language:   templateLanguage{Code: definition.Language},
+			Components: components,
 		},
 		BizOpaqueCallbackData: message.Values.OpaqueCallbackData,
 	}, nil
@@ -186,12 +227,28 @@ func orderedTemplateParameters(names []string, values map[string]string, routeSu
 		if !ok || value == "" || len(value) > 1024 || containsControlCharacter(value) {
 			return nil, fmt.Errorf("parameter %q is missing or invalid", name)
 		}
-		if routeSuffix && (!strings.HasPrefix(value, "?") || strings.Contains(value, "://")) {
-			return nil, fmt.Errorf("parameter %q must be a relative query suffix", name)
+		if routeSuffix && !validBookingRouteSuffix(value) {
+			return nil, fmt.Errorf("parameter %q must be a relative booking suffix", name)
 		}
 		parameters = append(parameters, templateParameter{Type: "text", Text: value})
 	}
 	return parameters, nil
+}
+
+func validBookingRouteSuffix(value string) bool {
+	if strings.HasPrefix(value, "#claim=") {
+		token := strings.TrimPrefix(value, "#claim=")
+		if len(token) < 32 || len(token) > 128 {
+			return false
+		}
+		for _, c := range token {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+				return false
+			}
+		}
+		return true
+	}
+	return strings.HasPrefix(value, "?") && !strings.Contains(value, "://")
 }
 
 func containsControlCharacter(value string) bool {

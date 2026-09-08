@@ -17,6 +17,7 @@ import (
 	aisvc "booking/go-server/internal/ai"
 	"booking/go-server/internal/appdata"
 	"booking/go-server/internal/auth"
+	"booking/go-server/internal/authchallenge"
 	"booking/go-server/internal/config"
 	"booking/go-server/internal/database"
 	"booking/go-server/internal/llm"
@@ -33,6 +34,7 @@ import (
 	"booking/go-server/internal/server"
 	"booking/go-server/internal/storage"
 	"booking/go-server/internal/tessa"
+	"booking/go-server/internal/welcomeemail"
 	"booking/go-server/internal/whatsapp"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -141,7 +143,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	smtpMailer, err := mailer.NewSMTPMailer(mailer.Config{
+	transactionalSMTPConfig := mailer.Config{
 		Host:               cfg.SMTPHost,
 		Port:               cfg.SMTPPort,
 		Username:           cfg.SMTPUsername,
@@ -151,16 +153,50 @@ func main() {
 		Security:           cfg.SMTPSecurity,
 		InsecureSkipVerify: cfg.SMTPInsecureSkipVerify,
 		ConnectTimeout:     cfg.SMTPConnectTimeout,
-	})
+	}
+	smtpMailer, err := mailer.NewSMTPMailer(transactionalSMTPConfig)
 	if err != nil {
 		logger.Error("configure smtp mailer", "error", err)
 		os.Exit(1)
 	}
+	notificationSMTPConfig := transactionalSMTPConfig
+	notificationSMTPConfig.SendTimeout = cfg.NotificationEmailTimeout
+	notificationSMTPConfig.MaxConnections = cfg.NotificationEmailConcurrency
+	notificationSMTPMailer, err := mailer.NewSMTPMailer(notificationSMTPConfig)
+	if err != nil {
+		logger.Error("configure notification smtp mailer", "error", err)
+		os.Exit(1)
+	}
+	welcomeSMTPConfig := transactionalSMTPConfig
+	welcomeSMTPConfig.SendTimeout = cfg.WelcomeEmailTimeout
+	welcomeSMTPConfig.MaxConnections = cfg.WelcomeEmailConcurrency
+	welcomeSMTPMailer, err := mailer.NewSMTPMailer(welcomeSMTPConfig)
+	if err != nil {
+		logger.Error("configure welcome smtp mailer", "error", err)
+		os.Exit(1)
+	}
+	authSMTPConfig := transactionalSMTPConfig
+	authSMTPConfig.SendTimeout = cfg.AuthDeliveryTimeout
+	authSMTPConfig.MaxConnections = cfg.AuthDeliveryConcurrency
+	authSMTPMailer, err := mailer.NewSMTPMailer(authSMTPConfig)
+	if err != nil {
+		logger.Error("configure auth smtp mailer", "error", err)
+		os.Exit(1)
+	}
+	authChallenges, err := authchallenge.NewService(dbPool, authchallenge.Config{
+		EmailEnabled: cfg.AuthEmailEnabled, WhatsAppEnabled: cfg.AuthWhatsAppEnabled,
+		EncryptionKeys: cfg.AuthDeliveryEncryptionKeys, ActiveKey: cfg.AuthDeliveryActiveKey,
+		DestinationKey: cfg.AuthDestinationHMACKey,
+	})
+	if err != nil {
+		logger.Error("configure auth challenge delivery", "error", err)
+		os.Exit(1)
+	}
 
-	authService := auth.NewService(authRepo, cfg, r2Service, smtpMailer)
+	authService := auth.NewService(authRepo, cfg, r2Service, authChallenges)
 	authHandler := auth.NewHandler(authService, cfg)
 	marketplaceAuthRepo := marketplaceauth.NewRepository(dbPool)
-	marketplaceAuthService := marketplaceauth.NewService(marketplaceAuthRepo, cfg, smtpMailer)
+	marketplaceAuthService := marketplaceauth.NewService(marketplaceAuthRepo, cfg, authChallenges)
 	if redisClient != nil {
 		marketplaceAuthService.ConfigureSessionCache(redisClient, cfg.RedisFallbackMaxConcurrency, metrics)
 	}
@@ -497,9 +533,44 @@ func main() {
 		go settlementWorker.Start(ctx)
 	}
 	if runsCoreWorkers {
+		if cfg.AuthEmailEnabled {
+			authWake, unsubscribeAuthWake := coreWorkerWake.Subscribe()
+			defer unsubscribeAuthWake()
+			go authchallenge.NewWorker(
+				authChallenges, authSMTPMailer, logger, authWake, metrics,
+				cfg.AuthDeliveryConcurrency, cfg.AuthDeliveryTimeout,
+			).Start(ctx)
+		}
+		if cfg.AuthWhatsAppEnabled {
+			authWhatsAppSender, authWhatsAppErr := whatsapp.NewClient(whatsapp.ClientConfig{
+				BaseURL: cfg.WhatsAppGraphBaseURL, GraphVersion: cfg.WhatsAppGraphVersion,
+				PhoneNumberID: cfg.WABAPhoneNumberID, BusinessAccountID: cfg.WhatsAppBusinessAccountID,
+				AccessToken: cfg.WABAToken, Timeout: cfg.WhatsAppHTTPTimeout,
+				EnabledTemplateKeys: []string{string(whatsapp.TemplateAuthCode)},
+			})
+			if authWhatsAppErr != nil {
+				logger.Error("configure WhatsApp auth sender", "error", authWhatsAppErr)
+				os.Exit(1)
+			}
+			authWhatsAppWake, unsubscribeAuthWhatsAppWake := coreWorkerWake.Subscribe()
+			defer unsubscribeAuthWhatsAppWake()
+			go authchallenge.NewWhatsAppWorker(
+				authChallenges, authWhatsAppSender, logger, authWhatsAppWake, metrics,
+				cfg.AuthDeliveryConcurrency, cfg.AuthDeliveryTimeout,
+			).Start(ctx)
+		}
+		if cfg.WelcomeEmailEnabled {
+			welcomeWake, unsubscribeWelcomeWake := coreWorkerWake.Subscribe()
+			defer unsubscribeWelcomeWake()
+			go welcomeemail.NewWorker(
+				welcomeemail.NewRepository(dbPool), welcomeSMTPMailer, logger, welcomeWake, metrics,
+				cfg.WelcomeEmailConcurrency, cfg.WelcomeEmailTimeout,
+			).Start(ctx)
+		}
 		if len(cfg.NotificationDestinationHMACKey) >= 32 {
 			notificationRepository, notificationErr := notificationworker.NewRepository(
 				dbPool, cfg.NotificationDestinationHMACKey, cfg.WhatsAppEnabledTemplateKeys,
+				cfg.NotificationEmailEnabled, cfg.NotificationWhatsAppEnabled,
 			)
 			if notificationErr != nil {
 				logger.Error("configure notification planner", "error", notificationErr)
@@ -510,6 +581,37 @@ func main() {
 			go notificationworker.NewPlannerWorker(
 				notificationRepository, logger, notificationWake, cfg.NotificationPlannerConcurrency,
 			).Start(ctx)
+			if cfg.NotificationEmailEnabled {
+				emailWake, unsubscribeEmailWake := coreWorkerWake.Subscribe()
+				defer unsubscribeEmailWake()
+				go notificationworker.NewEmailWorker(
+					notificationRepository, notificationSMTPMailer, logger, emailWake, metrics,
+					cfg.NotificationEmailConcurrency, cfg.NotificationEmailTimeout,
+					cfg.ClientPublicBaseURL, cfg.MarketplacePublicBaseURL,
+				).Start(ctx)
+			}
+			if cfg.WhatsAppBusinessAccountID != "" && cfg.WABAPhoneNumberID != "" {
+				var whatsAppSender *whatsapp.Client
+				if cfg.NotificationWhatsAppEnabled {
+					whatsAppSender, notificationErr = whatsapp.NewClient(whatsapp.ClientConfig{
+						BaseURL: cfg.WhatsAppGraphBaseURL, GraphVersion: cfg.WhatsAppGraphVersion,
+						PhoneNumberID: cfg.WABAPhoneNumberID, BusinessAccountID: cfg.WhatsAppBusinessAccountID,
+						AccessToken: cfg.WABAToken, Timeout: cfg.WhatsAppHTTPTimeout,
+						EnabledTemplateKeys: cfg.WhatsAppEnabledTemplateKeys,
+					})
+					if notificationErr != nil {
+						logger.Error("configure WhatsApp notification sender", "error", notificationErr)
+						os.Exit(1)
+					}
+				}
+				whatsAppWake, unsubscribeWhatsAppWake := coreWorkerWake.Subscribe()
+				defer unsubscribeWhatsAppWake()
+				go notificationworker.NewWhatsAppWorker(
+					notificationRepository, whatsAppSender, logger, whatsAppWake, metrics,
+					cfg.WhatsAppWorkerConcurrency, cfg.WhatsAppHTTPTimeout,
+					cfg.NotificationWhatsAppEnabled,
+				).Start(ctx)
+			}
 		} else {
 			logger.Info("notification planner disabled", "reason", "missing destination HMAC key")
 		}
@@ -530,10 +632,44 @@ func main() {
 
 	appdataHandler := appdata.NewHandler(appdataRepo, authHandler, destinationService, r2Service, smtpMailer, aiClient, checkoutService, payoutService, paymentEvents, paymentReconciliations, cfg.ClientPublicBaseURL, cfg.MarketplacePublicBaseURL)
 	var notificationContacts *whatsapp.ContactFoundationRepository
+	tessaLinks := whatsapp.NewTessaLinkRepository(dbPool, cfg.WABAPhoneNumberID, cfg.WABABusinessPhoneE164, cfg.TessaWhatsAppLinkingEnabled, cfg.TessaAIProviderAllowlist)
+	// A separate chat rollout switch preserves linking without starting AI replies.
+	var tessaWhatsAppClient *whatsapp.Client
+	if cfg.TessaWhatsAppLinkingEnabled && (runsCoreWorkers || (cfg.TessaWhatsAppConversationsEnabled && runsAIWorkers)) {
+		var clientErr error
+		tessaWhatsAppClient, clientErr = whatsapp.NewClient(whatsapp.ClientConfig{BaseURL: cfg.WhatsAppGraphBaseURL, GraphVersion: cfg.WhatsAppGraphVersion,
+			PhoneNumberID: cfg.WABAPhoneNumberID, BusinessAccountID: cfg.WhatsAppBusinessAccountID, AccessToken: cfg.WABAToken, Timeout: cfg.WhatsAppHTTPTimeout})
+		if clientErr != nil {
+			logger.Error("configure Tessa WhatsApp transport", "error", clientErr)
+			os.Exit(1)
+		}
+	}
+	if cfg.TessaWhatsAppConversationsEnabled {
+		if err := tessaLinks.WithAssistantReplies(cfg.ClientPublicBaseURL, cfg.TessaAINoticeRevision); err != nil {
+			logger.Error("configure Tessa WhatsApp replies", "error", err)
+			os.Exit(1)
+		}
+		tessaLinks.WithConversationIngress(appdata.NewTessaWhatsAppIngress(cfg.TessaAINoticeRevision))
+	}
+	if cfg.AuthEmailEnabled {
+		tessaLinks.WithEmailLinking(authChallenges, cfg.ClientPublicBaseURL)
+	}
+	appdataHandler.ConfigureTessaWhatsApp(tessaLinks)
+	if runsCoreWorkers {
+		var tessaSender whatsapp.TextSender
+		if tessaWhatsAppClient != nil {
+			tessaSender = tessaWhatsAppClient
+		}
+		if cfg.WABAPhoneNumberID != "" {
+			tessaWake, unsubscribeTessaWake := coreWorkerWake.Subscribe()
+			defer unsubscribeTessaWake()
+			go whatsapp.NewTessaControlWorker(tessaLinks, tessaSender, logger).Start(ctx, tessaWake)
+		}
+	}
 	if runsAPI && cfg.NotificationContactFoundationConfigured() {
 		notificationContacts, err = whatsapp.NewContactFoundationRepository(
 			dbPool, cfg.NotificationDestinationHMACKey, cfg.WABABusinessPhoneE164,
-			cfg.MetaWebhookConfigured(),
+			cfg.MetaWebhookConfigured(), cfg.NotificationEmailEnabled, cfg.NotificationWhatsAppEnabled,
 		)
 		if err != nil {
 			logger.Error("configure notification contact foundation", "error", err)
@@ -624,18 +760,24 @@ func main() {
 			logger.Error("load Tessa help corpus", "error", helpErr)
 			os.Exit(1)
 		}
+		tessaWorkerConfig := appdata.TessaWorkerConfig{
+			MaxConcurrency: cfg.TessaAIWorkerConcurrency, TurnTimeout: cfg.TessaAITurnTimeout,
+			ConfigHash: cfg.TessaAIConfigHash(), NoticeRevision: cfg.TessaAINoticeRevision,
+		}
+		if cfg.TessaWhatsAppConversationsEnabled {
+			tessaWorkerConfig.WhatsAppPhoneNumberID = cfg.WABAPhoneNumberID
+			tessaWorkerConfig.WhatsAppProviderAllowlist = cfg.TessaAIProviderAllowlist
+		}
 		tessaWorker, workerErr := appdata.NewTessaWorker(
 			appdataRepo, tessaService, helpIndex, inboxAIGenerationLimiter, logger,
-			appdata.TessaWorkerConfig{
-				MaxConcurrency: cfg.TessaAIWorkerConcurrency,
-				TurnTimeout:    cfg.TessaAITurnTimeout,
-				ConfigHash:     cfg.TessaAIConfigHash(),
-				NoticeRevision: cfg.TessaAINoticeRevision,
-			},
+			tessaWorkerConfig,
 		)
 		if workerErr != nil {
 			logger.Error("configure Tessa worker", "error", workerErr)
 			os.Exit(1)
+		}
+		if cfg.TessaWhatsAppConversationsEnabled {
+			tessaWorker.WithWhatsAppTyping(tessaWhatsAppClient)
 		}
 		tessaWakes, unsubscribeTessaWakes := subscribeWorkerWakes(aiWorkerWake, cfg.TessaAIWorkerConcurrency)
 		defer unsubscribeTessaWakes()
@@ -707,7 +849,7 @@ func main() {
 					AppSecret: cfg.MetaAppSecret, VerifyToken: cfg.MetaVerifyToken,
 					BusinessID: cfg.WhatsAppBusinessAccountID, PhoneNumberID: cfg.WABAPhoneNumberID,
 				},
-				whatsapp.NewWebhookRepository(dbPool, notificationContacts),
+				whatsapp.NewWebhookRepository(dbPool, notificationContacts).WithTessaLinks(tessaLinks),
 				logger,
 			)
 			if metaHandlerErr != nil {

@@ -7,6 +7,110 @@ servers:
 security:
   - bearerAuth: []
 paths:
+  /profile/customer-contact:
+    get:
+      operationId: getCustomerContact
+      responses:
+        '200':
+          description: Private business contact settings and verified numbers available for explicit reuse.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomerContactResponse' }
+    patch:
+      operationId: updateCustomerContactVisibility
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [revision]
+              anyOf:
+                - required: [allow_booking_contact]
+                - required: [show_on_public_profile]
+              properties:
+                revision: { type: integer, minimum: 1 }
+                allow_booking_contact: { type: boolean }
+                show_on_public_profile: { type: boolean }
+      responses:
+        '200':
+          description: Sharing choices saved independently; verification is required for either choice.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomerContactResponse' }
+        '409':
+          description: Revision changed or contact is not verified. Reload contact settings.
+    delete:
+      operationId: removeCustomerContact
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [revision]
+              properties:
+                revision: { type: integer, minimum: 1 }
+      responses:
+        '204': { description: Contact removed and both sharing choices disabled. }
+        '409': { description: Revision changed. Reload contact settings. }
+  /profile/customer-contact/reuse-verified:
+    post:
+      operationId: reuseVerifiedCustomerContact
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CustomerContactNumberInput' }
+      responses:
+        '200':
+          description: Selected verified number copied to business contact. Both sharing choices reset to false.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomerContactResponse' }
+        '409': { description: Number no longer verified for this provider or revision changed. }
+  /profile/customer-contact/verification:
+    post:
+      operationId: startCustomerContactVerification
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CustomerContactNumberInput' }
+      responses:
+        '201':
+          description: Number normalized; existing verification and sharing cleared. Open the prepared WhatsApp message and send it from this number, then GET contact settings to refresh. Verification expires after 15 minutes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [verification]
+                properties:
+                  verification: { $ref: '#/components/schemas/ProviderWhatsAppVerification' }
+        '409': { description: Revision changed or number already verified. }
+        '503': { description: Inbound WhatsApp verification is unavailable. }
+  /bookings/{bookingID}:
+    get:
+      operationId: getProviderBookingDeliveryStatus
+      parameters:
+        - name: bookingID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Provider-owned booking detail including committed delivery status.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                required: [id, delivery_status]
+                properties:
+                  id: { type: string, format: uuid }
+                  delivery_status: { $ref: '#/components/schemas/BookingDeliveryStatus' }
   /notification-preferences:
     get:
       operationId: getProviderNotificationPreferences
@@ -60,6 +164,57 @@ components:
       type: http
       scheme: bearer
   schemas:
+    CustomerContactNumberInput:
+      type: object
+      additionalProperties: false
+      required: [phone, revision]
+      properties:
+        phone:
+          type: string
+          minLength: 1
+          description: For reuse, the exact E.164 number returned in reusable_verified_numbers. For verification, a local or international phone number.
+        revision: { type: integer, minimum: 1 }
+    CustomerContactResponse:
+      type: object
+      required: [contact]
+      properties:
+        contact: { $ref: '#/components/schemas/CustomerContact' }
+    CustomerContact:
+      type: object
+      additionalProperties: false
+      required: [phone, allow_booking_contact, show_on_public_profile, revision, verification_available, reusable_verified_numbers]
+      properties:
+        phone: { type: string, description: Normalized E.164 phone or empty when unset. }
+        verified_at: { type: string, format: date-time }
+        allow_booking_contact: { type: boolean, default: false }
+        show_on_public_profile: { type: boolean, default: false }
+        revision: { type: integer, minimum: 1 }
+        verification_available: { type: boolean }
+        reusable_verified_numbers:
+          type: array
+          uniqueItems: true
+          items: { type: string }
+    BookingDeliveryChannelStatus:
+      type: object
+      additionalProperties: false
+      required: [requested, eligible, status]
+      properties:
+        requested: { type: boolean }
+        eligible: { type: boolean }
+        status:
+          type: string
+          enum: [not_requested, pending, accepted, sent, delivered, read, failed, unknown, manual_review, cancelled]
+    BookingDeliveryStatus:
+      type: object
+      additionalProperties: false
+      required: [provider_in_app, provider_email, provider_whatsapp, customer_email, customer_whatsapp, customer_sms]
+      properties:
+        provider_in_app: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        provider_email: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        provider_whatsapp: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        customer_email: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        customer_whatsapp: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        customer_sms: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
     ProviderNotificationPreferences:
       type: object
       additionalProperties: false
@@ -69,7 +224,9 @@ components:
         - appointment_reminder_enabled
         - appointment_reminder_minutes
         - email_available
+        - email_delivery_enabled
         - whatsapp_verification_available
+        - whatsapp_delivery_enabled
         - preference_revision
         - updated_at
       properties:
@@ -78,9 +235,11 @@ components:
         appointment_reminder_enabled: { type: boolean }
         appointment_reminder_minutes: { type: integer, enum: [1440] }
         email_available: { type: boolean }
+        email_delivery_enabled: { type: boolean }
         whatsapp_e164: { type: string }
         whatsapp_verified_at: { type: string, format: date-time }
         whatsapp_verification_available: { type: boolean }
+        whatsapp_delivery_enabled: { type: boolean }
         preference_revision: { type: integer, format: int64, minimum: 1 }
         updated_at: { type: string, format: date-time }
     ProviderNotificationPreferencesResponse:

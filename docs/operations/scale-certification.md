@@ -22,6 +22,7 @@ The minimum scenario set is:
 | `auth_and_account` | Session/account reads plus distributed identifier, actor, and IP limits |
 | `provider_application` | Dashboard, bookings, customers, notifications, and stats |
 | `booking_contention` | Quote/create/change/payment status, retries, idempotency, and capacity contention |
+| `notification_phase_a` | Planner/email/WhatsApp load, channel failure isolation, webhook bursts, lease recovery, and backfill safety |
 | `inbox_and_tessa` | Lists, large histories, sends, AI queue/worker completion, event delivery, and reconnect |
 | `idle_sse_10000` | 10,000 established idle streams on the intended ingress/API topology |
 | `controlled_event_burst` | Bounded event fan-out after streams are established |

@@ -8,7 +8,9 @@ import (
 	"strings"
 	"time"
 
+	"booking/go-server/internal/authchallenge"
 	"booking/go-server/internal/publictoken"
+	"booking/go-server/internal/welcomeemail"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -26,98 +28,10 @@ type Repository struct{ db *pgxpool.Pool }
 
 func NewRepository(db *pgxpool.Pool) *Repository { return &Repository{db: db} }
 
-func (r *Repository) CreateChallenge(ctx context.Context, challenge Challenge) error {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin marketplace auth challenge: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `
-		UPDATE marketplace_auth_challenges SET consumed_at=NOW()
-		WHERE identifier_type=$1 AND identifier=$2 AND purpose=$3
-		  AND target_customer_id IS NOT DISTINCT FROM $4 AND consumed_at IS NULL
-	`, challenge.IdentifierType, challenge.Identifier, challenge.Purpose, challenge.TargetCustomerID); err != nil {
-		return fmt.Errorf("expire prior marketplace auth challenges: %w", err)
-	}
-	_, err = tx.Exec(ctx, `
-		INSERT INTO marketplace_auth_challenges (
-			id, identifier_type, identifier, delivery_channel, purpose, target_customer_id,
-			code_hash, expires_at, created_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-	`, challenge.ID, challenge.IdentifierType, challenge.Identifier, challenge.DeliveryChannel,
-		challenge.Purpose, challenge.TargetCustomerID, challenge.CodeHash, challenge.ExpiresAt, challenge.CreatedAt)
-	if err != nil {
-		return fmt.Errorf("create marketplace auth challenge: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit marketplace auth challenge: %w", err)
-	}
-	return nil
-}
-
-func (r *Repository) LatestChallengeCreatedAt(ctx context.Context, identifierType, identifier string) (time.Time, error) {
-	var createdAt time.Time
-	err := r.db.QueryRow(ctx, `
-		SELECT created_at FROM marketplace_auth_challenges
-		WHERE identifier_type=$1 AND identifier=$2
-		ORDER BY created_at DESC LIMIT 1
-	`, identifierType, identifier).Scan(&createdAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return time.Time{}, ErrNotFound
-	}
-	if err != nil {
-		return time.Time{}, fmt.Errorf("load latest marketplace challenge: %w", err)
-	}
-	return createdAt, nil
-}
-
-func (r *Repository) GetChallenge(ctx context.Context, id uuid.UUID) (Challenge, error) {
-	var challenge Challenge
-	var consumedAt sql.NullTime
-	var targetCustomerID uuid.NullUUID
-	err := r.db.QueryRow(ctx, `
-		SELECT id, identifier_type, identifier, delivery_channel, purpose, target_customer_id,
-		       code_hash, failed_attempts, expires_at, consumed_at, created_at
-		FROM marketplace_auth_challenges WHERE id=$1
-	`, id).Scan(&challenge.ID, &challenge.IdentifierType, &challenge.Identifier,
-		&challenge.DeliveryChannel, &challenge.Purpose, &targetCustomerID,
-		&challenge.CodeHash, &challenge.FailedAttempts,
-		&challenge.ExpiresAt, &consumedAt, &challenge.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Challenge{}, ErrNotFound
-	}
-	if err != nil {
-		return Challenge{}, fmt.Errorf("load marketplace challenge: %w", err)
-	}
-	if consumedAt.Valid {
-		challenge.ConsumedAt = &consumedAt.Time
-	}
-	if targetCustomerID.Valid {
-		challenge.TargetCustomerID = &targetCustomerID.UUID
-	}
-	return challenge, nil
-}
-
-func (r *Repository) DeleteChallenge(ctx context.Context, id uuid.UUID) {
-	_, _ = r.db.Exec(ctx, `DELETE FROM marketplace_auth_challenges WHERE id=$1`, id)
-}
-
-func (r *Repository) RecordFailedChallengeAttempt(ctx context.Context, id uuid.UUID) error {
-	_, err := r.db.Exec(ctx, `
-		UPDATE marketplace_auth_challenges
-		SET failed_attempts=LEAST(failed_attempts+1, 6)
-		WHERE id=$1 AND consumed_at IS NULL
-	`, id)
-	if err != nil {
-		return fmt.Errorf("record failed challenge attempt: %w", err)
-	}
-	return nil
-}
-
-func (r *Repository) CompleteChallenge(ctx context.Context, challenge Challenge, session Session) (Customer, error) {
+func (r *Repository) CompleteChallenge(ctx context.Context, challenge authchallenge.Challenge, session Session) (Customer, bool, error) {
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return Customer{}, fmt.Errorf("begin marketplace challenge completion: %w", err)
+		return Customer{}, false, fmt.Errorf("begin marketplace challenge completion: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
@@ -125,33 +39,35 @@ func (r *Repository) CompleteChallenge(ctx context.Context, challenge Challenge,
 	err = tx.QueryRow(ctx, `
 		UPDATE marketplace_auth_challenges SET consumed_at=NOW()
 		WHERE id=$1 AND code_hash=$2 AND consumed_at IS NULL
-		  AND purpose='sign_in' AND expires_at>NOW() AND failed_attempts<6
+		  AND purpose='sign_in' AND delivery_accepted_at IS NOT NULL
+		  AND verify_expires_at>NOW() AND failed_attempts<6
 		RETURNING id
 	`, challenge.ID, challenge.CodeHash).Scan(&lockedID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Customer{}, ErrNotFound
+		return Customer{}, false, ErrNotFound
 	}
 	if err != nil {
-		return Customer{}, fmt.Errorf("consume marketplace challenge: %w", err)
+		return Customer{}, false, fmt.Errorf("consume marketplace challenge: %w", err)
 	}
 
 	// Serialize first-time sign-ins for one normalized identity so concurrent code
 	// verification cannot create orphaned or duplicate customer records.
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, challenge.IdentifierType+":"+challenge.Identifier); err != nil {
-		return Customer{}, fmt.Errorf("lock marketplace identity: %w", err)
+		return Customer{}, false, fmt.Errorf("lock marketplace identity: %w", err)
 	}
 	var customerID uuid.UUID
+	newCustomer := false
 	err = tx.QueryRow(ctx, `
 		SELECT marketplace_customer_id
 		FROM marketplace_customer_identities
-		WHERE normalized_identifier=$2
-		  AND (identifier_type=$1 OR ($1 IN ('phone','whatsapp') AND identifier_type IN ('phone','whatsapp')))
+		WHERE identifier_type=$1 AND normalized_identifier=$2
 	`, challenge.IdentifierType, challenge.Identifier).Scan(&customerID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		customerID = uuid.New()
+		newCustomer = true
 		now := time.Now().UTC()
 		if err = insertCustomerForIdentity(ctx, tx, customerID, challenge.IdentifierType, challenge.Identifier, now); err != nil {
-			return Customer{}, err
+			return Customer{}, false, err
 		}
 		_, err = tx.Exec(ctx, `
 			INSERT INTO marketplace_customer_identities (
@@ -160,39 +76,49 @@ func (r *Repository) CompleteChallenge(ctx context.Context, challenge Challenge,
 		`, customerID, challenge.IdentifierType, challenge.Identifier, now)
 	}
 	if err != nil {
-		return Customer{}, fmt.Errorf("resolve marketplace identity: %w", err)
+		return Customer{}, false, fmt.Errorf("resolve marketplace identity: %w", err)
 	}
 	if err := updateCustomerIdentityColumn(ctx, tx, customerID, challenge.IdentifierType, challenge.Identifier, time.Now().UTC()); err != nil {
-		return Customer{}, err
+		return Customer{}, false, err
 	}
 
 	session.CustomerID = customerID
 	_, err = tx.Exec(ctx, `
 		INSERT INTO marketplace_auth_sessions (
 			id, marketplace_customer_id, token_hash, user_agent, ip_address,
-			expires_at, last_used_at, created_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+			expires_at, last_used_at, created_at, session_revision
+		) SELECT $1,$2,$3,$4,$5,$6,$7,$8,security_revision
+		  FROM marketplace_customers WHERE id=$2
 	`, session.ID, session.CustomerID, session.TokenHash, session.UserAgent, session.IPAddress,
 		session.ExpiresAt, session.LastUsedAt, session.CreatedAt)
 	if err != nil {
-		return Customer{}, fmt.Errorf("create marketplace session: %w", err)
+		return Customer{}, false, fmt.Errorf("create marketplace session: %w", err)
 	}
 
 	if _, err = tx.Exec(ctx, `
 		INSERT INTO marketplace_notification_preferences (marketplace_customer_id)
 		VALUES ($1) ON CONFLICT DO NOTHING
 	`, customerID); err != nil {
-		return Customer{}, fmt.Errorf("create notification preferences: %w", err)
+		return Customer{}, false, fmt.Errorf("create notification preferences: %w", err)
+	}
+	if newCustomer && challenge.IdentifierType == "email" {
+		if _, err := welcomeemail.AssignOptionalTx(ctx, tx, welcomeemail.Assignment{
+			Audience:  welcomeemail.AudienceMarketplaceCustomer,
+			AccountID: customerID,
+			Email:     challenge.Identifier,
+		}); err != nil {
+			return Customer{}, false, fmt.Errorf("assign marketplace welcome email: %w", err)
+		}
 	}
 
 	customer, err := scanCustomer(tx.QueryRow(ctx, customerSelect+` WHERE c.id=$1`, customerID))
 	if err != nil {
-		return Customer{}, err
+		return Customer{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Customer{}, fmt.Errorf("commit marketplace login: %w", err)
+		return Customer{}, false, fmt.Errorf("commit marketplace login: %w", err)
 	}
-	return customer, nil
+	return customer, newCustomer, nil
 }
 
 func insertCustomerForIdentity(ctx context.Context, tx pgx.Tx, customerID uuid.UUID, identifierType, identifier string, now time.Time) error {
@@ -206,11 +132,6 @@ func insertCustomerForIdentity(ctx context.Context, tx pgx.Tx, customerID uuid.U
 	case "phone":
 		_, err = tx.Exec(ctx, `
 			INSERT INTO marketplace_customers (id, phone_e164, phone_verified_at, created_at, updated_at)
-			VALUES ($1,$2,$3,$3,$3)
-		`, customerID, identifier, now)
-	case "whatsapp":
-		_, err = tx.Exec(ctx, `
-			INSERT INTO marketplace_customers (id, whatsapp_e164, whatsapp_verified_at, created_at, updated_at)
 			VALUES ($1,$2,$3,$3,$3)
 		`, customerID, identifier, now)
 	default:
@@ -227,8 +148,7 @@ func (r *Repository) IdentityOwner(ctx context.Context, identifierType, identifi
 	err := r.db.QueryRow(ctx, `
 		SELECT marketplace_customer_id
 		FROM marketplace_customer_identities
-		WHERE normalized_identifier=$2
-		  AND (identifier_type=$1 OR ($1 IN ('phone','whatsapp') AND identifier_type IN ('phone','whatsapp')))
+		WHERE identifier_type=$1 AND normalized_identifier=$2
 	`, identifierType, identifier).Scan(&customerID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, ErrNotFound
@@ -261,7 +181,6 @@ func (r *Repository) CustomerHasVerifiedIdentityType(ctx context.Context, custom
 		SELECT CASE $2
 			WHEN 'email' THEN email_verified_at IS NOT NULL
 			WHEN 'phone' THEN phone_verified_at IS NOT NULL
-			WHEN 'whatsapp' THEN whatsapp_verified_at IS NOT NULL
 			ELSE FALSE
 		END
 		FROM marketplace_customers WHERE id=$1
@@ -275,13 +194,13 @@ func (r *Repository) CustomerHasVerifiedIdentityType(ctx context.Context, custom
 	return verified, nil
 }
 
-func (r *Repository) CompleteIdentityLink(ctx context.Context, challenge Challenge) (Customer, error) {
-	if challenge.TargetCustomerID == nil {
-		return Customer{}, ErrNotFound
+func (r *Repository) CompleteIdentityLink(ctx context.Context, challenge authchallenge.Challenge) (Customer, [][]byte, error) {
+	if challenge.TargetAccountID == nil {
+		return Customer{}, nil, ErrNotFound
 	}
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return Customer{}, fmt.Errorf("begin marketplace identity link: %w", err)
+		return Customer{}, nil, fmt.Errorf("begin marketplace identity link: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
@@ -290,14 +209,14 @@ func (r *Repository) CompleteIdentityLink(ctx context.Context, challenge Challen
 		UPDATE marketplace_auth_challenges SET consumed_at=NOW()
 		WHERE id=$1 AND code_hash=$2 AND consumed_at IS NULL
 		  AND purpose='link_identity' AND target_customer_id=$3
-		  AND expires_at>NOW() AND failed_attempts<6
+		  AND delivery_accepted_at IS NOT NULL AND verify_expires_at>NOW() AND failed_attempts<6
 		RETURNING id
-	`, challenge.ID, challenge.CodeHash, *challenge.TargetCustomerID).Scan(&lockedID)
+	`, challenge.ID, challenge.CodeHash, *challenge.TargetAccountID).Scan(&lockedID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Customer{}, ErrNotFound
+		return Customer{}, nil, ErrNotFound
 	}
 	if err != nil {
-		return Customer{}, fmt.Errorf("consume identity link challenge: %w", err)
+		return Customer{}, nil, fmt.Errorf("consume identity link challenge: %w", err)
 	}
 
 	now := time.Now().UTC()
@@ -306,44 +225,66 @@ func (r *Repository) CompleteIdentityLink(ctx context.Context, challenge Challen
 			marketplace_customer_id, identifier_type, normalized_identifier, verified_at
 		) VALUES ($1,$2,$3,$4)
 		ON CONFLICT DO NOTHING
-	`, *challenge.TargetCustomerID, challenge.IdentifierType, challenge.Identifier, now)
+	`, *challenge.TargetAccountID, challenge.IdentifierType, challenge.Identifier, now)
 	if err != nil {
-		return Customer{}, fmt.Errorf("link marketplace identity: %w", err)
+		return Customer{}, nil, fmt.Errorf("link marketplace identity: %w", err)
 	}
 	if result.RowsAffected() == 0 {
 		var ownerID uuid.UUID
 		err = tx.QueryRow(ctx, `
 			SELECT marketplace_customer_id
 			FROM marketplace_customer_identities
-			WHERE normalized_identifier=$1
-			  AND (identifier_type=$2 OR ($2 IN ('phone','whatsapp') AND identifier_type IN ('phone','whatsapp')))
+			WHERE normalized_identifier=$1 AND identifier_type=$2
 		`, challenge.Identifier, challenge.IdentifierType).Scan(&ownerID)
-		if err != nil || ownerID != *challenge.TargetCustomerID {
-			return Customer{}, ErrIdentityConflict
+		if err != nil || ownerID != *challenge.TargetAccountID {
+			return Customer{}, nil, ErrIdentityConflict
 		}
 	}
-	if err := updateCustomerIdentityColumn(ctx, tx, *challenge.TargetCustomerID, challenge.IdentifierType, challenge.Identifier, now); err != nil {
-		return Customer{}, err
+	if err := updateCustomerIdentityColumn(ctx, tx, *challenge.TargetAccountID, challenge.IdentifierType, challenge.Identifier, now); err != nil {
+		return Customer{}, nil, err
 	}
-	customer, err := scanCustomer(tx.QueryRow(ctx, customerSelect+` WHERE c.id=$1`, *challenge.TargetCustomerID))
+	if challenge.IdentifierType == "email" {
+		if _, err := welcomeemail.AssignOptionalTx(ctx, tx, welcomeemail.Assignment{
+			Audience: welcomeemail.AudienceMarketplaceCustomer, AccountID: *challenge.TargetAccountID,
+			Email: challenge.Identifier,
+		}); err != nil {
+			return Customer{}, nil, fmt.Errorf("assign linked marketplace welcome email: %w", err)
+		}
+	}
+	revokedHashes, err := marketplaceSessionHashesTx(ctx, tx, *challenge.TargetAccountID)
 	if err != nil {
-		return Customer{}, err
+		return Customer{}, nil, err
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM marketplace_auth_sessions WHERE marketplace_customer_id=$1`, *challenge.TargetAccountID); err != nil {
+		return Customer{}, nil, fmt.Errorf("revoke marketplace sessions after identity link: %w", err)
+	}
+	customer, err := scanCustomer(tx.QueryRow(ctx, customerSelect+` WHERE c.id=$1`, *challenge.TargetAccountID))
+	if err != nil {
+		return Customer{}, nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Customer{}, fmt.Errorf("commit marketplace identity link: %w", err)
+		return Customer{}, nil, fmt.Errorf("commit marketplace identity link: %w", err)
 	}
-	return customer, nil
+	return customer, revokedHashes, nil
 }
 
 func updateCustomerIdentityColumn(ctx context.Context, tx pgx.Tx, customerID uuid.UUID, identifierType, identifier string, verifiedAt time.Time) error {
 	var err error
 	switch identifierType {
 	case "email":
-		_, err = tx.Exec(ctx, `UPDATE marketplace_customers SET email=$2, email_verified_at=$3, security_revision=security_revision+1, updated_at=$3 WHERE id=$1`, customerID, identifier, verifiedAt)
+		_, err = tx.Exec(ctx, `
+			UPDATE marketplace_customers
+			SET email=$2, email_verified_at=$3,
+				security_revision=security_revision+1, updated_at=$3
+			WHERE id=$1 AND (email IS DISTINCT FROM $2 OR email_verified_at IS NULL)
+		`, customerID, identifier, verifiedAt)
 	case "phone":
-		_, err = tx.Exec(ctx, `UPDATE marketplace_customers SET phone_e164=$2, phone_verified_at=$3, security_revision=security_revision+1, updated_at=$3 WHERE id=$1`, customerID, identifier, verifiedAt)
-	case "whatsapp":
-		_, err = tx.Exec(ctx, `UPDATE marketplace_customers SET whatsapp_e164=$2, whatsapp_verified_at=$3, security_revision=security_revision+1, updated_at=$3 WHERE id=$1`, customerID, identifier, verifiedAt)
+		_, err = tx.Exec(ctx, `
+			UPDATE marketplace_customers
+			SET phone_e164=$2, phone_verified_at=$3,
+				security_revision=security_revision+1, updated_at=$3
+			WHERE id=$1 AND (phone_e164 IS DISTINCT FROM $2 OR phone_verified_at IS NULL)
+		`, customerID, identifier, verifiedAt)
 	default:
 		return fmt.Errorf("unsupported identifier type %q", identifierType)
 	}
@@ -380,12 +321,121 @@ func (r *Repository) PasswordCandidates(ctx context.Context, normalizedIdentifie
 	return items, rows.Err()
 }
 
+func (r *Repository) PasswordResetAccount(ctx context.Context, identifierType, identifier string) (passwordCandidate, error) {
+	var candidate passwordCandidate
+	err := r.db.QueryRow(ctx, `
+		SELECT c.id, c.password_hash
+		FROM marketplace_customer_identities identity
+		JOIN marketplace_customers c ON c.id=identity.marketplace_customer_id
+		WHERE identity.identifier_type=$1 AND identity.normalized_identifier=$2
+		  AND c.password_hash IS NOT NULL
+	`, identifierType, identifier).Scan(&candidate.CustomerID, &candidate.PasswordHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return passwordCandidate{}, ErrNotFound
+	}
+	if err != nil {
+		return passwordCandidate{}, fmt.Errorf("load marketplace password reset account: %w", err)
+	}
+	return candidate, nil
+}
+
+func (r *Repository) StorePasswordResetGrant(ctx context.Context, challenge authchallenge.Challenge, grantHash []byte, expiresAt time.Time) error {
+	if challenge.TargetAccountID == nil {
+		return ErrNotFound
+	}
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin marketplace reset verification: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	var consumedID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		UPDATE marketplace_auth_challenges SET consumed_at=NOW()
+		WHERE id=$1 AND code_hash=$2 AND purpose='password_reset'
+		  AND target_customer_id=$3 AND consumed_at IS NULL
+		  AND delivery_accepted_at IS NOT NULL AND verify_expires_at>NOW() AND failed_attempts<6
+		RETURNING id
+	`, challenge.ID, challenge.CodeHash, *challenge.TargetAccountID).Scan(&consumedID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("consume marketplace reset challenge: %w", err)
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO auth_password_reset_grants (
+			id,realm,marketplace_customer_id,marketplace_challenge_id,grant_hash,expires_at
+		) VALUES ($1,'marketplace_customer',$2,$3,$4,$5)
+	`, uuid.New(), *challenge.TargetAccountID, challenge.ID, grantHash, expiresAt)
+	if err != nil {
+		return fmt.Errorf("store marketplace password reset grant: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit marketplace reset verification: %w", err)
+	}
+	return nil
+}
+
+func (r *Repository) CompletePasswordReset(ctx context.Context, grantHash []byte, passwordHash string, session Session) (Customer, [][]byte, error) {
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Customer{}, nil, fmt.Errorf("begin marketplace password reset: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	var customerID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		UPDATE auth_password_reset_grants SET consumed_at=NOW()
+		WHERE realm='marketplace_customer' AND grant_hash=$1 AND consumed_at IS NULL AND expires_at>NOW()
+		RETURNING marketplace_customer_id
+	`, grantHash).Scan(&customerID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Customer{}, nil, ErrNotFound
+	}
+	if err != nil {
+		return Customer{}, nil, fmt.Errorf("consume marketplace password reset grant: %w", err)
+	}
+	if _, err = tx.Exec(ctx, `
+		UPDATE marketplace_customers
+		SET password_hash=$2,security_revision=security_revision+1,updated_at=NOW()
+		WHERE id=$1
+	`, customerID, passwordHash); err != nil {
+		return Customer{}, nil, fmt.Errorf("reset marketplace password: %w", err)
+	}
+	revokedHashes, err := marketplaceSessionHashesTx(ctx, tx, customerID)
+	if err != nil {
+		return Customer{}, nil, err
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM marketplace_auth_sessions WHERE marketplace_customer_id=$1`, customerID); err != nil {
+		return Customer{}, nil, fmt.Errorf("revoke marketplace sessions after reset: %w", err)
+	}
+	session.CustomerID = customerID
+	if _, err = tx.Exec(ctx, `
+		INSERT INTO marketplace_auth_sessions (
+			id,marketplace_customer_id,token_hash,user_agent,ip_address,
+			expires_at,last_used_at,created_at,session_revision
+		) SELECT $1,$2,$3,$4,$5,$6,$7,$8,security_revision
+		  FROM marketplace_customers WHERE id=$2
+	`, session.ID, session.CustomerID, session.TokenHash, session.UserAgent, session.IPAddress,
+		session.ExpiresAt, session.LastUsedAt, session.CreatedAt); err != nil {
+		return Customer{}, nil, fmt.Errorf("create marketplace reset session: %w", err)
+	}
+	customer, err := scanCustomer(tx.QueryRow(ctx, customerSelect+` WHERE c.id=$1`, customerID))
+	if err != nil {
+		return Customer{}, nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Customer{}, nil, fmt.Errorf("commit marketplace password reset: %w", err)
+	}
+	return customer, revokedHashes, nil
+}
+
 func (r *Repository) CreateSession(ctx context.Context, customerID uuid.UUID, session Session) (Customer, error) {
 	_, err := r.db.Exec(ctx, `
 		INSERT INTO marketplace_auth_sessions (
 			id, marketplace_customer_id, token_hash, user_agent, ip_address,
-			expires_at, last_used_at, created_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+			expires_at, last_used_at, created_at, session_revision
+		) SELECT $1,$2,$3,$4,$5,$6,$7,$8,security_revision
+		  FROM marketplace_customers WHERE id=$2
 	`, session.ID, customerID, session.TokenHash, session.UserAgent, session.IPAddress,
 		session.ExpiresAt, session.LastUsedAt, session.CreatedAt)
 	if err != nil {
@@ -395,8 +445,8 @@ func (r *Repository) CreateSession(ctx context.Context, customerID uuid.UUID, se
 }
 
 const customerSelect = `
-	SELECT c.id, c.full_name, COALESCE(c.email,''), COALESCE(c.phone_e164,''), COALESCE(c.whatsapp_e164,''),
-	       c.email_verified_at, c.phone_verified_at, c.whatsapp_verified_at,
+	SELECT c.id, c.full_name, COALESCE(c.email,''), COALESCE(c.phone_e164,''),
+	       c.email_verified_at, c.phone_verified_at,
 	       COALESCE(to_char(c.birthday, 'YYYY-MM-DD'), ''), c.password_hash IS NOT NULL,
 	       c.created_at, c.updated_at
 	FROM marketplace_customers c`
@@ -405,9 +455,9 @@ type rowScanner interface{ Scan(...any) error }
 
 func scanCustomer(row rowScanner) (Customer, error) {
 	var customer Customer
-	var emailVerified, phoneVerified, whatsappVerified sql.NullTime
-	err := row.Scan(&customer.ID, &customer.FullName, &customer.Email, &customer.Phone, &customer.WhatsApp,
-		&emailVerified, &phoneVerified, &whatsappVerified, &customer.Birthday, &customer.HasPassword,
+	var emailVerified, phoneVerified sql.NullTime
+	err := row.Scan(&customer.ID, &customer.FullName, &customer.Email, &customer.Phone,
+		&emailVerified, &phoneVerified, &customer.Birthday, &customer.HasPassword,
 		&customer.CreatedAt, &customer.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Customer{}, ErrNotFound
@@ -421,9 +471,6 @@ func scanCustomer(row rowScanner) (Customer, error) {
 	if phoneVerified.Valid {
 		customer.PhoneVerifiedAt = &phoneVerified.Time
 	}
-	if whatsappVerified.Valid {
-		customer.WhatsAppVerifiedAt = &whatsappVerified.Time
-	}
 	return customer, nil
 }
 
@@ -431,6 +478,7 @@ func (r *Repository) CustomerBySessionTokenHash(ctx context.Context, tokenHash [
 	return scanCustomer(r.db.QueryRow(ctx, customerSelect+`
 		JOIN marketplace_auth_sessions s ON s.marketplace_customer_id=c.id
 		WHERE s.token_hash=$1 AND s.expires_at>NOW()
+		  AND s.session_revision=c.security_revision
 	`, tokenHash))
 }
 
@@ -442,6 +490,7 @@ func (r *Repository) SessionPrincipalByTokenHash(ctx context.Context, tokenHash 
 		FROM marketplace_auth_sessions s
 		JOIN marketplace_customers c ON c.id=s.marketplace_customer_id
 		WHERE s.token_hash=$1 AND s.expires_at>NOW()
+		  AND s.session_revision=c.security_revision
 	`, tokenHash).Scan(
 		&principal.SessionID, &principal.CustomerID, &principal.ExpiresAt,
 		&principal.SecurityRevision, &principal.SessionRevision,
@@ -510,16 +559,70 @@ func (r *Repository) UpdateProfile(ctx context.Context, customerID uuid.UUID, in
 	return scanCustomer(r.db.QueryRow(ctx, customerSelect+` WHERE c.id=$1`, customerID))
 }
 
-func (r *Repository) SetPassword(ctx context.Context, customerID uuid.UUID, passwordHash string) (Customer, error) {
-	_, err := r.db.Exec(ctx, `
+func (r *Repository) SetPassword(ctx context.Context, customerID uuid.UUID, passwordHash string) (Customer, [][]byte, error) {
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return Customer{}, nil, fmt.Errorf("begin marketplace password change: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	result, err := tx.Exec(ctx, `
 		UPDATE marketplace_customers
 		SET password_hash=$2, security_revision=security_revision+1, updated_at=NOW()
 		WHERE id=$1
 	`, customerID, passwordHash)
 	if err != nil {
-		return Customer{}, fmt.Errorf("set marketplace password: %w", err)
+		return Customer{}, nil, fmt.Errorf("set marketplace password: %w", err)
 	}
-	return scanCustomer(r.db.QueryRow(ctx, customerSelect+` WHERE c.id=$1`, customerID))
+	if result.RowsAffected() != 1 {
+		return Customer{}, nil, ErrNotFound
+	}
+	revokedHashes, err := marketplaceSessionHashesTx(ctx, tx, customerID)
+	if err != nil {
+		return Customer{}, nil, err
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM marketplace_auth_sessions WHERE marketplace_customer_id=$1`, customerID); err != nil {
+		return Customer{}, nil, fmt.Errorf("revoke marketplace sessions after password change: %w", err)
+	}
+	customer, err := scanCustomer(tx.QueryRow(ctx, customerSelect+` WHERE c.id=$1`, customerID))
+	if err != nil {
+		return Customer{}, nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Customer{}, nil, fmt.Errorf("commit marketplace password change: %w", err)
+	}
+	return customer, revokedHashes, nil
+}
+
+func marketplaceSessionHashesTx(ctx context.Context, tx pgx.Tx, customerID uuid.UUID) ([][]byte, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT token_hash FROM marketplace_auth_sessions
+		WHERE marketplace_customer_id=$1
+	`, customerID)
+	if err != nil {
+		return nil, fmt.Errorf("list revoked marketplace session hashes: %w", err)
+	}
+	defer rows.Close()
+	hashes := make([][]byte, 0, 4)
+	for rows.Next() {
+		var tokenHash []byte
+		if err := rows.Scan(&tokenHash); err != nil {
+			return nil, fmt.Errorf("scan revoked marketplace session hash: %w", err)
+		}
+		hashes = append(hashes, tokenHash)
+	}
+	return hashes, rows.Err()
+}
+
+func (r *Repository) PasswordHashByCustomerID(ctx context.Context, customerID uuid.UUID) (string, error) {
+	var passwordHash sql.NullString
+	err := r.db.QueryRow(ctx, `SELECT password_hash FROM marketplace_customers WHERE id=$1`, customerID).Scan(&passwordHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("load marketplace password hash: %w", err)
+	}
+	return passwordHash.String, nil
 }
 
 func (r *Repository) ListAddresses(ctx context.Context, customerID uuid.UUID) ([]Address, error) {
@@ -793,13 +896,18 @@ func (r *Repository) DeleteAddress(ctx context.Context, customerID, addressID uu
 func (r *Repository) GetPreferences(ctx context.Context, customerID uuid.UUID) (NotificationPreferences, error) {
 	var item NotificationPreferences
 	err := r.db.QueryRow(ctx, `
-		SELECT booking_email, booking_sms, booking_whatsapp, marketing_email, updated_at
-		FROM marketplace_notification_preferences
-		WHERE marketplace_customer_id=$1
-	`, customerID).Scan(&item.BookingEmail, &item.BookingSMS, &item.BookingWhatsApp, &item.MarketingEmail, &item.UpdatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return NotificationPreferences{BookingEmail: true}, nil
-	}
+		SELECT COALESCE(preference.booking_email,TRUE),COALESCE(preference.booking_sms,FALSE),
+			COALESCE(preference.booking_whatsapp,FALSE),COALESCE(preference.marketing_email,FALSE),
+			customer.email_verified_at IS NOT NULL,customer.phone_verified_at IS NOT NULL,
+			COALESCE(preference.updated_at,customer.updated_at)
+		FROM marketplace_customers customer
+		LEFT JOIN marketplace_notification_preferences preference
+			ON preference.marketplace_customer_id=customer.id
+		WHERE customer.id=$1
+	`, customerID).Scan(
+		&item.BookingEmail, &item.BookingSMS, &item.BookingWhatsApp, &item.MarketingEmail,
+		&item.EmailAvailable, &item.WhatsAppAvailable, &item.UpdatedAt,
+	)
 	if err != nil {
 		return item, fmt.Errorf("load marketplace preferences: %w", err)
 	}
@@ -807,8 +915,7 @@ func (r *Repository) GetPreferences(ctx context.Context, customerID uuid.UUID) (
 }
 
 func (r *Repository) UpdatePreferences(ctx context.Context, customerID uuid.UUID, input NotificationPreferencesInput) (NotificationPreferences, error) {
-	var item NotificationPreferences
-	err := r.db.QueryRow(ctx, `
+	_, err := r.db.Exec(ctx, `
 		INSERT INTO marketplace_notification_preferences (
 			marketplace_customer_id, booking_email, booking_sms, booking_whatsapp, marketing_email, updated_at
 		) VALUES ($1,$2,$3,$4,$5,NOW())
@@ -816,11 +923,9 @@ func (r *Repository) UpdatePreferences(ctx context.Context, customerID uuid.UUID
 			booking_email=EXCLUDED.booking_email, booking_sms=EXCLUDED.booking_sms,
 			booking_whatsapp=EXCLUDED.booking_whatsapp, marketing_email=EXCLUDED.marketing_email,
 			updated_at=NOW()
-		RETURNING booking_email, booking_sms, booking_whatsapp, marketing_email, updated_at
-	`, customerID, input.BookingEmail, input.BookingSMS, input.BookingWhatsApp, input.MarketingEmail).
-		Scan(&item.BookingEmail, &item.BookingSMS, &item.BookingWhatsApp, &item.MarketingEmail, &item.UpdatedAt)
+	`, customerID, input.BookingEmail, input.BookingSMS, input.BookingWhatsApp, input.MarketingEmail)
 	if err != nil {
-		return item, fmt.Errorf("update marketplace preferences: %w", err)
+		return NotificationPreferences{}, fmt.Errorf("update marketplace preferences: %w", err)
 	}
-	return item, nil
+	return r.GetPreferences(ctx, customerID)
 }

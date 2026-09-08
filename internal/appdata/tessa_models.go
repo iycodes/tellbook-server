@@ -1,6 +1,9 @@
 package appdata
 
-import "time"
+import (
+	"booking/go-server/internal/whatsapp"
+	"time"
+)
 
 type TessaPreferences struct {
 	IntroductionCompleted      bool       `json:"introduction_completed"`
@@ -31,6 +34,17 @@ type TessaMessage struct {
 	EntityReferences []TessaEntityReference   `json:"entity_references"`
 	RunID            string                   `json:"run_id,omitempty"`
 	CreatedAt        time.Time                `json:"created_at"`
+	WhatsAppDelivery *TessaWhatsAppDelivery   `json:"whatsapp_delivery,omitempty"`
+}
+
+type TessaWhatsAppDelivery struct {
+	Status      string     `json:"status"`
+	Reason      string     `json:"reason,omitempty"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	AcceptedAt  *time.Time `json:"accepted_at,omitempty"`
+	SentAt      *time.Time `json:"sent_at,omitempty"`
+	DeliveredAt *time.Time `json:"delivered_at,omitempty"`
+	ReadAt      *time.Time `json:"read_at,omitempty"`
 }
 
 type TessaNavigationAction struct {
@@ -67,13 +81,14 @@ type TessaRun struct {
 }
 
 type TessaBootstrapResponse struct {
-	Preferences    TessaPreferences `json:"preferences"`
-	Thread         *TessaThread     `json:"thread,omitempty"`
-	Messages       []TessaMessage   `json:"messages"`
-	CurrentRun     *TessaRun        `json:"current_run,omitempty"`
-	BeforeSequence string           `json:"before_sequence,omitempty"`
-	HasMore        bool             `json:"has_more"`
-	RealtimeCursor string           `json:"realtime_cursor"`
+	WhatsApp       *whatsapp.TessaWhatsAppState `json:"whatsapp,omitempty"`
+	Preferences    TessaPreferences             `json:"preferences"`
+	Thread         *TessaThread                 `json:"thread,omitempty"`
+	Messages       []TessaMessage               `json:"messages"`
+	CurrentRun     *TessaRun                    `json:"current_run,omitempty"`
+	BeforeSequence string                       `json:"before_sequence,omitempty"`
+	HasMore        bool                         `json:"has_more"`
+	RealtimeCursor string                       `json:"realtime_cursor"`
 }
 
 type TessaMessagePage struct {
@@ -185,10 +200,11 @@ type TessaAvailabilityDay struct {
 }
 
 type TessaServiceAvailability struct {
-	ServiceID       string                 `json:"service_id"`
-	ServiceTitle    string                 `json:"service_title"`
-	DurationMinutes int                    `json:"duration_minutes"`
-	Dates           []TessaAvailabilityDay `json:"dates"`
+	ReturnedSlotCount int                    `json:"returned_slot_count"`
+	ServiceID         string                 `json:"service_id"`
+	ServiceTitle      string                 `json:"service_title"`
+	DurationMinutes   int                    `json:"duration_minutes"`
+	Dates             []TessaAvailabilityDay `json:"dates"`
 }
 
 type TessaAvailabilityResult struct {

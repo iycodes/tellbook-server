@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"booking/go-server/internal/config"
 	"booking/go-server/internal/llm"
@@ -24,6 +25,233 @@ const (
 	localEvalTime = "12:00:00"
 	localEvalZone = "Africa/Lagos"
 )
+
+func TestTessaCalendarPeriodLocalConformance(t *testing.T) {
+	if os.Getenv("RUN_TESSA_LOCAL_EVALS") != "true" {
+		t.Skip("RUN_TESSA_LOCAL_EVALS is not enabled")
+	}
+	service, timeout, _ := newLocalTessaService(t)
+	for _, tc := range []struct{ question, period, from, to string }{
+		{"What bookings do I have this week?", "this_week", "2026-09-07", "2026-09-13"},
+		{"Abeg show my appointments for this week", "this_week", "2026-09-07", "2026-09-13"},
+		{"What bookings do I have next week?", "next_week", "2026-09-14", "2026-09-20"},
+		{"What bookings did I have last week?", "last_week", "2026-08-31", "2026-09-06"},
+		{"Show my bookings this month", "this_month", "2026-09-01", "2026-09-30"},
+		{"Show my bookings last month", "last_month", "2026-08-01", "2026-08-31"},
+		{"What bookings do I have tomorrow?", "tomorrow", "2026-09-08", "2026-09-08"},
+		{"Show my bookings from September 10 to September 15, 2026", "custom", "2026-09-10", "2026-09-15"},
+	} {
+		t.Run(tc.question, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+			defer cancel()
+			plan, err := service.GeneratePlan(ctx, service.Primary(), tessa.PlanInput{Question: tc.question, CurrentDate: "2026-09-08", QuestionAt: "2026-09-07T17:16:00+01:00", Timezone: "Africa/Lagos", RecentMessages: []tessa.ContextMessage{{Role: "provider", Content: "What bookings do I have today?"}, {Role: "assistant", Content: "There are three bookings on September 7, 2026."}}})
+			if err != nil || len(plan.Tools) != 1 {
+				t.Fatal(plan, err)
+			}
+			tool := plan.Tools[0]
+			if tool.Period != tc.period || tool.From != tc.from || tool.To != tc.to {
+				t.Fatal("incorrect calendar selection", tool)
+			}
+			if (tool.Name == "search_bookings" || tool.Name == "get_schedule") && tool.TimeScope != "period" {
+				t.Fatal("calendar request incorrectly filtered to still-upcoming appointments", tool)
+			}
+		})
+	}
+	t.Run("weekly answer keeps full range when bookings fall on one day", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+		defer cancel()
+		answer, err := service.GenerateAnswer(ctx, service.Primary(), tessa.SynthesisInput{
+			Question: "What bookings do I have this week?", QuestionAt: "2026-09-07T17:16:00+01:00",
+			CurrentDate: "2026-09-08", Timezone: "Africa/Lagos", SourceChannel: "whatsapp",
+			Tools:    []tessa.ToolRequest{{Name: "search_bookings", Period: "this_week", From: "2026-09-07", To: "2026-09-13", Selection: "list", Limit: 8, TimeScope: "period"}},
+			Evidence: []tessa.Evidence{{Tool: "search_bookings", Result: json.RawMessage(`{"from":"2026-09-07","to":"2026-09-13","timezone":"Africa/Lagos","has_more":false,"items":[{"booking_id":"10000000-0000-4000-8000-000000000001","customer_name":"Ada","service_title":"Haircut","starts_at":"2026-09-07T09:10:00+01:00"}]}`)}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := strings.ToLower(answer.Content)
+		if !strings.Contains(body, "week") && !strings.Contains(body, "13") {
+			t.Fatal("weekly scope missing from answer", answer.Content)
+		}
+		t.Log(answer.Content)
+	})
+}
+
+func TestTessaOperationalGroundingLocalConformance(t *testing.T) {
+	if os.Getenv("RUN_TESSA_LOCAL_EVALS") != "true" {
+		t.Skip("RUN_TESSA_LOCAL_EVALS is not enabled")
+	}
+	service, timeout, _ := newLocalTessaService(t)
+	const id = "10000000-0000-4000-8000-000000000001"
+	for _, tc := range []struct{ name, question, tool, payload string }{
+		{"payment", "Has Ada paid for that booking?", "get_booking_payment_status", `{"found":true,"payment":{"booking_id":"` + id + `","service_title":"Consultation","customer_name":"Ada","payment_status":"paid","total_amount_minor":500000,"currency_code":"NGN"}}`},
+		{"availability", "When can someone book a consultation today?", "get_availability", `{"from":"2026-09-07","to":"2026-09-07","timezone":"Africa/Lagos","has_more":true,"services":[{"service_id":"` + id + `","service_title":"Consultation","duration_minutes":30,"dates":[{"date":"2026-09-07","slots":[{"starts_at":"2026-09-07T15:00:00+01:00","label":"3:00 PM"}]}]}]}`},
+		{"customer", "Give me a summary of Ada's bookings.", "get_customer_booking_summary", `{"found":true,"customer":{"customer":{"customer_id":"` + id + `","name":"Ada"},"total_bookings":20,"completed_bookings":19,"upcoming_bookings":1,"cancelled_bookings":0,"recent_bookings":[{"booking_id":"20000000-0000-4000-8000-000000000001","service_title":"Consultation","starts_at":"2026-09-07T15:00:00+01:00","timezone":"Africa/Lagos"}]}}`},
+		{"attention", "How many bookings need my attention today?", "get_booking_attention_summary", `{"from":"2026-09-07","to":"2026-09-07","timezone":"Africa/Lagos","total":10,"awaiting_payment":10,"awaiting_agreement":0,"awaiting_provider_confirmation":0,"examples":[{"booking_id":"` + id + `","service_title":"Consultation","customer_name":"Ada","starts_at":"2026-09-07T15:00:00+01:00","timezone":"Africa/Lagos"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+			defer cancel()
+			answer, err := service.GenerateAnswer(ctx, service.Primary(), tessa.SynthesisInput{SourceChannel: "whatsapp", Question: tc.question, CurrentDate: "2026-09-08", QuestionAt: "2026-09-07T09:00:00+01:00", Timezone: "Africa/Lagos", Tools: []tessa.ToolRequest{{Name: tc.tool}}, Evidence: []tessa.Evidence{{Tool: tc.tool, Result: json.RawMessage(tc.payload)}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.name == "availability" && answer.PartialNotice == "" {
+				t.Fatal("partial slots hidden")
+			}
+			if strings.Contains(answer.Content, "September 8") {
+				t.Fatal("processing date leaked into answer", answer.Content)
+			}
+			t.Log(answer.Content)
+		})
+	}
+}
+
+// Explicitly opt-in: synthetic booking evidence only, no database or WhatsApp sends.
+func TestTessaBookingPresentationLocalConformance(t *testing.T) {
+	if os.Getenv("RUN_TESSA_LOCAL_EVALS") != "true" {
+		t.Skip("RUN_TESSA_LOCAL_EVALS is not enabled")
+	}
+	service, timeout, _ := newLocalTessaService(t)
+	recent := []tessa.ContextMessage{{Role: "provider", Content: "What bookings do I have today?"}, {Role: "assistant", Content: "You have three bookings on September 7, 2026, in Africa/Lagos."}}
+	t.Run("earliest follow-up limits lookup", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+		defer cancel()
+		plan, err := service.GeneratePlan(ctx, service.Primary(), tessa.PlanInput{Question: "Which of those bookings is first, and what time is it?", CurrentDate: "2026-09-07", CurrentTime: "00:30:00", Timezone: "Africa/Lagos", RecentMessages: recent})
+		if err != nil {
+			for errors.Unwrap(err) != nil {
+				err = errors.Unwrap(err)
+			}
+			t.Fatal(err)
+		}
+		if len(plan.Tools) != 1 || plan.Tools[0].Name != "search_bookings" || plan.Tools[0].Limit != 1 || plan.Tools[0].From != "2026-09-07" || plan.Tools[0].To != "2026-09-07" || plan.Tools[0].Query != "" || plan.Tools[0].TimeScope != "period" {
+			t.Fatalf("unexpected plan: %+v", plan)
+		}
+	})
+	t.Run("list includes dates times and order", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+		defer cancel()
+		answer, err := service.GenerateAnswer(ctx, service.Primary(), tessa.SynthesisInput{
+			Tools:         []tessa.ToolRequest{{Name: "search_bookings", Selection: "list", Limit: 8}},
+			SourceChannel: "whatsapp", Question: "What bookings do I have today?", CurrentDate: "2026-09-07", Timezone: "Africa/Lagos",
+			Evidence: []tessa.Evidence{{Tool: "search_bookings", Result: json.RawMessage(`{"from":"2026-09-07","to":"2026-09-07","timezone":"Africa/Lagos","has_more":false,"items":[{"booking_id":"10000000-0000-4000-8000-000000000001","customer_name":"Ada","service_title":"Haircut","starts_at":"2026-09-07T09:10:00+01:00"},{"booking_id":"10000000-0000-4000-8000-000000000002","customer_name":"Bisi","service_title":"Braiding","starts_at":"2026-09-07T11:30:00+01:00"},{"booking_id":"10000000-0000-4000-8000-000000000003","customer_name":"Chidi","service_title":"Consultation","starts_at":"2026-09-07T14:20:00+01:00"}]}`)}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := answer.Content
+		if utf8.RuneCountInString(body) > 1024 || strings.Contains(body, "http") || strings.Contains(body, "10000000-") {
+			t.Fatalf("invalid WhatsApp body: %s", body)
+		}
+		for _, part := range []string{"2026", "9:10", "11:30", "Africa/Lagos"} {
+			if !strings.Contains(body, part) {
+				t.Fatalf("missing %s: %s", part, body)
+			}
+		}
+		if !strings.Contains(body, "2:20") && !strings.Contains(body, "14:20") {
+			t.Fatalf("missing final appointment time: %s", body)
+		}
+		first, second, third := strings.Index(body, "9:10"), strings.Index(body, "11:30"), strings.Index(body, ":20")
+		if first < 0 || second <= first || third <= second {
+			t.Fatalf("schedule out of order: %s", body)
+		}
+		t.Log(body)
+	})
+}
+
+func TestTessaGroundingConversationLocalConformance(t *testing.T) {
+	if os.Getenv("RUN_TESSA_LOCAL_EVALS") != "true" {
+		t.Skip("RUN_TESSA_LOCAL_EVALS is not enabled")
+	}
+	service, timeout, _ := newLocalTessaService(t)
+	const id = "10000000-0000-4000-8000-000000000001"
+	for _, selection := range []string{"list", "first"} {
+		t.Run("coverage-"+selection, func(t *testing.T) {
+			question, limit := "Show my bookings today", 8
+			if selection == "first" {
+				question, limit = "Which booking is first today?", 1
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+			defer cancel()
+			answer, err := service.GenerateAnswer(ctx, service.Primary(), tessa.SynthesisInput{
+				SourceChannel: "whatsapp", Question: question, CurrentDate: "2026-09-07", Timezone: "Africa/Lagos",
+				Tools:    []tessa.ToolRequest{{Name: "search_bookings", Selection: selection, Limit: limit, TimeScope: "period", From: "2026-09-07", To: "2026-09-07"}},
+				Evidence: []tessa.Evidence{{Tool: "search_bookings", Result: json.RawMessage(`{"from":"2026-09-07","to":"2026-09-07","timezone":"Africa/Lagos","has_more":true,"items":[{"booking_id":"10000000-0000-4000-8000-000000000001","customer_name":"Ada","service_title":"Consultation","starts_at":"2026-09-07T09:10:00+01:00"}]}`)}},
+			})
+			if err != nil {
+				for errors.Unwrap(err) != nil {
+					err = errors.Unwrap(err)
+				}
+				t.Fatal(err)
+			}
+			if selection == "list" && answer.PartialNotice == "" {
+				t.Fatal("partial collection was not disclosed")
+			}
+			if selection == "first" && answer.PartialNotice != "" {
+				t.Fatal("fulfilled first selection was treated as partial", answer)
+			}
+			t.Log(answer.Content)
+		})
+	}
+	history := []tessa.ContextMessage{
+		{Role: "provider", Content: "Which booking is first today?"},
+		{Role: "assistant", Content: "Ada is first on 7 September 2026 at 9:10 AM in Africa/Lagos.", References: []tessa.ContextReference{{Kind: "booking", ID: id, Label: "Ada — Consultation"}}},
+	}
+	for _, question := range []string{"What bookings do I have today?", "Show my schedule for today", "Abeg show all my appointments for today"} {
+		for repeat := 0; repeat < 2; repeat++ {
+			t.Run(fmt.Sprintf("reset-%s-%d", question, repeat), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+				defer cancel()
+				plan, err := service.GeneratePlan(ctx, service.Primary(), tessa.PlanInput{Question: question, RecentMessages: history, CurrentDate: "2026-09-07", CurrentTime: "12:00:00", Timezone: "Africa/Lagos"})
+				if err != nil {
+					for errors.Unwrap(err) != nil {
+						err = errors.Unwrap(err)
+					}
+					t.Fatal(err)
+				}
+				if len(plan.Tools) != 1 {
+					t.Fatal(plan)
+				}
+				tool := plan.Tools[0]
+				if tool.From != "2026-09-07" || tool.To != "2026-09-07" || tool.Query != "" || tool.TimeScope != "period" || (tool.Name != "get_schedule" && (tool.Name != "search_bookings" || tool.Selection != "list" || tool.Limit != 8)) {
+					t.Fatalf("inherited restriction: %+v", tool)
+				}
+			})
+		}
+	}
+	t.Run("reference followup", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+		defer cancel()
+		plan, err := service.GeneratePlan(ctx, service.Primary(), tessa.PlanInput{Question: "Has that booking been paid?", RecentMessages: history, CurrentDate: "2026-09-07", CurrentTime: "12:00:00", Timezone: "Africa/Lagos"})
+		if err != nil || len(plan.Tools) != 1 || plan.Tools[0].Name != "get_booking_payment_status" || plan.Tools[0].BookingID != id {
+			t.Fatal(plan, err)
+		}
+	})
+	t.Run("delayed relative date", func(t *testing.T) {
+		for _, tc := range []struct{ name, sent, checked, want string }{
+			{"midnight", "2026-09-06T23:59:00+01:00", "2026-09-07", "2026-09-06"},
+			{"month_boundary", "2026-08-31T23:59:00+01:00", "2026-09-01", "2026-08-31"},
+			{"local_date_not_UTC", "2026-09-07T23:30:00Z", "2026-09-09", "2026-09-08"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+				defer cancel()
+				plan, err := service.GeneratePlan(ctx, service.Primary(), tessa.PlanInput{Question: "Show my bookings today", QuestionAt: tc.sent, CurrentDate: tc.checked, CurrentTime: "00:02:00", Timezone: "Africa/Lagos"})
+				if err != nil || len(plan.Tools) != 1 || plan.Tools[0].From != tc.want || plan.Tools[0].To != tc.want {
+					t.Fatal(plan, err)
+				}
+			})
+		}
+	})
+	t.Run("upcoming versus first of day", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+		defer cancel()
+		plan, err := service.GeneratePlan(ctx, service.Primary(), tessa.PlanInput{Question: "What is my next upcoming booking today?", CurrentDate: "2026-09-07", CurrentTime: "12:00:00", Timezone: "Africa/Lagos"})
+		if err != nil || len(plan.Tools) != 1 || plan.Tools[0].TimeScope != "upcoming" || plan.Tools[0].Selection != "first" {
+			t.Fatal(plan, err)
+		}
+	})
+}
 
 type localPlanFixture struct {
 	name     string
@@ -234,12 +462,25 @@ func newLocalTessaService(t *testing.T) (*tessa.Service, time.Duration, time.Dur
 		SelfHostedThinking:   envBool(t, "SELF_HOSTED_THINKING", false),
 	})
 	service, err := tessa.NewService(tessa.Provider{
-		Name: "self_hosted", Model: model, Generator: client, Timeout: requestTimeout,
+		Name: "self_hosted", Model: model, Generator: localEvaluationGenerator{Client: client, t: t}, Timeout: requestTimeout,
 	}, nil, positiveEnvInt(t, "TESSA_AI_MAX_INPUT_TOKENS", 12000))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return service, requestTimeout, turnTimeout
+}
+
+// Synthetic fixtures only: retain the generated plan in test output so a failed
+// conformance check is diagnosable without enabling production prompt logging.
+type localEvaluationGenerator struct {
+	*llm.Client
+	t *testing.T
+}
+
+func (g localEvaluationGenerator) GenerateJSONSchema(ctx context.Context, system, user, name string, schema json.RawMessage) (json.RawMessage, error) {
+	output, err := g.Client.GenerateJSONSchema(ctx, system, user, name, schema)
+	g.t.Logf("synthetic %s: %s", name, output)
+	return output, err
 }
 
 func generateLocalPlan(t *testing.T, service *tessa.Service, timeout time.Duration, question string) tessa.Plan {

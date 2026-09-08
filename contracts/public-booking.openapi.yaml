@@ -5,6 +5,42 @@ info:
 servers:
   - url: /v1/public
 paths:
+  /clients/{slug}:
+    get:
+      operationId: getPublicProviderProfile
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Public profile. Customer contact phone appears only when verified and explicitly approved for public display.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [profile]
+                properties:
+                  profile:
+                    type: object
+                    additionalProperties: true
+                    properties:
+                      customer_contact_phone: { type: string }
+  /notification-capabilities:
+    get:
+      operationId: getPublicNotificationCapabilities
+      responses:
+        '200':
+          description: Delivery channels currently capable of sending optional booking reminders.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [capabilities]
+                properties:
+                  capabilities: { $ref: '#/components/schemas/NotificationDeliveryCapabilities' }
   /clients/{slug}/bookings:
     post:
       operationId: createPublicBooking
@@ -29,8 +65,50 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+  /bookings/{bookingToken}:
+    get:
+      operationId: getPublicBooking
+      parameters:
+        - name: bookingToken
+          in: path
+          required: true
+          schema: { type: string, minLength: 1 }
+      responses:
+        '200':
+          description: Public booking summary including committed notification delivery state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicBookingSummary' }
 components:
   schemas:
+    NotificationDeliveryCapabilities:
+      type: object
+      additionalProperties: false
+      required: [email_reminder_available, whatsapp_reminder_available]
+      properties:
+        email_reminder_available: { type: boolean }
+        whatsapp_reminder_available: { type: boolean }
+    BookingDeliveryChannelStatus:
+      type: object
+      additionalProperties: false
+      required: [requested, eligible, status]
+      properties:
+        requested: { type: boolean }
+        eligible: { type: boolean }
+        status:
+          type: string
+          enum: [not_requested, pending, accepted, sent, delivered, read, failed, unknown, manual_review, cancelled]
+    BookingDeliveryStatus:
+      type: object
+      additionalProperties: false
+      required: [provider_in_app, provider_email, provider_whatsapp, customer_email, customer_whatsapp, customer_sms]
+      properties:
+        provider_in_app: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        provider_email: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        provider_whatsapp: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        customer_email: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        customer_whatsapp: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
+        customer_sms: { $ref: '#/components/schemas/BookingDeliveryChannelStatus' }
     CreatePublicBookingRequest:
       type: object
       additionalProperties: false
@@ -64,6 +142,16 @@ components:
         whatsapp_consent: { type: boolean }
         sms_consent: { type: boolean }
       additionalProperties: true
+    PublicBookingSummary:
+      type: object
+      additionalProperties: true
+      required: [booking_token, delivery_status]
+      properties:
+        booking_token: { type: string }
+        provider_contact_phone:
+          type: string
+          description: Current verified business contact, only when sharing with booked customers is enabled. Access requires the booking capability token.
+        delivery_status: { $ref: '#/components/schemas/BookingDeliveryStatus' }
     Error:
       type: object
       required: [code, message]

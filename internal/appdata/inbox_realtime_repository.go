@@ -201,7 +201,7 @@ func loadInboxEventSummaries(
 			SELECT conversation.id, conversation.channel, conversation.marketplace_customer_id,
 				COALESCE(
 					NULLIF(BTRIM(customer.full_name),''), NULLIF(customer.email,''),
-					NULLIF(customer.phone_e164,''), NULLIF(customer.whatsapp_e164,''),
+					NULLIF(customer.phone_e164,''),
 					'Tellbook customer'
 				), '', '', conversation.preview,
 				(

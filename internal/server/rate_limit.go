@@ -118,7 +118,7 @@ func rateLimitMiddleware(cfg config.Config, sharedLimiters ...SharedRateLimiter)
 		positiveOr(cfg.LocationRateLimitPerMinute, 20),
 		positiveOr(cfg.LocationRateLimitBurst, 5),
 	)
-	marketplaceAuth := newRequestLimiter(
+	authLimiter := newRequestLimiter(
 		positiveOr(cfg.MarketplaceAuthRateLimitPerMinute, 20),
 		positiveOr(cfg.MarketplaceAuthRateLimitBurst, 6),
 	)
@@ -143,9 +143,9 @@ func rateLimitMiddleware(cfg config.Config, sharedLimiters ...SharedRateLimiter)
 			} else if r.URL.Path == "/v1/public/locations/resolve" {
 				limiter = location
 				class = "location"
-			} else if isMarketplaceAuthRoute(r.Method, r.URL.Path) {
-				limiter = marketplaceAuth
-				class = "marketplace-auth"
+			} else if isAuthMutationRoute(r.Method, r.URL.Path) {
+				limiter = authLimiter
+				class = "auth"
 			}
 
 			clientIP := requestClientIP(r)
@@ -157,7 +157,7 @@ func rateLimitMiddleware(cfg config.Config, sharedLimiters ...SharedRateLimiter)
 				r.Context(), shared, limiter, class, identity, clientIP,
 				limiter.perMinute, limiter.burst, ipMultiplier,
 			)
-			if limitErr != nil && class == "marketplace-auth" {
+			if limitErr != nil && class == "auth" {
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
 				w.Header().Set("Retry-After", "1")
 				w.WriteHeader(http.StatusServiceUnavailable)
@@ -224,8 +224,10 @@ func localRateLimitKey(class, identity string) string {
 }
 
 func rateLimitIdentity(r *http.Request, cfg config.Config) string {
-	if isMarketplaceAuthRoute(r.Method, r.URL.Path) {
-		return marketplaceAuthRateLimitIdentity(r)
+	if isAuthMutationRoute(r.Method, r.URL.Path) {
+		if identity := marketplaceAuthRateLimitIdentity(r); identity != "" {
+			return identity
+		}
 	}
 	if authorization := strings.TrimSpace(r.Header.Get("Authorization")); authorization != "" && len(authorization) <= 4096 {
 		return "credential:" + authorization
@@ -345,13 +347,23 @@ func isAICommandRoute(method, path string) bool {
 		strings.HasSuffix(path, "/messages")
 }
 
-func isMarketplaceAuthRoute(method, path string) bool {
-	if method != http.MethodPost {
+func isAuthMutationRoute(method, path string) bool {
+	if method != http.MethodPost && method != http.MethodPatch {
 		return false
 	}
-	return path == "/v1/marketplace/auth/code" ||
+	return path == "/v1/auth/code" ||
+		path == "/v1/app/profile/customer-contact/verification" ||
+		path == "/v1/auth/code/resend" ||
+		path == "/v1/auth/verify" ||
+		path == "/v1/auth/password" ||
+		strings.HasPrefix(path, "/v1/auth/password/reset") ||
+		strings.HasPrefix(path, "/v1/app/me/identities/") ||
+		path == "/v1/app/me/password" ||
+		path == "/v1/marketplace/auth/code" ||
 		path == "/v1/marketplace/auth/code/resend" ||
 		path == "/v1/marketplace/auth/verify" ||
 		path == "/v1/marketplace/auth/password" ||
+		strings.HasPrefix(path, "/v1/marketplace/auth/password/reset") ||
+		path == "/v1/marketplace/me/password" ||
 		strings.HasPrefix(path, "/v1/marketplace/me/identities/")
 }

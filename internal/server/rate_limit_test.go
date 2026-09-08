@@ -188,11 +188,11 @@ func TestSharedAuthLimitUsesNormalizedIdentifierAndSecondaryIP(t *testing.T) {
 	if len(shared.calls) != 2 {
 		t.Fatalf("shared calls = %d, want actor and IP", len(shared.calls))
 	}
-	if shared.calls[0].scope != "route_marketplace_auth" ||
+	if shared.calls[0].scope != "route_auth" ||
 		shared.calls[0].identity != "identifier:+2348021234567" {
 		t.Fatalf("unexpected primary limit: %+v", shared.calls[0])
 	}
-	if shared.calls[1].scope != "route_marketplace_auth_ip" ||
+	if shared.calls[1].scope != "route_auth_ip" ||
 		shared.calls[1].identity != "192.0.2.12" ||
 		shared.calls[1].perMinute != 160 || shared.calls[1].burst != 48 {
 		t.Fatalf("unexpected IP ceiling: %+v", shared.calls[1])
@@ -202,6 +202,28 @@ func TestSharedAuthLimitUsesNormalizedIdentifierAndSecondaryIP(t *testing.T) {
 func TestRateLimitIdentifierRejectsUnboundedInput(t *testing.T) {
 	if normalized := normalizeRateLimitIdentifier(strings.Repeat("x", 321)); normalized != "" {
 		t.Fatalf("oversized identifier normalized to %q", normalized)
+	}
+}
+
+func TestA5AuthMutationsUseAuthLimiter(t *testing.T) {
+	for _, route := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/v1/auth/password"},
+		{http.MethodPost, "/v1/auth/password/reset/code"},
+		{http.MethodPost, "/v1/auth/password/reset/verify"},
+		{http.MethodPost, "/v1/auth/password/reset"},
+		{http.MethodPost, "/v1/app/me/identities/code"},
+		{http.MethodPatch, "/v1/app/me/password"},
+		{http.MethodPost, "/v1/marketplace/auth/password/reset/code"},
+		{http.MethodPost, "/v1/marketplace/auth/password/reset/verify"},
+		{http.MethodPost, "/v1/marketplace/auth/password/reset"},
+		{http.MethodPatch, "/v1/marketplace/me/password"},
+	} {
+		if !isAuthMutationRoute(route.method, route.path) {
+			t.Fatalf("%s %s was not classified as auth", route.method, route.path)
+		}
 	}
 }
 

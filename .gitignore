@@ -1,44 +1,69 @@
-# Env
+# Local environment files
 .env
 .env.*
-server.env
 !.env.example
-!.env.test
+server.env
+server.env.*
 
-# OS
-.DS_Store
-Thumbs.db
+# Go dependencies and workspace caches
+/vendor/
+/.gopath/
 
-# Editors / IDEs
-.idea/
-.vscode/
+# Go build output
+/api
+/booking-api
+/bin/
+/build/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test, coverage, and profiling output
+*.test
+*.out
+*.coverprofile
+*.prof
+*.pprof
+/coverage/
+
+# Logs and runtime files
+*.log
+*.pid
+openai-response-output*.jsonl
+/logs/
+/tmp/
+/temp/
+*.tmp
+*.temp
+
+# Local databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Local uploads / generated files
+/uploads/
+/artifacts/performance/
+
+# Editors and IDEs
+/.idea/
+/.vscode/
 *.swp
 *.swo
 *~
 
-# Logs / temp
-*.log
-openai-response-output.jsonl
-logs/
-tmp/
-temp/
-*.tmp
-*.temp
-
-# Go build / test artifacts
-/api
-bin/
-vendor/
-coverage.out
-*.test
-*.prof
-*.pprof
-
-# Local databases
-*.db
-*.sqlite
-*.sqlite3
-
-# Local uploads / generated files
-uploads/
-artifacts/performance/
+# Operating-system files
+.DS_Store
+Thumbs.db

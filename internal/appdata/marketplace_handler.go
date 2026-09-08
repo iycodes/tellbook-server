@@ -20,6 +20,14 @@ import (
 	"github.com/google/uuid"
 )
 
+func (h *Handler) getPublicNotificationCapabilities(w http.ResponseWriter, _ *http.Request) {
+	capabilities := marketplaceauth.NotificationDeliveryCapabilities{}
+	if h.marketplaceAuth != nil {
+		capabilities = h.marketplaceAuth.NotificationCapabilities()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"capabilities": capabilities})
+}
+
 func (h *Handler) listMarketplaceCustomerBookings(w http.ResponseWriter, r *http.Request) {
 	customer, _ := marketplaceauth.CustomerFromContext(r.Context())
 	status := MarketplaceBookingStatus(strings.TrimSpace(r.URL.Query().Get("status")))
@@ -77,7 +85,11 @@ func (h *Handler) getMarketplaceCustomerBooking(w http.ResponseWriter, r *http.R
 }
 
 func (h *Handler) claimMarketplaceCustomerBooking(w http.ResponseWriter, r *http.Request) {
-	customer, _ := marketplaceauth.CustomerFromContext(r.Context())
+	customer, err := h.marketplaceAuth.CustomerFromRequest(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "session_expired", "Sign in to continue.")
+		return
+	}
 	input, err := decodeJSON[struct {
 		BookingToken string `json:"booking_token"`
 	}](r)

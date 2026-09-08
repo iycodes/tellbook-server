@@ -15,22 +15,32 @@ import (
 )
 
 type Metrics struct {
-	registry          *prometheus.Registry
-	httpRequests      *prometheus.CounterVec
-	httpDuration      *prometheus.HistogramVec
-	httpResponseBytes *prometheus.HistogramVec
-	dbQueries         *prometheus.CounterVec
-	dbQueryDuration   *prometheus.HistogramVec
-	dbQueryErrors     *prometheus.CounterVec
-	externalRequests  *prometheus.CounterVec
-	externalDuration  *prometheus.HistogramVec
-	redisOperations   *prometheus.CounterVec
-	redisDuration     *prometheus.HistogramVec
-	cacheRequests     *prometheus.CounterVec
-	sseConnections    *prometheus.GaugeVec
-	sseOpened         *prometheus.CounterVec
-	sseDuration       *prometheus.HistogramVec
-	sseEventLag       *prometheus.HistogramVec
+	registry                         *prometheus.Registry
+	httpRequests                     *prometheus.CounterVec
+	httpDuration                     *prometheus.HistogramVec
+	httpResponseBytes                *prometheus.HistogramVec
+	dbQueries                        *prometheus.CounterVec
+	dbQueryDuration                  *prometheus.HistogramVec
+	dbQueryErrors                    *prometheus.CounterVec
+	externalRequests                 *prometheus.CounterVec
+	externalDuration                 *prometheus.HistogramVec
+	notificationEmailOutcomes        *prometheus.CounterVec
+	notificationEmailClaimLatency    *prometheus.HistogramVec
+	welcomeEmailOutcomes             *prometheus.CounterVec
+	welcomeEmailClaimLatency         *prometheus.HistogramVec
+	authCodeDeliveryOutcomes         *prometheus.CounterVec
+	authCodeDeliveryClaimLatency     *prometheus.HistogramVec
+	notificationWhatsAppOutcomes     *prometheus.CounterVec
+	notificationWhatsAppClaimLatency *prometheus.HistogramVec
+	notificationWhatsAppStatuses     *prometheus.CounterVec
+	notificationWhatsAppStatusLag    *prometheus.HistogramVec
+	redisOperations                  *prometheus.CounterVec
+	redisDuration                    *prometheus.HistogramVec
+	cacheRequests                    *prometheus.CounterVec
+	sseConnections                   *prometheus.GaugeVec
+	sseOpened                        *prometheus.CounterVec
+	sseDuration                      *prometheus.HistogramVec
+	sseEventLag                      *prometheus.HistogramVec
 }
 
 func New() *Metrics {
@@ -84,6 +94,51 @@ func New() *Metrics {
 			Help:    "External HTTP request duration by bounded service and outcome.",
 			Buckets: []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60},
 		}, []string{"service", "outcome"}),
+		notificationEmailOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "tellbook", Subsystem: "notification_email", Name: "outcomes_total",
+			Help: "Durable booking-email outcomes by bounded template and outcome.",
+		}, []string{"template", "outcome"}),
+		notificationEmailClaimLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "tellbook", Subsystem: "notification_email", Name: "claim_latency_seconds",
+			Help:    "Delay between a booking email becoming due and a worker claiming it.",
+			Buckets: []float64{0.1, 0.5, 1, 2.5, 5, 15, 30, 60, 300, 900, 3600},
+		}, []string{"template"}),
+		welcomeEmailOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "tellbook", Subsystem: "welcome_email", Name: "outcomes_total",
+			Help: "Durable welcome-email outcomes by bounded audience and outcome.",
+		}, []string{"audience", "outcome"}),
+		welcomeEmailClaimLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "tellbook", Subsystem: "welcome_email", Name: "claim_latency_seconds",
+			Help:    "Delay between a welcome email becoming due and a worker claiming it.",
+			Buckets: []float64{0.1, 0.5, 1, 2.5, 5, 15, 30, 60, 300, 900, 3600},
+		}, []string{"audience"}),
+		authCodeDeliveryOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "tellbook", Subsystem: "auth_code_delivery", Name: "outcomes_total",
+			Help: "Durable authentication-code delivery outcomes by bounded realm, channel, and outcome.",
+		}, []string{"realm", "channel", "outcome"}),
+		authCodeDeliveryClaimLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "tellbook", Subsystem: "auth_code_delivery", Name: "claim_latency_seconds",
+			Help:    "Delay between an authentication code becoming due and a worker claiming it.",
+			Buckets: []float64{0.05, 0.1, 0.5, 1, 2.5, 5, 15, 30, 60, 90},
+		}, []string{"realm", "channel"}),
+		notificationWhatsAppOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "tellbook", Subsystem: "notification_whatsapp", Name: "outcomes_total",
+			Help: "Durable booking WhatsApp send outcomes by bounded template and outcome.",
+		}, []string{"template", "outcome"}),
+		notificationWhatsAppClaimLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "tellbook", Subsystem: "notification_whatsapp", Name: "claim_latency_seconds",
+			Help:    "Delay between a booking WhatsApp notification becoming due and a worker claiming it.",
+			Buckets: []float64{0.1, 0.5, 1, 2.5, 5, 15, 30, 60, 300, 900, 3600},
+		}, []string{"template"}),
+		notificationWhatsAppStatuses: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "tellbook", Subsystem: "notification_whatsapp", Name: "status_outcomes_total",
+			Help: "Verified Meta status callback outcomes by bounded status and processing result.",
+		}, []string{"status", "outcome"}),
+		notificationWhatsAppStatusLag: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "tellbook", Subsystem: "notification_whatsapp", Name: "status_lag_seconds",
+			Help:    "Delay between Meta's status timestamp and durable callback processing.",
+			Buckets: []float64{0.1, 0.5, 1, 2.5, 5, 15, 30, 60, 300, 900, 3600},
+		}, []string{"status"}),
 		redisOperations: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "tellbook", Subsystem: "redis", Name: "operations_total",
 			Help: "Redis operations by bounded command class and outcome.",
@@ -127,6 +182,16 @@ func New() *Metrics {
 		metrics.dbQueryErrors,
 		metrics.externalRequests,
 		metrics.externalDuration,
+		metrics.notificationEmailOutcomes,
+		metrics.notificationEmailClaimLatency,
+		metrics.welcomeEmailOutcomes,
+		metrics.welcomeEmailClaimLatency,
+		metrics.authCodeDeliveryOutcomes,
+		metrics.authCodeDeliveryClaimLatency,
+		metrics.notificationWhatsAppOutcomes,
+		metrics.notificationWhatsAppClaimLatency,
+		metrics.notificationWhatsAppStatuses,
+		metrics.notificationWhatsAppStatusLag,
 		metrics.redisOperations,
 		metrics.redisDuration,
 		metrics.cacheRequests,
@@ -151,6 +216,203 @@ func (m *Metrics) ObserveCacheRequest(cache, outcome string) {
 		return
 	}
 	m.cacheRequests.WithLabelValues(cache, outcome).Inc()
+}
+
+func (m *Metrics) ObserveNotificationEmailClaim(template string, latency time.Duration) {
+	if m == nil {
+		return
+	}
+	if latency < 0 {
+		latency = 0
+	}
+	m.notificationEmailClaimLatency.WithLabelValues(boundedNotificationEmailTemplate(template)).Observe(latency.Seconds())
+}
+
+func (m *Metrics) ObserveNotificationEmailOutcome(template, outcome string) {
+	if m == nil {
+		return
+	}
+	m.notificationEmailOutcomes.WithLabelValues(
+		boundedNotificationEmailTemplate(template), boundedNotificationEmailOutcome(outcome),
+	).Inc()
+}
+
+func (m *Metrics) ObserveWelcomeEmailClaim(audience string, latency time.Duration) {
+	if m == nil {
+		return
+	}
+	if latency < 0 {
+		latency = 0
+	}
+	m.welcomeEmailClaimLatency.WithLabelValues(boundedWelcomeEmailAudience(audience)).Observe(latency.Seconds())
+}
+
+func (m *Metrics) ObserveWelcomeEmailOutcome(audience, outcome string) {
+	if m == nil {
+		return
+	}
+	m.welcomeEmailOutcomes.WithLabelValues(
+		boundedWelcomeEmailAudience(audience), boundedWelcomeEmailOutcome(outcome),
+	).Inc()
+}
+
+func (m *Metrics) ObserveAuthCodeDeliveryClaim(realm, channel string, latency time.Duration) {
+	if m == nil {
+		return
+	}
+	if latency < 0 {
+		latency = 0
+	}
+	m.authCodeDeliveryClaimLatency.WithLabelValues(
+		boundedAuthRealm(realm), boundedAuthChannel(channel),
+	).Observe(latency.Seconds())
+}
+
+func (m *Metrics) ObserveAuthCodeDeliveryOutcome(realm, channel, outcome string) {
+	if m == nil {
+		return
+	}
+	m.authCodeDeliveryOutcomes.WithLabelValues(
+		boundedAuthRealm(realm), boundedAuthChannel(channel), boundedAuthOutcome(outcome),
+	).Inc()
+}
+
+func boundedAuthRealm(value string) string {
+	switch strings.TrimSpace(value) {
+	case "provider", "marketplace_customer":
+		return strings.TrimSpace(value)
+	default:
+		return "other"
+	}
+}
+
+func boundedAuthChannel(value string) string {
+	switch strings.TrimSpace(value) {
+	case "email", "whatsapp":
+		return strings.TrimSpace(value)
+	default:
+		return "other"
+	}
+}
+
+func boundedAuthOutcome(value string) string {
+	switch strings.TrimSpace(value) {
+	case "accepted", "retry", "retry_exhausted", "failed", "unknown", "expired":
+		return strings.TrimSpace(value)
+	default:
+		return "other"
+	}
+}
+
+func boundedWelcomeEmailAudience(audience string) string {
+	switch strings.TrimSpace(audience) {
+	case "provider", "marketplace_customer":
+		return strings.TrimSpace(audience)
+	default:
+		return "other"
+	}
+}
+
+func boundedWelcomeEmailOutcome(outcome string) string {
+	switch strings.TrimSpace(outcome) {
+	case "accepted", "retry", "retry_exhausted", "failed", "manual_review":
+		return strings.TrimSpace(outcome)
+	default:
+		return "other"
+	}
+}
+
+func boundedNotificationEmailTemplate(template string) string {
+	switch strings.TrimSpace(template) {
+	case "customer:customer_booking_received", "customer:customer_booking_secured",
+		"provider:provider_new_booking", "provider:appointment_reminder", "customer:appointment_reminder",
+		"provider:booking_rescheduled", "customer:booking_rescheduled",
+		"provider:booking_cancelled", "customer:booking_cancelled",
+		"provider:booking_expired", "customer:booking_expired",
+		"provider:payment_satisfied", "customer:payment_satisfied",
+		"provider:payment_failed", "customer:payment_failed",
+		"provider:payment_refunded", "customer:payment_refunded",
+		"provider:payment_action_required", "customer:payment_action_required":
+		return strings.TrimSpace(template)
+	default:
+		return "other"
+	}
+}
+
+func boundedNotificationEmailOutcome(outcome string) string {
+	switch strings.TrimSpace(outcome) {
+	case "accepted", "retry", "retry_exhausted", "failed", "manual_review", "cancelled":
+		return strings.TrimSpace(outcome)
+	default:
+		return "other"
+	}
+}
+
+func (m *Metrics) ObserveNotificationWhatsAppClaim(template string, latency time.Duration) {
+	if m == nil {
+		return
+	}
+	if latency < 0 {
+		latency = 0
+	}
+	m.notificationWhatsAppClaimLatency.WithLabelValues(boundedNotificationWhatsAppTemplate(template)).Observe(latency.Seconds())
+}
+
+func (m *Metrics) ObserveNotificationWhatsAppOutcome(template, outcome string) {
+	if m == nil {
+		return
+	}
+	m.notificationWhatsAppOutcomes.WithLabelValues(
+		boundedNotificationWhatsAppTemplate(template), boundedNotificationWhatsAppOutcome(outcome),
+	).Inc()
+}
+
+func (m *Metrics) ObserveNotificationWhatsAppStatus(status, outcome string, lag time.Duration) {
+	if m == nil {
+		return
+	}
+	if lag < 0 {
+		lag = 0
+	}
+	status = boundedNotificationWhatsAppStatus(status)
+	m.notificationWhatsAppStatuses.WithLabelValues(status, boundedNotificationWhatsAppStatusOutcome(outcome)).Inc()
+	m.notificationWhatsAppStatusLag.WithLabelValues(status).Observe(lag.Seconds())
+}
+
+func boundedNotificationWhatsAppTemplate(template string) string {
+	switch strings.TrimSpace(template) {
+	case "provider_new_booking", "provider_booking_reminder", "user_reminder":
+		return strings.TrimSpace(template)
+	default:
+		return "other"
+	}
+}
+
+func boundedNotificationWhatsAppOutcome(outcome string) string {
+	switch strings.TrimSpace(outcome) {
+	case "accepted", "retry", "retry_exhausted", "failed", "unknown", "cancelled":
+		return strings.TrimSpace(outcome)
+	default:
+		return "other"
+	}
+}
+
+func boundedNotificationWhatsAppStatus(status string) string {
+	switch strings.TrimSpace(status) {
+	case "sent", "delivered", "read", "failed", "deleted":
+		return strings.TrimSpace(status)
+	default:
+		return "other"
+	}
+}
+
+func boundedNotificationWhatsAppStatusOutcome(outcome string) string {
+	switch strings.TrimSpace(outcome) {
+	case "applied", "stale", "ignored", "retry", "dead_letter":
+		return strings.TrimSpace(outcome)
+	default:
+		return "other"
+	}
 }
 
 type RedisPoolSnapshot struct {
@@ -409,6 +671,7 @@ func newQueueCollector(pool *pgxpool.Pool) *queueCollector {
 		"oldest":         prometheus.NewDesc("tellbook_queue_oldest_age_seconds", "Age of the oldest runnable job.", labels, nil),
 		"retries":        prometheus.NewDesc("tellbook_queue_retry_attempts", "Retry attempts on active queue records.", labels, nil),
 		"throughput":     prometheus.NewDesc("tellbook_queue_completed_last_5m", "Jobs completed in the last five minutes.", labels, nil),
+		"dead_letters":   prometheus.NewDesc("tellbook_queue_dead_letter_depth", "Jobs retained for operational review after exhausting retries.", labels, nil),
 		"scrape_success": prometheus.NewDesc("tellbook_queue_scrape_success", "Whether the latest queue metric collection succeeded.", nil, nil),
 	}}
 }
@@ -430,9 +693,9 @@ func (c *queueCollector) Collect(ch chan<- prometheus.Metric) {
 	defer rows.Close()
 	for rows.Next() {
 		var queue string
-		var depth, retries, throughput int64
+		var depth, retries, throughput, deadLetters int64
 		var oldest float64
-		if rows.Scan(&queue, &depth, &oldest, &retries, &throughput) != nil {
+		if rows.Scan(&queue, &depth, &oldest, &retries, &throughput, &deadLetters) != nil {
 			ch <- prometheus.MustNewConstMetric(c.desc["scrape_success"], prometheus.GaugeValue, 0)
 			return
 		}
@@ -440,6 +703,7 @@ func (c *queueCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.desc["oldest"], prometheus.GaugeValue, oldest, queue)
 		ch <- prometheus.MustNewConstMetric(c.desc["retries"], prometheus.GaugeValue, float64(retries), queue)
 		ch <- prometheus.MustNewConstMetric(c.desc["throughput"], prometheus.GaugeValue, float64(throughput), queue)
+		ch <- prometheus.MustNewConstMetric(c.desc["dead_letters"], prometheus.GaugeValue, float64(deadLetters), queue)
 	}
 	if rows.Err() != nil {
 		ch <- prometheus.MustNewConstMetric(c.desc["scrape_success"], prometheus.GaugeValue, 0)
@@ -450,7 +714,8 @@ func (c *queueCollector) Collect(ch chan<- prometheus.Metric) {
 
 const queueMetricsSQL = `
 	SELECT 'agreement_lifecycle', active.depth, active.oldest, active.retries,
-		(SELECT COUNT(*)::bigint FROM agreement_jobs WHERE completed_at >= NOW()-INTERVAL '5 minutes')
+		(SELECT COUNT(*)::bigint FROM agreement_jobs WHERE completed_at >= NOW()-INTERVAL '5 minutes'),
+		0::bigint
 	FROM (
 		SELECT COUNT(*)::bigint AS depth,
 			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(created_at) FILTER (WHERE status='queued'))),0)::double precision AS oldest,
@@ -459,7 +724,8 @@ const queueMetricsSQL = `
 	) active
 	UNION ALL
 	SELECT 'agreement_generation', active.depth, active.oldest, active.retries,
-		(SELECT COUNT(*)::bigint FROM agreement_template_generation_jobs WHERE completed_at >= NOW()-INTERVAL '5 minutes')
+		(SELECT COUNT(*)::bigint FROM agreement_template_generation_jobs WHERE completed_at >= NOW()-INTERVAL '5 minutes'),
+		0::bigint
 	FROM (
 		SELECT COUNT(*)::bigint AS depth,
 			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(created_at) FILTER (WHERE status='queued'))),0)::double precision AS oldest,
@@ -468,7 +734,8 @@ const queueMetricsSQL = `
 	) active
 	UNION ALL
 	SELECT 'financial', active.depth, active.oldest, active.retries,
-		(SELECT COUNT(*)::bigint FROM financial_jobs WHERE completed_at >= NOW()-INTERVAL '5 minutes')
+		(SELECT COUNT(*)::bigint FROM financial_jobs WHERE completed_at >= NOW()-INTERVAL '5 minutes'),
+		(SELECT COUNT(*)::bigint FROM financial_jobs WHERE status='dead_letter')
 	FROM (
 		SELECT COUNT(*)::bigint AS depth,
 			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(created_at) FILTER (WHERE status IN ('pending','failed')))),0)::double precision AS oldest,
@@ -477,7 +744,8 @@ const queueMetricsSQL = `
 	) active
 	UNION ALL
 	SELECT 'inbox_ai', active.depth, active.oldest, active.retries,
-		(SELECT COUNT(*)::bigint FROM inbox_ai_turn_jobs WHERE completed_at >= NOW()-INTERVAL '5 minutes')
+		(SELECT COUNT(*)::bigint FROM inbox_ai_turn_jobs WHERE completed_at >= NOW()-INTERVAL '5 minutes'),
+		0::bigint
 	FROM (
 		SELECT COUNT(*)::bigint AS depth,
 			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(created_at) FILTER (WHERE status='queued'))),0)::double precision AS oldest,
@@ -486,7 +754,8 @@ const queueMetricsSQL = `
 	) active
 	UNION ALL
 	SELECT 'tessa', active.depth, active.oldest, active.retries,
-		(SELECT COUNT(*)::bigint FROM tessa_runs WHERE completed_at >= NOW()-INTERVAL '5 minutes')
+		(SELECT COUNT(*)::bigint FROM tessa_runs WHERE completed_at >= NOW()-INTERVAL '5 minutes'),
+		0::bigint
 	FROM (
 		SELECT COUNT(*)::bigint AS depth,
 			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(created_at) FILTER (WHERE status='queued'))),0)::double precision AS oldest,
@@ -495,12 +764,126 @@ const queueMetricsSQL = `
 	) active
 	UNION ALL
 	SELECT 'provider_daily_metrics', active.depth, active.oldest, active.retries,
-		(SELECT COUNT(*)::bigint FROM provider_daily_metrics WHERE projected_at >= NOW()-INTERVAL '5 minutes')
+		(SELECT COUNT(*)::bigint FROM provider_daily_metrics WHERE projected_at >= NOW()-INTERVAL '5 minutes'),
+		0::bigint
 	FROM (
 		SELECT COUNT(*)::bigint AS depth,
 			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(enqueued_at))),0)::double precision AS oldest,
 			COALESCE(SUM(revision-1),0)::bigint AS retries
 		FROM provider_daily_metric_jobs
+	) active
+	UNION ALL
+	SELECT 'notification_event_planner', active.depth, active.oldest, active.retries,
+		(SELECT COUNT(*)::bigint FROM notification_event_jobs
+		 WHERE status='completed' AND completed_at>=NOW()-INTERVAL '5 minutes'),
+		(SELECT COUNT(*)::bigint FROM notification_event_jobs WHERE status='dead_letter')
+	FROM (
+		SELECT COUNT(*)::bigint AS depth,
+			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(
+				CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END)
+				FILTER (WHERE (CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END)<=NOW()))),0)::double precision AS oldest,
+			COALESCE(SUM(GREATEST(attempt_count-1,0)),0)::bigint AS retries
+		FROM notification_event_jobs WHERE status IN ('pending','retry','processing')
+	) active
+	UNION ALL
+	SELECT 'notification_scope_planner', active.depth, active.oldest, active.retries,
+		(SELECT COUNT(*)::bigint FROM notification_scope_replan_jobs
+		 WHERE status='completed' AND completed_at>=NOW()-INTERVAL '5 minutes'),
+		(SELECT COUNT(*)::bigint FROM notification_scope_replan_jobs WHERE status='dead_letter')
+	FROM (
+		SELECT COUNT(*)::bigint AS depth,
+			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(
+				CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END)
+				FILTER (WHERE (CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END)<=NOW()))),0)::double precision AS oldest,
+			COALESCE(SUM(GREATEST(attempt_count-1,0)),0)::bigint AS retries
+		FROM notification_scope_replan_jobs WHERE status IN ('pending','retry','processing')
+	) active
+	UNION ALL
+	SELECT 'notification_in_app', active.depth, active.oldest, active.retries,
+		(SELECT COUNT(*)::bigint FROM notification_in_app_jobs
+		 WHERE status='completed' AND completed_at>=NOW()-INTERVAL '5 minutes'),
+		(SELECT COUNT(*)::bigint FROM notification_in_app_jobs WHERE status='dead_letter')
+	FROM (
+		SELECT COUNT(*)::bigint AS depth,
+			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(scheduled_for)
+				FILTER (WHERE scheduled_for<=NOW() AND
+					(CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END)<=NOW()))),0)::double precision AS oldest,
+			COALESCE(SUM(GREATEST(attempt_count-1,0)),0)::bigint AS retries
+		FROM notification_in_app_jobs WHERE status IN ('pending','retry','processing')
+	) active
+	UNION ALL
+	SELECT 'notification_email', active.depth, active.oldest, active.retries,
+		(SELECT COUNT(*)::bigint FROM notification_deliveries
+		 WHERE channel='email' AND status='accepted' AND accepted_at>=NOW()-INTERVAL '5 minutes'),
+		(SELECT COUNT(*)::bigint FROM notification_deliveries
+		 WHERE channel='email' AND status IN ('failed','manual_review'))
+	FROM (
+		SELECT COUNT(*)::bigint AS depth,
+			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(scheduled_for)
+				FILTER (WHERE scheduled_for<=NOW() AND
+					(CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END)<=NOW()))),0)::double precision AS oldest,
+			COALESCE(SUM(GREATEST(attempt_count-1,0)),0)::bigint AS retries
+		FROM notification_deliveries
+		WHERE channel='email' AND status IN ('pending','retry','processing')
+	) active
+	UNION ALL
+	SELECT 'welcome_email', active.depth, active.oldest, active.retries,
+		(SELECT COUNT(*)::bigint FROM welcome_email_jobs
+		 WHERE status='accepted' AND accepted_at>=NOW()-INTERVAL '5 minutes'),
+		(SELECT COUNT(*)::bigint FROM welcome_email_jobs WHERE status IN ('failed','manual_review'))
+	FROM (
+		SELECT COUNT(*)::bigint AS depth,
+			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(
+				CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END)
+				FILTER (WHERE (CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END)<=NOW()))),0)::double precision AS oldest,
+			COALESCE(SUM(GREATEST(attempt_count-1,0)),0)::bigint AS retries
+		FROM welcome_email_jobs WHERE status IN ('pending','retry','processing')
+	) active
+	UNION ALL
+	SELECT 'auth_code_email', active.depth, active.oldest, active.retries,
+		(SELECT COUNT(*)::bigint FROM auth_code_delivery_jobs
+		 WHERE channel='email' AND status='accepted' AND accepted_at>=NOW()-INTERVAL '5 minutes'),
+		(SELECT COUNT(*)::bigint FROM auth_code_delivery_jobs
+		 WHERE channel='email' AND status IN ('failed','unknown'))
+	FROM (
+		SELECT COUNT(*)::bigint AS depth,
+			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(
+				CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END)
+				FILTER (WHERE (CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END)<=NOW()))),0)::double precision AS oldest,
+			COALESCE(SUM(GREATEST(attempt_count-1,0)),0)::bigint AS retries
+		FROM auth_code_delivery_jobs
+		WHERE channel='email' AND status IN ('pending','retry','processing')
+	) active
+	UNION ALL
+	SELECT 'notification_whatsapp', active.depth, active.oldest, active.retries,
+		(SELECT COUNT(*)::bigint FROM notification_deliveries
+		 WHERE channel='whatsapp' AND provider_status IN ('accepted','sent','delivered','read')
+		   AND provider_status_at>=NOW()-INTERVAL '5 minutes'),
+		(SELECT COUNT(*)::bigint FROM notification_deliveries
+		 WHERE channel='whatsapp' AND status IN ('failed','manual_review'))
+	FROM (
+		SELECT COUNT(*)::bigint AS depth,
+			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(scheduled_for)
+				FILTER (WHERE scheduled_for<=NOW() AND
+					(CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END)<=NOW()))),0)::double precision AS oldest,
+			COALESCE(SUM(GREATEST(attempt_count-1,0)),0)::bigint AS retries
+		FROM notification_deliveries
+		WHERE channel='whatsapp' AND status IN ('pending','retry','processing')
+	) active
+	UNION ALL
+	SELECT 'notification_whatsapp_status', active.depth, active.oldest, active.retries,
+		(SELECT COUNT(*)::bigint FROM meta_whatsapp_webhook_receipts
+		 WHERE event_kind='status' AND processing_status='completed'
+		   AND processed_at>=NOW()-INTERVAL '5 minutes'),
+		(SELECT COUNT(*)::bigint FROM meta_whatsapp_webhook_receipts
+		 WHERE event_kind='status' AND processing_status='dead_letter')
+	FROM (
+		SELECT COUNT(*)::bigint AS depth,
+			COALESCE(EXTRACT(EPOCH FROM (NOW()-MIN(created_at)
+				FILTER (WHERE (CASE WHEN processing_status='processing' THEN lease_expires_at ELSE available_at END)<=NOW()))),0)::double precision AS oldest,
+			COALESCE(SUM(GREATEST(attempt_count-1,0)),0)::bigint AS retries
+		FROM meta_whatsapp_webhook_receipts
+		WHERE event_kind='status' AND processing_status IN ('pending','retry','processing')
 	) active
 `
 

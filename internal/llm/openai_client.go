@@ -61,11 +61,39 @@ func NewOpenAIClient(cfg config.Config, operationalMetrics ...*observability.Met
 }
 
 func (c *OpenAIClient) GenerateJSON(ctx context.Context, systemPrompt, userPrompt string, dst any) error {
-	startedAt := time.Now()
 	schemaName, schema, err := responseSchema(dst)
 	if err != nil {
 		return aierror.Terminal("prepare OpenAI request", aierror.KindConfiguration, err)
 	}
+	return c.generateJSON(ctx, systemPrompt, userPrompt, dst, schemaName, schema)
+}
+
+func (c *OpenAIClient) GenerateJSONSchema(ctx context.Context, systemPrompt, userPrompt, schemaName string, schemaJSON json.RawMessage) (json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	var schemaType string
+	if err := json.Unmarshal(schemaJSON, &fields); err != nil {
+		return nil, aierror.Terminal("prepare OpenAI schema", aierror.KindConfiguration, errors.New("invalid object schema"))
+	}
+	if err := json.Unmarshal(fields["type"], &schemaType); err != nil || schemaType != "object" {
+		return nil, aierror.Terminal("prepare OpenAI schema", aierror.KindConfiguration, errors.New("invalid object schema"))
+	}
+	// The SDK requires a map at the schema root. Preserve its values as raw JSON
+	// so application-defined property order (including nested tool discriminators)
+	// survives encoding. Recursively decoding into maps sorts those fields and can
+	// force constrained decoding to choose arguments before selecting a tool.
+	schema := make(map[string]any, len(fields))
+	for key, value := range fields {
+		schema[key] = value
+	}
+	var output json.RawMessage
+	if err := c.generateJSON(ctx, systemPrompt, userPrompt, &output, schemaName, schema); err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+func (c *OpenAIClient) generateJSON(ctx context.Context, systemPrompt, userPrompt string, dst any, schemaName string, schema map[string]any) error {
+	startedAt := time.Now()
 
 	format := responses.ResponseFormatTextConfigParamOfJSONSchema(schemaName, schema)
 	format.OfJSONSchema.Strict = openai.Bool(true)

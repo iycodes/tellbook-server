@@ -249,7 +249,14 @@ func seed(ctx context.Context, tx pgx.Tx, conversations, messagesPerConversation
 				INSERT INTO clients (id, full_name, email, password_hash, email_verified_at)
 				SELECT client_id, 'Inbox Load Provider ' || n,
 					format('inbox-load-provider-%s@example.invalid', lpad(n::text, 4, '0')), $1, NOW()
-				FROM inbox_load_actors;`,
+				FROM inbox_load_actors;
+				INSERT INTO provider_auth_identities (
+					client_id, identity_type, normalized_identifier, verified_at
+				)
+				SELECT id, 'email', lower(btrim(email)), email_verified_at
+				FROM clients
+				WHERE id = 'b019a06b-55c1-4f08-a4c3-da96e86b33a2'::uuid
+				   OR id IN (SELECT client_id FROM inbox_load_actors);`,
 			args: []any{passwordHash},
 		},
 		{

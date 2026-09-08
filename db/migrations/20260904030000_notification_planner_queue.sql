@@ -2,6 +2,7 @@
 CREATE TABLE notification_event_jobs (
     booking_event_id uuid PRIMARY KEY REFERENCES booking_domain_events(id) ON DELETE CASCADE,
     event_sequence bigint NOT NULL,
+	origin text NOT NULL DEFAULT 'live',
     status text NOT NULL DEFAULT 'pending',
     attempt_count integer NOT NULL DEFAULT 0,
     next_attempt_at timestamptz NOT NULL DEFAULT NOW(),
@@ -15,6 +16,7 @@ CREATE TABLE notification_event_jobs (
         CHECK (status IN ('pending','processing','retry','completed','dead_letter')),
     CONSTRAINT notification_event_jobs_attempt_check CHECK (attempt_count BETWEEN 0 AND 20),
     CONSTRAINT notification_event_jobs_sequence_check CHECK (event_sequence > 0),
+	CONSTRAINT notification_event_jobs_origin_check CHECK (origin IN ('live','backfill')),
     CONSTRAINT notification_event_jobs_error_check CHECK (char_length(last_error_code) <= 80),
     CONSTRAINT notification_event_jobs_lease_check CHECK (
         (status='processing' AND btrim(lease_owner)<>'' AND lease_expires_at IS NOT NULL)
@@ -156,8 +158,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-INSERT INTO notification_event_jobs (booking_event_id,event_sequence)
-SELECT DISTINCT ON (event.booking_id) event.id,event.sequence
+INSERT INTO notification_event_jobs (booking_event_id,event_sequence,origin)
+SELECT DISTINCT ON (event.booking_id) event.id,event.sequence,'backfill'
 FROM booking_domain_events event
 JOIN bookings booking ON booking.id=event.booking_id
 WHERE booking.start_at>NOW()

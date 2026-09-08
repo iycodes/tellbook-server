@@ -49,7 +49,7 @@ func TestProviderWhatsAppVerificationAndControls(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := strings.Repeat("foundation-key-", 3)
-	foundation, err := NewContactFoundationRepository(pool, key, "+2348031685968", true)
+	foundation, err := NewContactFoundationRepository(pool, key, "+2348031685968", true, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestProviderWhatsAppVerificationAndControls(t *testing.T) {
 	if err != nil || !defaults.BookingEmail || defaults.BookingWhatsApp || !defaults.EmailAvailable || !defaults.WhatsAppVerificationAvailable {
 		t.Fatalf("provider defaults = %#v, %v", defaults, err)
 	}
-	unavailableFoundation, err := NewContactFoundationRepository(pool, key, "+2348031685968", false)
+	unavailableFoundation, err := NewContactFoundationRepository(pool, key, "+2348031685968", false, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}

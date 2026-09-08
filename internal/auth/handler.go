@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"time"
 
+	"booking/go-server/internal/authchallenge"
 	"booking/go-server/internal/config"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 )
 
 type Handler struct {
@@ -28,89 +30,161 @@ func NewHandler(service *Service, cfg config.Config) *Handler {
 }
 
 func (h *Handler) Routes(r chi.Router) {
-	r.Post("/register", h.register)
-	r.Post("/register/verify", h.verifyRegistration)
-	r.Post("/register/resend", h.resendRegistrationVerification)
-	r.Post("/login", h.login)
+	r.Get("/capabilities", h.capabilities)
+	r.Post("/code", h.startCode)
+	r.Get("/code/{challengeID}", h.codeStatus)
+	r.Post("/code/resend", h.resendCode)
+	r.Post("/verify", h.verifyCode)
+	r.Post("/password", h.login)
+	r.Post("/password/reset/code", h.startPasswordReset)
+	r.Post("/password/reset/verify", h.verifyPasswordReset)
+	r.Post("/password/reset", h.completePasswordReset)
 	r.Post("/session", h.session)
 	r.Post("/logout", h.logout)
-	r.Post("/password/forgot", h.forgotPassword)
-	r.Post("/password/reset", h.resetPassword)
-
 }
 
-func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
-	input, err := decodeJSONLimit[registerInput](r, 8<<20)
+// ProtectedRoutes is mounted below /v1/app after the provider authentication
+// middleware. Keeping these operations here prevents appdata from duplicating
+// authentication ownership.
+func (h *Handler) ProtectedRoutes(r chi.Router) {
+	r.Patch("/me/password", h.updatePassword)
+	r.Post("/me/identities/code", h.startIdentityLink)
+	r.Get("/me/identities/code/{challengeID}", h.identityLinkStatus)
+	r.Post("/me/identities/code/resend", h.resendIdentityLink)
+	r.Post("/me/identities/verify", h.verifyIdentityLink)
+}
+
+func (h *Handler) updatePassword(w http.ResponseWriter, r *http.Request) {
+	user, _ := UserFromContext(r.Context())
+	input, err := decodeJSONLimit[struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}](r, 4<<10)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		writeError(w, http.StatusBadRequest, "invalid_request", "Enter a valid new password.")
 		return
 	}
-
-	err = h.service.StartRegistration(r.Context(), input)
-	if err != nil {
-		switch {
-		case errors.Is(err, ErrEmailTaken):
-			writeError(w, http.StatusConflict, "email_taken", "An account with that email already exists.")
-		default:
-			writeError(w, http.StatusBadRequest, "register_failed", err.Error())
-		}
+	updated, err := h.service.UpdatePassword(r.Context(), user.ID, input.CurrentPassword, input.NewPassword)
+	switch {
+	case errors.Is(err, ErrWeakPassword):
+		writeError(w, http.StatusBadRequest, "invalid_password", "Password must be between 8 and 72 characters.")
+		return
+	case errors.Is(err, ErrInvalidCredentials):
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "Current password is incorrect.")
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "password_update_failed", "Could not save your password.")
 		return
 	}
-
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"message": "Verification code has been sent.",
-		"email":   normalizeEmail(input.Email),
+	h.clearSessionCookies(w)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user": h.signUserMedia(r.Context(), updated), "reauthentication_required": true,
 	})
 }
 
-func (h *Handler) verifyRegistration(w http.ResponseWriter, r *http.Request) {
-	input, err := decodeJSON[verifyRegistrationInput](r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-
-	user, pair, refreshToken, err := h.service.CompleteRegistration(
-		r.Context(),
-		input.Email,
-		input.Token,
-		MetadataFromRequest(r),
-	)
-	if err != nil {
-		switch {
-		case errors.Is(err, ErrInvalidRegistrationToken):
-			writeError(w, http.StatusBadRequest, "invalid_verification_token", "Verification code is invalid or expired.")
-		case errors.Is(err, ErrEmailTaken):
-			writeError(w, http.StatusConflict, "email_taken", "An account with that email already exists.")
-		default:
-			writeError(w, http.StatusBadRequest, "register_failed", err.Error())
-		}
-		return
-	}
-
-	user = h.signUserMedia(r.Context(), user)
-	h.setSessionCookies(w, pair.AccessToken, refreshToken)
-	writeJSON(w, http.StatusCreated, map[string]any{"user": user})
+func (h *Handler) capabilities(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "public, max-age=60")
+	writeJSON(w, http.StatusOK, h.service.AuthCapabilities())
 }
 
-func (h *Handler) resendRegistrationVerification(w http.ResponseWriter, r *http.Request) {
-	input, err := decodeJSON[resendRegistrationInput](r)
+func (h *Handler) startCode(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeJSONLimit[struct {
+		Identifier      string `json:"identifier"`
+		DeliveryChannel string `json:"delivery_channel"`
+	}](r, 4<<10)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		writeError(w, http.StatusBadRequest, "invalid_request", "Enter a valid email address or phone number.")
 		return
 	}
+	response, err := h.service.StartCodeChallenge(r.Context(), input.Identifier, input.DeliveryChannel)
+	if err != nil {
+		h.writeCodeChallengeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, response)
+}
 
-	if err := h.service.ResendRegistrationVerification(r.Context(), input.Email); err != nil {
-		if errors.Is(err, ErrInvalidRegistrationToken) {
-			writeError(w, http.StatusBadRequest, "registration_not_pending", "Start signup again before requesting another code.")
+func (h *Handler) codeStatus(w http.ResponseWriter, r *http.Request) {
+	challengeID, err := uuid.Parse(chi.URLParam(r, "challengeID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_challenge", "Start again to request a new code.")
+		return
+	}
+	response, err := h.service.CodeChallengeStatus(r.Context(), challengeID)
+	if err != nil {
+		h.writeCodeChallengeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) resendCode(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeJSONLimit[struct {
+		ChallengeID string `json:"challenge_id"`
+	}](r, 4<<10)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Start again to request a new code.")
+		return
+	}
+	challengeID, err := uuid.Parse(input.ChallengeID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_challenge", "Start again to request a new code.")
+		return
+	}
+	response, err := h.service.ResendCodeChallenge(r.Context(), challengeID)
+	if err != nil {
+		h.writeCodeChallengeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, response)
+}
+
+func (h *Handler) verifyCode(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeJSONLimit[struct {
+		ChallengeID string `json:"challenge_id"`
+		Code        string `json:"code"`
+	}](r, 4<<10)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Enter the six-digit code.")
+		return
+	}
+	challengeID, err := uuid.Parse(input.ChallengeID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_verification_code", "Code is invalid or expired.")
+		return
+	}
+	result, err := h.service.VerifyCodeChallenge(r.Context(), challengeID, input.Code, MetadataFromRequest(r))
+	if err != nil {
+		if errors.Is(err, authchallenge.ErrInvalidChallenge) {
+			writeError(w, http.StatusBadRequest, "invalid_verification_code", "Code is invalid or expired.")
 			return
 		}
-		slog.Error("resend registration verification code failed", "error", err, "email", normalizeEmail(input.Email))
-		writeError(w, http.StatusInternalServerError, "verification_failed", "Could not resend verification code.")
+		writeError(w, http.StatusInternalServerError, "verification_failed", "Could not verify the code.")
 		return
 	}
+	result.User = h.signUserMedia(r.Context(), result.User)
+	h.setSessionCookies(w, result.Pair.AccessToken, result.RefreshToken)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user": result.User, "is_new_account": result.IsNewAccount,
+		"onboarding_required": result.OnboardingRequired,
+	})
+}
 
-	writeJSON(w, http.StatusAccepted, map[string]any{"message": "Verification code has been sent."})
+func (h *Handler) writeCodeChallengeError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, authchallenge.ErrUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "delivery_channel_unavailable", "That sign-in method is not available right now.")
+	case errors.Is(err, authchallenge.ErrTooSoon):
+		w.Header().Set("Retry-After", "45")
+		writeError(w, http.StatusTooManyRequests, "code_requested_too_recently", "Wait a moment before requesting another code.")
+	case errors.Is(err, authchallenge.ErrInvalidIdentifier):
+		writeError(w, http.StatusBadRequest, "invalid_identifier", "Enter a valid email address or phone number.")
+	case errors.Is(err, authchallenge.ErrInvalidChallenge), errors.Is(err, authchallenge.ErrNotFound):
+		writeError(w, http.StatusBadRequest, "invalid_challenge", "Start again to request a new code.")
+	default:
+		slog.Error("provider auth code request failed", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "code_delivery_unavailable", "Could not prepare the code. Try again shortly.")
+	}
 }
 
 func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
@@ -123,7 +197,7 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	user, pair, refreshToken, err := h.service.Login(r.Context(), input, MetadataFromRequest(r))
 	if err != nil {
 		if errors.Is(err, ErrInvalidCredentials) {
-			writeError(w, http.StatusUnauthorized, "invalid_credentials", "Email or password is incorrect.")
+			writeError(w, http.StatusUnauthorized, "invalid_credentials", "Contact or password is incorrect.")
 			return
 		}
 		writeError(w, http.StatusBadRequest, "login_failed", err.Error())
@@ -133,6 +207,159 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	user = h.signUserMedia(r.Context(), user)
 	h.setSessionCookies(w, pair.AccessToken, refreshToken)
 	writeJSON(w, http.StatusOK, map[string]any{"user": user})
+}
+
+func (h *Handler) startPasswordReset(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeJSONLimit[struct {
+		Identifier      string `json:"identifier"`
+		DeliveryChannel string `json:"delivery_channel"`
+	}](r, 4<<10)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Enter a valid email address or phone number.")
+		return
+	}
+	response, err := h.service.StartPasswordReset(r.Context(), input.Identifier, input.DeliveryChannel)
+	if err != nil {
+		h.writeCodeChallengeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, response)
+}
+
+func (h *Handler) verifyPasswordReset(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeJSONLimit[struct {
+		ChallengeID string `json:"challenge_id"`
+		Code        string `json:"code"`
+	}](r, 4<<10)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_verification_code", "Code is invalid or expired.")
+		return
+	}
+	challengeID, err := uuid.Parse(input.ChallengeID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_verification_code", "Code is invalid or expired.")
+		return
+	}
+	result, err := h.service.VerifyPasswordReset(r.Context(), challengeID, input.Code)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_verification_code", "Code is invalid or expired.")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) completePasswordReset(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeJSONLimit[struct {
+		ResetGrant  string `json:"reset_grant"`
+		NewPassword string `json:"new_password"`
+	}](r, 4<<10)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_reset", "Reset request is invalid or expired.")
+		return
+	}
+	result, err := h.service.CompletePasswordReset(r.Context(), input.ResetGrant, input.NewPassword, MetadataFromRequest(r))
+	if errors.Is(err, ErrInvalidResetToken) {
+		writeError(w, http.StatusBadRequest, "invalid_reset", "Reset request is invalid or expired.")
+		return
+	}
+	if err != nil {
+		slog.Error("complete provider password reset", "error", err)
+		writeError(w, http.StatusInternalServerError, "password_reset_failed", "Could not reset the password. Try again.")
+		return
+	}
+	result.User = h.signUserMedia(r.Context(), result.User)
+	h.setSessionCookies(w, result.Pair.AccessToken, result.RefreshToken)
+	writeJSON(w, http.StatusOK, map[string]any{"user": result.User})
+}
+
+func (h *Handler) startIdentityLink(w http.ResponseWriter, r *http.Request) {
+	user, _ := UserFromContext(r.Context())
+	input, err := decodeJSONLimit[struct {
+		Identifier      string `json:"identifier"`
+		DeliveryChannel string `json:"delivery_channel"`
+	}](r, 4<<10)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Enter a contact to verify.")
+		return
+	}
+	response, err := h.service.StartIdentityLink(r.Context(), user.ID, input.Identifier, input.DeliveryChannel)
+	if err != nil {
+		h.writeIdentityLinkError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, response)
+}
+
+func (h *Handler) identityLinkStatus(w http.ResponseWriter, r *http.Request) {
+	user, _ := UserFromContext(r.Context())
+	challengeID, err := uuid.Parse(chi.URLParam(r, "challengeID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_challenge", "Start again to request a new code.")
+		return
+	}
+	response, err := h.service.IdentityLinkStatus(r.Context(), user.ID, challengeID)
+	if err != nil {
+		h.writeIdentityLinkError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) resendIdentityLink(w http.ResponseWriter, r *http.Request) {
+	user, _ := UserFromContext(r.Context())
+	input, err := decodeJSONLimit[struct {
+		ChallengeID string `json:"challenge_id"`
+	}](r, 4<<10)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_challenge", "Start again to request a new code.")
+		return
+	}
+	challengeID, err := uuid.Parse(input.ChallengeID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_challenge", "Start again to request a new code.")
+		return
+	}
+	response, err := h.service.ResendIdentityLink(r.Context(), user.ID, challengeID)
+	if err != nil {
+		h.writeIdentityLinkError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, response)
+}
+
+func (h *Handler) verifyIdentityLink(w http.ResponseWriter, r *http.Request) {
+	user, _ := UserFromContext(r.Context())
+	input, err := decodeJSONLimit[struct {
+		ChallengeID string `json:"challenge_id"`
+		Code        string `json:"code"`
+	}](r, 4<<10)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_verification_code", "Code is invalid or expired.")
+		return
+	}
+	challengeID, err := uuid.Parse(input.ChallengeID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_verification_code", "Code is invalid or expired.")
+		return
+	}
+	updated, err := h.service.VerifyIdentityLink(r.Context(), user.ID, challengeID, input.Code)
+	if err != nil {
+		h.writeIdentityLinkError(w, err)
+		return
+	}
+	h.clearSessionCookies(w)
+	writeJSON(w, http.StatusOK, map[string]any{"user": h.signUserMedia(r.Context(), updated), "reauthentication_required": true})
+}
+
+func (h *Handler) writeIdentityLinkError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrIdentityAlreadyLinked):
+		writeError(w, http.StatusConflict, "identity_already_linked", "That contact is already linked to your account.")
+	case errors.Is(err, ErrIdentityConflict):
+		writeError(w, http.StatusConflict, "identity_unavailable", "That contact is already in use or this account already has that contact type.")
+	default:
+		h.writeCodeChallengeError(w, err)
+	}
 }
 
 func (h *Handler) session(w http.ResponseWriter, r *http.Request) {
@@ -170,44 +397,6 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h *Handler) forgotPassword(w http.ResponseWriter, r *http.Request) {
-	input, err := decodeJSON[forgotPasswordInput](r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-
-	if err := h.service.SendPasswordReset(r.Context(), input.Email); err != nil {
-		slog.Error("send password reset code failed", "error", err, "email", input.Email)
-		writeError(w, http.StatusInternalServerError, "password_reset_failed", "Could not issue password reset code.")
-		return
-	}
-
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"message": "If that email exists, a password reset code has been sent.",
-	})
-}
-
-func (h *Handler) resetPassword(w http.ResponseWriter, r *http.Request) {
-	input, err := decodeJSON[resetPasswordInput](r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-
-	if err := h.service.ResetPassword(r.Context(), input.Token, input.NewPassword); err != nil {
-		if errors.Is(err, ErrInvalidResetToken) {
-			writeError(w, http.StatusBadRequest, "invalid_reset_token", "Reset token is invalid or expired.")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "password_reset_failed", err.Error())
-		return
-	}
-
-	h.clearSessionCookies(w)
-	writeJSON(w, http.StatusOK, map[string]any{"message": "Password updated successfully."})
 }
 
 func (h *Handler) requireAuth(next http.Handler) http.Handler {

@@ -1,14 +1,16 @@
 package marketplaceauth
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
-	"fmt"
 	"os"
 	"regexp"
 	"testing"
 	"time"
 
+	"booking/go-server/internal/authchallenge"
 	"booking/go-server/internal/config"
 	"booking/go-server/internal/mailer"
 
@@ -16,12 +18,69 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type captureMailer struct{ message mailer.Message }
+type captureMailer struct {
+	messages chan mailer.Message
+	wake     chan struct{}
+}
 
 func (m *captureMailer) Enabled() bool { return true }
 func (m *captureMailer) Send(_ context.Context, message mailer.Message) error {
-	m.message = message
+	m.messages <- message
 	return nil
+}
+
+func newTestChallengeService(t *testing.T, pool *pgxpool.Pool) *authchallenge.Service {
+	t.Helper()
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	service, err := authchallenge.NewService(pool, authchallenge.Config{
+		EmailEnabled: true, EncryptionKeys: `{"v1":"` + key + `"}`, ActiveKey: "v1",
+		DestinationKey: "auth-challenge-test-hmac-key-32-bytes",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service
+}
+
+func startTestAuthWorker(t *testing.T, challenges *authchallenge.Service) *captureMailer {
+	t.Helper()
+	sender := &captureMailer{messages: make(chan mailer.Message, 8), wake: make(chan struct{}, 1)}
+	workerContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go authchallenge.NewWorker(challenges, sender, nil, sender.wake, nil, 1, 2*time.Second).Start(workerContext)
+	return sender
+}
+
+func awaitAuthCode(t *testing.T, sender *captureMailer) string {
+	t.Helper()
+	select {
+	case sender.wake <- struct{}{}:
+	default:
+	}
+	select {
+	case message := <-sender.messages:
+		code := regexp.MustCompile(`\b\d{6}\b`).FindString(message.Text)
+		if code == "" {
+			t.Fatalf("verification code missing from %q", message.Text)
+		}
+		return code
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for auth email")
+		return ""
+	}
+}
+
+func awaitMarketplaceChallengeReady(t *testing.T, service *Service, challengeID uuid.UUID) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := service.ChallengeStatus(context.Background(), challengeID)
+		if err == nil && status.DeliveryState == "accepted" && status.VerificationExpiresInSeconds != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("auth challenge delivery was not accepted")
 }
 
 func TestPasswordlessCustomerAccountLifecycle(t *testing.T) {
@@ -41,22 +100,34 @@ func TestPasswordlessCustomerAccountLifecycle(t *testing.T) {
 		_, _ = pool.Exec(ctx, `DELETE FROM marketplace_customers WHERE email=$1`, email)
 	})
 	repo := NewRepository(pool)
-	sender := &captureMailer{}
-	service := NewService(repo, config.Config{AuthRefreshTokenTTL: 30 * 24 * time.Hour, AuthBcryptCost: 10}, sender)
+	challenges := newTestChallengeService(t, pool)
+	sender := startTestAuthWorker(t, challenges)
+	service := NewService(repo, config.Config{AuthRefreshTokenTTL: 30 * 24 * time.Hour, AuthBcryptCost: 10}, challenges)
 	challenge, err := service.StartChallenge(ctx, email, "email")
 	if err != nil {
 		t.Fatal(err)
 	}
-	code := regexp.MustCompile(`\b\d{6}\b`).FindString(sender.message.Text)
-	if code == "" {
-		t.Fatalf("verification code missing from %q", sender.message.Text)
-	}
-	customer, sessionToken, err := service.VerifyChallenge(ctx, challenge.ChallengeID, code, "integration-test", "127.0.0.1")
+	code := awaitAuthCode(t, sender)
+	awaitMarketplaceChallengeReady(t, service, challenge.ChallengeID)
+	customer, sessionToken, isNewAccount, err := service.VerifyChallenge(ctx, challenge.ChallengeID, code, "integration-test", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !isNewAccount {
+		t.Fatal("first verified sign-in was not marked as a new account")
+	}
 	if customer.Email != email || customer.EmailVerifiedAt == nil {
 		t.Fatalf("customer = %+v", customer)
+	}
+	var welcomeCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM welcome_email_jobs
+		WHERE marketplace_customer_id=$1 AND audience='marketplace_customer'
+	`, customer.ID).Scan(&welcomeCount); err != nil {
+		t.Fatal(err)
+	}
+	if welcomeCount != 1 {
+		t.Fatalf("marketplace welcome jobs = %d, want 1", welcomeCount)
 	}
 	authed, err := service.Authenticate(ctx, sessionToken)
 	if err != nil {
@@ -75,20 +146,23 @@ func TestPasswordlessCustomerAccountLifecycle(t *testing.T) {
 		principalBeforeSecurityChange.SessionRevision < 1 {
 		t.Fatalf("session principal = %+v", principalBeforeSecurityChange)
 	}
-	passwordCustomer, err := service.SetPassword(ctx, customer.ID, "correct horse battery staple")
+	passwordCustomer, err := service.SetPassword(ctx, customer.ID, "", "correct horse battery staple")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !passwordCustomer.HasPassword {
 		t.Fatal("saved password was not reflected on the customer")
 	}
-	principalAfterPassword, err := service.AuthenticatePrincipal(ctx, sessionToken, true)
-	if err != nil {
+	if _, err := service.AuthenticatePrincipal(ctx, sessionToken, true); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("password change did not revoke the existing session: %v", err)
+	}
+	var revisionAfterPassword int64
+	if err := pool.QueryRow(ctx, `SELECT security_revision FROM marketplace_customers WHERE id=$1`, customer.ID).Scan(&revisionAfterPassword); err != nil {
 		t.Fatal(err)
 	}
-	if principalAfterPassword.SecurityRevision <= principalBeforeSecurityChange.SecurityRevision {
+	if revisionAfterPassword <= principalBeforeSecurityChange.SecurityRevision {
 		t.Fatalf("password change did not advance security revision: before=%d after=%d",
-			principalBeforeSecurityChange.SecurityRevision, principalAfterPassword.SecurityRevision)
+			principalBeforeSecurityChange.SecurityRevision, revisionAfterPassword)
 	}
 	passwordAuthed, passwordToken, err := service.PasswordLogin(ctx, email, "correct horse battery staple", "integration-test", "127.0.0.1")
 	if err != nil {
@@ -100,71 +174,79 @@ func TestPasswordlessCustomerAccountLifecycle(t *testing.T) {
 	if _, _, err := service.PasswordLogin(ctx, email, "wrong password", "integration-test", "127.0.0.1"); !errors.Is(err, ErrInvalidPassword) {
 		t.Fatalf("wrong password error = %v", err)
 	}
-	phone := fmt.Sprintf("+2348%09d", time.Now().UnixNano()%1_000_000_000)
-	linkCode, linkHash, err := newSixDigitCode()
+	resetChallenge, err := service.StartPasswordReset(ctx, email, "email")
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UTC()
-	linkChallenge := Challenge{
-		ID: uuid.New(), IdentifierType: "phone", Identifier: phone, DeliveryChannel: "sms",
-		Purpose: "link_identity", TargetCustomerID: &customer.ID, CodeHash: linkHash,
-		ExpiresAt: now.Add(challengeTTL), CreatedAt: now,
+	resetCode := awaitAuthCode(t, sender)
+	resetDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(resetDeadline) {
+		status, statusErr := challenges.Status(ctx, authchallenge.RealmMarketplaceCustomer,
+			resetChallenge.ChallengeID, authchallenge.PurposePasswordReset, &customer.ID)
+		if statusErr == nil && status.VerificationExpiresInSeconds != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if err := repo.CreateChallenge(ctx, linkChallenge); err != nil {
-		t.Fatal(err)
+	verification, err := service.VerifyPasswordReset(ctx, resetChallenge.ChallengeID, resetCode)
+	if err != nil || verification.ResetGrant == "" {
+		t.Fatalf("verify password reset = %+v, %v", verification, err)
 	}
-	linked, err := service.VerifyIdentityLink(ctx, customer.ID, linkChallenge.ID, linkCode)
+	resetCustomer, resetToken, err := service.CompletePasswordReset(
+		ctx, verification.ResetGrant, "new correct horse battery staple", "integration-test", "127.0.0.1",
+	)
+	if err != nil || resetCustomer.ID != customer.ID || resetToken == "" {
+		t.Fatalf("complete password reset customer=%+v token_empty=%t err=%v", resetCustomer, resetToken == "", err)
+	}
+	if _, _, err := service.CompletePasswordReset(ctx, verification.ResetGrant, "another secure password", "integration-test", "127.0.0.1"); !errors.Is(err, ErrInvalidChallenge) {
+		t.Fatalf("replayed reset grant error = %v", err)
+	}
+	if _, err := service.Authenticate(ctx, passwordToken); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("password reset did not revoke old session: %v", err)
+	}
+	if _, err := service.Authenticate(ctx, resetToken); err != nil {
+		t.Fatalf("replacement reset session failed: %v", err)
+	}
+	unknownEmail := "unknown-" + uuid.NewString() + "@example.com"
+	synthetic, err := service.StartPasswordReset(ctx, unknownEmail, "email")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if linked.ID != customer.ID || linked.Phone != phone || linked.PhoneVerifiedAt == nil {
-		t.Fatalf("linked customer = %+v", linked)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM marketplace_auth_challenges WHERE id=$1`, synthetic.ChallengeID)
+	})
+	var syntheticDeliveries int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM auth_code_delivery_jobs WHERE marketplace_challenge_id=$1
+	`, synthetic.ChallengeID).Scan(&syntheticDeliveries); err != nil {
+		t.Fatal(err)
 	}
-	principalAfterIdentity, err := service.AuthenticatePrincipal(ctx, sessionToken, true)
+	if syntheticDeliveries != 0 {
+		t.Fatalf("unknown-account reset queued %d outbound deliveries", syntheticDeliveries)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE marketplace_auth_challenges SET created_at=created_at-INTERVAL '46 seconds' WHERE id=$1`, challenge.ChallengeID); err != nil {
+		t.Fatal(err)
+	}
+	repeatChallenge, err := service.StartChallenge(ctx, email, "email")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if principalAfterIdentity.SecurityRevision <= principalAfterPassword.SecurityRevision {
-		t.Fatalf("identity change did not advance security revision: password=%d identity=%d",
-			principalAfterPassword.SecurityRevision, principalAfterIdentity.SecurityRevision)
-	}
-	whatsAppCode, whatsAppHash, err := newSixDigitCode()
+	repeatCode := awaitAuthCode(t, sender)
+	awaitMarketplaceChallengeReady(t, service, repeatChallenge.ChallengeID)
+	repeatCustomer, _, repeatIsNew, err := service.VerifyChallenge(ctx, repeatChallenge.ChallengeID, repeatCode, "integration-test", "127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	whatsAppChallenge := Challenge{
-		ID: uuid.New(), IdentifierType: "whatsapp", Identifier: phone, DeliveryChannel: "whatsapp",
-		Purpose: "link_identity", TargetCustomerID: &customer.ID, CodeHash: whatsAppHash,
-		ExpiresAt: now.Add(challengeTTL), CreatedAt: now,
+	if repeatCustomer.ID != customer.ID || repeatIsNew {
+		t.Fatalf("repeat sign-in account = %s new=%t, want %s false", repeatCustomer.ID, repeatIsNew, customer.ID)
 	}
-	if err := repo.CreateChallenge(ctx, whatsAppChallenge); err != nil {
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM welcome_email_jobs WHERE marketplace_customer_id=$1
+	`, customer.ID).Scan(&welcomeCount); err != nil {
 		t.Fatal(err)
 	}
-	linked, err = service.VerifyIdentityLink(ctx, customer.ID, whatsAppChallenge.ID, whatsAppCode)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if linked.WhatsApp != phone || linked.WhatsAppVerifiedAt == nil {
-		t.Fatalf("WhatsApp verification did not stay on the existing customer: %+v", linked)
-	}
-	signInCode, signInHash, err := newSixDigitCode()
-	if err != nil {
-		t.Fatal(err)
-	}
-	whatsAppSignIn := Challenge{
-		ID: uuid.New(), IdentifierType: "whatsapp", Identifier: phone, DeliveryChannel: "whatsapp",
-		Purpose: "sign_in", CodeHash: signInHash, ExpiresAt: now.Add(challengeTTL), CreatedAt: now,
-	}
-	if err := repo.CreateChallenge(ctx, whatsAppSignIn); err != nil {
-		t.Fatal(err)
-	}
-	channelCustomer, _, err := service.VerifyChallenge(ctx, whatsAppSignIn.ID, signInCode, "integration-test", "127.0.0.1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if channelCustomer.ID != customer.ID {
-		t.Fatalf("same phone contact created another customer: got %s, want %s", channelCustomer.ID, customer.ID)
+	if welcomeCount != 1 {
+		t.Fatalf("repeat sign-in changed marketplace welcome jobs to %d", welcomeCount)
 	}
 	updated, err := repo.UpdateProfile(ctx, customer.ID, ProfileInput{FullName: "Test Customer", Birthday: "1995-03-14"})
 	if err != nil {
@@ -198,6 +280,9 @@ func TestPasswordlessCustomerAccountLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !initialPrefs.EmailAvailable || initialPrefs.WhatsAppAvailable {
+		t.Fatalf("verified notification capabilities = %+v", initialPrefs)
+	}
 	readAgain, err := repo.GetPreferences(ctx, customer.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -205,11 +290,11 @@ func TestPasswordlessCustomerAccountLifecycle(t *testing.T) {
 	if !initialPrefs.UpdatedAt.Equal(readAgain.UpdatedAt) {
 		t.Fatal("reading preferences changed updated_at")
 	}
-	prefs, err := repo.UpdatePreferences(ctx, customer.ID, NotificationPreferencesInput{BookingEmail: true, BookingWhatsApp: true})
+	prefs, err := repo.UpdatePreferences(ctx, customer.ID, NotificationPreferencesInput{BookingEmail: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !prefs.BookingEmail || !prefs.BookingWhatsApp {
+	if !prefs.BookingEmail || prefs.BookingWhatsApp || !prefs.EmailAvailable || prefs.WhatsAppAvailable {
 		t.Fatalf("preferences = %+v", prefs)
 	}
 	if err := service.Logout(ctx, sessionToken); err != nil {

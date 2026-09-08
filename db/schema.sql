@@ -765,6 +765,20 @@ $$;
 
 
 --
+-- Name: notify_auth_code_delivery_job(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.notify_auth_code_delivery_job() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM pg_notify('tellbook_worker_core','auth_code_delivery');
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: notify_booking_domain_event(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -809,6 +823,71 @@ BEGIN
     RETURN NEW;
 END;
 $$;
+
+
+--
+-- Name: notify_welcome_email_job(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.notify_welcome_email_job() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    PERFORM pg_notify('tellbook_worker_core','welcome_email');
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: tessa_whatsapp_delivery_timestamps(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.tessa_whatsapp_delivery_timestamps() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.status IS DISTINCT FROM OLD.status THEN
+        NEW.updated_at=clock_timestamp();
+        IF NEW.status IN ('accepted','sent','delivered','read') THEN
+            NEW.accepted_at=COALESCE(OLD.accepted_at,clock_timestamp());
+        END IF;
+        IF NEW.status='sent' THEN NEW.sent_at=COALESCE(OLD.sent_at,NEW.status_at); END IF;
+        IF NEW.status='delivered' THEN NEW.delivered_at=COALESCE(OLD.delivered_at,NEW.status_at); END IF;
+        IF NEW.status='read' THEN NEW.read_at=COALESCE(OLD.read_at,NEW.status_at); END IF;
+    END IF;
+    RETURN NEW;
+END $$;
+
+
+--
+-- Name: tessa_whatsapp_public_status(text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.tessa_whatsapp_public_status(value text) RETURNS text
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    AS $$
+    SELECT CASE WHEN value IN ('pending','processing','dispatching','retry') THEN 'pending' ELSE value END;
+$$;
+
+
+--
+-- Name: tessa_whatsapp_publish_delivery(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.tessa_whatsapp_publish_delivery() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE event_sequence bigint;
+BEGIN
+    IF NEW.kind='answer' AND tessa_whatsapp_public_status(NEW.status) IS DISTINCT FROM tessa_whatsapp_public_status(OLD.status) THEN
+        INSERT INTO tessa_events(client_id,thread_id,message_id,event_type)
+        VALUES(NEW.client_id,NEW.thread_id,NEW.assistant_message_id,'message.delivery_changed')
+        RETURNING sequence INTO event_sequence;
+        PERFORM pg_notify('tellbook_tessa_events',event_sequence::text || '|' || NEW.client_id::text);
+    END IF;
+    RETURN NULL;
+END $$;
 
 
 SET default_tablespace = '';
@@ -1061,34 +1140,68 @@ CREATE TABLE public.agreement_template_versions (
 
 
 --
--- Name: auth_password_reset_tokens; Type: TABLE; Schema: public; Owner: -
+-- Name: auth_code_delivery_jobs; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.auth_password_reset_tokens (
+CREATE TABLE public.auth_code_delivery_jobs (
     id uuid NOT NULL,
-    client_id uuid NOT NULL,
-    token_hash bytea NOT NULL,
-    expires_at timestamp with time zone NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    realm text NOT NULL,
+    channel text NOT NULL,
+    template_key text NOT NULL,
+    locale text DEFAULT 'en'::text NOT NULL,
+    provider_challenge_id uuid,
+    marketplace_challenge_id uuid,
+    payload_ciphertext bytea,
+    payload_nonce bytea,
+    payload_key_version text,
+    destination_fingerprint bytea NOT NULL,
+    delivery_deadline timestamp with time zone NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    next_attempt_at timestamp with time zone DEFAULT now() NOT NULL,
+    lease_owner text DEFAULT ''::text NOT NULL,
+    lease_expires_at timestamp with time zone,
+    provider_message_id text DEFAULT ''::text NOT NULL,
+    error_code text DEFAULT ''::text NOT NULL,
+    accepted_at timestamp with time zone,
+    sent_at timestamp with time zone,
+    delivered_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    tessa_security_event_id uuid,
+    tessa_link_challenge_id uuid,
+    CONSTRAINT auth_code_delivery_jobs_attempt_count_check CHECK ((attempt_count >= 0)),
+    CONSTRAINT auth_code_delivery_jobs_attempt_limit_check CHECK (((attempt_count >= 0) AND (attempt_count <= 8))),
+    CONSTRAINT auth_code_delivery_jobs_challenge_check CHECK ((((realm = 'provider'::text) AND (provider_challenge_id IS NOT NULL) AND (marketplace_challenge_id IS NULL) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NULL)) OR ((realm = 'marketplace_customer'::text) AND (provider_challenge_id IS NULL) AND (marketplace_challenge_id IS NOT NULL) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NULL)) OR ((realm = 'provider'::text) AND (provider_challenge_id IS NULL) AND (marketplace_challenge_id IS NULL) AND (tessa_security_event_id IS NOT NULL) AND (tessa_link_challenge_id IS NULL)) OR ((realm = 'provider'::text) AND (provider_challenge_id IS NULL) AND (marketplace_challenge_id IS NULL) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NOT NULL)))),
+    CONSTRAINT auth_code_delivery_jobs_channel_check CHECK ((channel = ANY (ARRAY['email'::text, 'whatsapp'::text]))),
+    CONSTRAINT auth_code_delivery_jobs_error_code_check CHECK ((char_length(error_code) <= 100)),
+    CONSTRAINT auth_code_delivery_jobs_lease_check CHECK (((status <> 'processing'::text) OR ((btrim(lease_owner) <> ''::text) AND (lease_expires_at IS NOT NULL)))),
+    CONSTRAINT auth_code_delivery_jobs_payload_check CHECK (((octet_length(destination_fingerprint) = 32) AND (((status = ANY (ARRAY['pending'::text, 'processing'::text, 'retry'::text])) AND (payload_ciphertext IS NOT NULL) AND (octet_length(payload_ciphertext) > 0) AND (payload_nonce IS NOT NULL) AND (octet_length(payload_nonce) = 12) AND (payload_key_version IS NOT NULL) AND (btrim(payload_key_version) <> ''::text)) OR ((status = ANY (ARRAY['accepted'::text, 'sent'::text, 'delivered'::text, 'unknown'::text, 'failed'::text, 'expired'::text])) AND (payload_ciphertext IS NULL) AND (payload_nonce IS NULL) AND (payload_key_version IS NULL))))),
+    CONSTRAINT auth_code_delivery_jobs_realm_check CHECK ((realm = ANY (ARRAY['provider'::text, 'marketplace_customer'::text]))),
+    CONSTRAINT auth_code_delivery_jobs_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'retry'::text, 'accepted'::text, 'sent'::text, 'delivered'::text, 'unknown'::text, 'failed'::text, 'expired'::text]))),
+    CONSTRAINT auth_code_delivery_jobs_template_contract_check CHECK ((((channel = 'email'::text) AND (template_key = 'auth_code_email'::text) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NULL)) OR ((channel = 'whatsapp'::text) AND (template_key = 'v_c_x'::text) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NULL)) OR ((channel = 'email'::text) AND (template_key = 'tessa_security_email'::text) AND (tessa_security_event_id IS NOT NULL) AND (tessa_link_challenge_id IS NULL)) OR ((channel = 'email'::text) AND (template_key = 'tessa_link_email'::text) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NOT NULL))))
 );
 
 
 --
--- Name: auth_pending_registrations; Type: TABLE; Schema: public; Owner: -
+-- Name: auth_password_reset_grants; Type: TABLE; Schema: public; Owner: -
 --
 
-CREATE TABLE public.auth_pending_registrations (
+CREATE TABLE public.auth_password_reset_grants (
     id uuid NOT NULL,
-    full_name text NOT NULL,
-    bio text DEFAULT ''::text NOT NULL,
-    email text NOT NULL,
-    password_hash text NOT NULL,
-    cover_image_data_url text DEFAULT ''::text NOT NULL,
-    cover_image_content_type text DEFAULT ''::text NOT NULL,
-    token_hash bytea NOT NULL,
+    realm text NOT NULL,
+    provider_client_id uuid,
+    marketplace_customer_id uuid,
+    provider_challenge_id uuid,
+    marketplace_challenge_id uuid,
+    grant_hash bytea NOT NULL,
     expires_at timestamp with time zone NOT NULL,
+    consumed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    CONSTRAINT auth_password_reset_grants_hash_check CHECK ((octet_length(grant_hash) = 32)),
+    CONSTRAINT auth_password_reset_grants_realm_check CHECK ((realm = ANY (ARRAY['provider'::text, 'marketplace_customer'::text]))),
+    CONSTRAINT auth_password_reset_grants_scope_check CHECK ((((realm = 'provider'::text) AND (provider_client_id IS NOT NULL) AND (provider_challenge_id IS NOT NULL) AND (marketplace_customer_id IS NULL) AND (marketplace_challenge_id IS NULL)) OR ((realm = 'marketplace_customer'::text) AND (provider_client_id IS NULL) AND (provider_challenge_id IS NULL) AND (marketplace_customer_id IS NOT NULL) AND (marketplace_challenge_id IS NOT NULL))))
 );
 
 
@@ -1104,7 +1217,9 @@ CREATE TABLE public.auth_refresh_sessions (
     ip_address text DEFAULT ''::text NOT NULL,
     expires_at timestamp with time zone NOT NULL,
     last_used_at timestamp with time zone DEFAULT now() NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    session_revision bigint DEFAULT 1 NOT NULL,
+    CONSTRAINT auth_refresh_sessions_session_revision_check CHECK ((session_revision > 0))
 );
 
 
@@ -1621,9 +1736,28 @@ CREATE TABLE public.client_profiles (
     marketplace_category_id uuid,
     marketplace_location_visibility text DEFAULT 'approximate'::text NOT NULL,
     concurrent_booking_capacity smallint DEFAULT 1 NOT NULL,
+    customer_contact_phone text,
+    customer_contact_verified_at timestamp with time zone,
+    allow_booking_contact boolean DEFAULT false NOT NULL,
+    show_contact_on_public_profile boolean DEFAULT false NOT NULL,
+    customer_contact_revision bigint DEFAULT 1 NOT NULL,
+    public_contact_phone text GENERATED ALWAYS AS (
+CASE
+    WHEN (show_contact_on_public_profile AND (customer_contact_verified_at IS NOT NULL)) THEN customer_contact_phone
+    ELSE NULL::text
+END) STORED,
+    booking_contact_phone text GENERATED ALWAYS AS (
+CASE
+    WHEN (allow_booking_contact AND (customer_contact_verified_at IS NOT NULL)) THEN customer_contact_phone
+    ELSE NULL::text
+END) STORED,
     CONSTRAINT client_profiles_concurrent_booking_capacity_check CHECK (((concurrent_booking_capacity >= 1) AND (concurrent_booking_capacity <= 50))),
     CONSTRAINT client_profiles_market_tuple_check CHECK ((((country_code IS NULL) AND (currency_code IS NULL) AND (timezone IS NULL) AND (locale IS NULL) AND (market_configured_at IS NULL)) OR ((country_code ~ '^[A-Z]{2}$'::text) AND (currency_code ~ '^[A-Z]{3}$'::text) AND (NULLIF(btrim(timezone), ''::text) IS NOT NULL) AND (locale ~ '^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})+$'::text) AND (market_configured_at IS NOT NULL)))),
-    CONSTRAINT client_profiles_marketplace_location_visibility_check CHECK ((marketplace_location_visibility = ANY (ARRAY['approximate'::text, 'exact'::text])))
+    CONSTRAINT client_profiles_marketplace_location_visibility_check CHECK ((marketplace_location_visibility = ANY (ARRAY['approximate'::text, 'exact'::text]))),
+    CONSTRAINT customer_contact_phone_check CHECK (((customer_contact_phone IS NULL) OR (customer_contact_phone ~ '^\+[1-9][0-9]{7,14}$'::text))),
+    CONSTRAINT customer_contact_revision_check CHECK ((customer_contact_revision > 0)),
+    CONSTRAINT customer_contact_verified_check CHECK (((customer_contact_verified_at IS NULL) OR (customer_contact_phone IS NOT NULL))),
+    CONSTRAINT customer_contact_visibility_check CHECK (((NOT (allow_booking_contact OR show_contact_on_public_profile)) OR (customer_contact_verified_at IS NOT NULL)))
 );
 
 
@@ -1634,13 +1768,15 @@ CREATE TABLE public.client_profiles (
 CREATE TABLE public.clients (
     id uuid NOT NULL,
     full_name text NOT NULL,
-    email text NOT NULL,
-    password_hash text NOT NULL,
+    email text,
+    password_hash text,
     email_verified_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     bio text DEFAULT ''::text NOT NULL,
-    cover_image_url text
+    cover_image_url text,
+    security_revision bigint DEFAULT 1 NOT NULL,
+    CONSTRAINT clients_security_revision_check CHECK ((security_revision > 0))
 );
 
 
@@ -2114,16 +2250,19 @@ CREATE TABLE public.marketplace_auth_challenges (
     delivery_channel text NOT NULL,
     code_hash bytea NOT NULL,
     failed_attempts integer DEFAULT 0 NOT NULL,
-    expires_at timestamp with time zone NOT NULL,
     consumed_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     purpose text DEFAULT 'sign_in'::text NOT NULL,
     target_customer_id uuid,
-    CONSTRAINT marketplace_auth_challenges_delivery_channel_check CHECK ((delivery_channel = ANY (ARRAY['email'::text, 'sms'::text, 'whatsapp'::text]))),
+    delivery_deadline timestamp with time zone NOT NULL,
+    delivery_accepted_at timestamp with time zone,
+    verify_expires_at timestamp with time zone,
+    CONSTRAINT marketplace_auth_challenges_delivery_channel_check CHECK ((delivery_channel = ANY (ARRAY['email'::text, 'whatsapp'::text]))),
+    CONSTRAINT marketplace_auth_challenges_delivery_state_check CHECK ((((delivery_accepted_at IS NULL) AND (verify_expires_at IS NULL)) OR ((delivery_accepted_at IS NOT NULL) AND (verify_expires_at IS NOT NULL) AND (verify_expires_at > delivery_accepted_at)))),
     CONSTRAINT marketplace_auth_challenges_failed_attempts_check CHECK (((failed_attempts >= 0) AND (failed_attempts <= 6))),
-    CONSTRAINT marketplace_auth_challenges_identifier_type_check CHECK ((identifier_type = ANY (ARRAY['email'::text, 'phone'::text, 'whatsapp'::text]))),
-    CONSTRAINT marketplace_auth_challenges_purpose_check CHECK ((purpose = ANY (ARRAY['sign_in'::text, 'link_identity'::text]))),
-    CONSTRAINT marketplace_auth_challenges_target_check CHECK ((((purpose = 'sign_in'::text) AND (target_customer_id IS NULL)) OR ((purpose = 'link_identity'::text) AND (target_customer_id IS NOT NULL))))
+    CONSTRAINT marketplace_auth_challenges_identifier_type_check CHECK ((identifier_type = ANY (ARRAY['email'::text, 'phone'::text]))),
+    CONSTRAINT marketplace_auth_challenges_purpose_check CHECK ((purpose = ANY (ARRAY['sign_in'::text, 'link_identity'::text, 'password_reset'::text]))),
+    CONSTRAINT marketplace_auth_challenges_target_check CHECK ((((purpose = 'sign_in'::text) AND (target_customer_id IS NULL)) OR ((purpose = 'link_identity'::text) AND (target_customer_id IS NOT NULL)) OR (purpose = 'password_reset'::text)))
 )
 WITH (autovacuum_vacuum_scale_factor='0.05', autovacuum_analyze_scale_factor='0.02', autovacuum_vacuum_threshold='500', autovacuum_analyze_threshold='500');
 
@@ -2205,7 +2344,8 @@ CREATE TABLE public.marketplace_customer_identities (
     normalized_identifier text NOT NULL,
     verified_at timestamp with time zone NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT marketplace_customer_identities_type_check CHECK ((identifier_type = ANY (ARRAY['email'::text, 'phone'::text, 'whatsapp'::text]))),
+    CONSTRAINT marketplace_customer_identities_normalized_value_check CHECK ((((identifier_type = 'email'::text) AND (normalized_identifier = lower(btrim(normalized_identifier)))) OR ((identifier_type = 'phone'::text) AND (normalized_identifier ~ '^\+[1-9][0-9]{9,14}$'::text)))),
+    CONSTRAINT marketplace_customer_identities_type_check CHECK ((identifier_type = ANY (ARRAY['email'::text, 'phone'::text]))),
     CONSTRAINT marketplace_customer_identities_value_check CHECK ((btrim(normalized_identifier) <> ''::text))
 );
 
@@ -2219,17 +2359,15 @@ CREATE TABLE public.marketplace_customers (
     full_name text DEFAULT ''::text NOT NULL,
     email text,
     phone_e164 text,
-    whatsapp_e164 text,
     email_verified_at timestamp with time zone,
     phone_verified_at timestamp with time zone,
-    whatsapp_verified_at timestamp with time zone,
     password_hash text,
     birthday date,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     security_revision bigint DEFAULT 1 NOT NULL,
     CONSTRAINT marketplace_customers_full_name_check CHECK ((char_length(full_name) <= 160)),
-    CONSTRAINT marketplace_customers_identifier_check CHECK (((email IS NOT NULL) OR (phone_e164 IS NOT NULL) OR (whatsapp_e164 IS NOT NULL))),
+    CONSTRAINT marketplace_customers_identifier_check CHECK (((email IS NOT NULL) OR (phone_e164 IS NOT NULL))),
     CONSTRAINT marketplace_customers_security_revision_check CHECK ((security_revision > 0))
 );
 
@@ -2445,7 +2583,10 @@ CREATE TABLE public.meta_whatsapp_webhook_receipts (
     last_error_code text DEFAULT ''::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     processed_at timestamp with time zone,
+    correlation_id text DEFAULT ''::text NOT NULL,
+    processing_owner text DEFAULT 'unassigned'::text NOT NULL,
     CONSTRAINT meta_whatsapp_webhook_receipts_attempt_check CHECK (((attempt_count >= 0) AND (attempt_count <= 20))),
+    CONSTRAINT meta_whatsapp_webhook_receipts_correlation_check CHECK (((correlation_id = ''::text) OR (correlation_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'::text))),
     CONSTRAINT meta_whatsapp_webhook_receipts_dedupe_check CHECK ((dedupe_key ~ '^[a-f0-9]{64}$'::text)),
     CONSTRAINT meta_whatsapp_webhook_receipts_error_length_check CHECK (((char_length(provider_error_code) <= 80) AND (char_length(last_error_code) <= 80))),
     CONSTRAINT meta_whatsapp_webhook_receipts_kind_check CHECK ((event_kind = ANY (ARRAY['status'::text, 'inbound_message'::text]))),
@@ -2453,6 +2594,7 @@ CREATE TABLE public.meta_whatsapp_webhook_receipts (
     CONSTRAINT meta_whatsapp_webhook_receipts_phone_check CHECK ((phone_number_id ~ '^[0-9]{1,32}$'::text)),
     CONSTRAINT meta_whatsapp_webhook_receipts_processed_check CHECK ((((processing_status = ANY (ARRAY['completed'::text, 'dead_letter'::text])) AND (processed_at IS NOT NULL)) OR ((processing_status <> ALL (ARRAY['completed'::text, 'dead_letter'::text])) AND (processed_at IS NULL)))),
     CONSTRAINT meta_whatsapp_webhook_receipts_processing_check CHECK ((processing_status = ANY (ARRAY['pending'::text, 'processing'::text, 'retry'::text, 'completed'::text, 'dead_letter'::text]))),
+    CONSTRAINT meta_whatsapp_webhook_receipts_processing_owner_check CHECK ((processing_owner = ANY (ARRAY['unassigned'::text, 'auth'::text, 'notification'::text, 'tessa'::text, 'quarantined'::text]))),
     CONSTRAINT meta_whatsapp_webhook_receipts_status_length_check CHECK ((char_length(message_status) <= 40)),
     CONSTRAINT meta_whatsapp_webhook_receipts_waba_check CHECK ((waba_id ~ '^[0-9]{1,32}$'::text)),
     CONSTRAINT meta_whatsapp_webhook_receipts_wamid_check CHECK (((char_length(wamid) >= 1) AND (char_length(wamid) <= 512)))
@@ -2550,10 +2692,12 @@ CREATE TABLE public.notification_event_jobs (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     completed_at timestamp with time zone,
+    origin text DEFAULT 'live'::text NOT NULL,
     CONSTRAINT notification_event_jobs_attempt_check CHECK (((attempt_count >= 0) AND (attempt_count <= 20))),
     CONSTRAINT notification_event_jobs_completion_check CHECK ((((status = ANY (ARRAY['completed'::text, 'dead_letter'::text])) AND (completed_at IS NOT NULL)) OR ((status <> ALL (ARRAY['completed'::text, 'dead_letter'::text])) AND (completed_at IS NULL)))),
     CONSTRAINT notification_event_jobs_error_check CHECK ((char_length(last_error_code) <= 80)),
     CONSTRAINT notification_event_jobs_lease_check CHECK ((((status = 'processing'::text) AND (btrim(lease_owner) <> ''::text) AND (lease_expires_at IS NOT NULL)) OR ((status <> 'processing'::text) AND (lease_owner = ''::text) AND (lease_expires_at IS NULL)))),
+    CONSTRAINT notification_event_jobs_origin_check CHECK ((origin = ANY (ARRAY['live'::text, 'backfill'::text]))),
     CONSTRAINT notification_event_jobs_sequence_check CHECK ((event_sequence > 0)),
     CONSTRAINT notification_event_jobs_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'retry'::text, 'completed'::text, 'dead_letter'::text])))
 );
@@ -2964,6 +3108,51 @@ CREATE TABLE public.promotions (
 
 
 --
+-- Name: provider_auth_challenges; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.provider_auth_challenges (
+    id uuid NOT NULL,
+    identifier_type text NOT NULL,
+    identifier text NOT NULL,
+    delivery_channel text NOT NULL,
+    purpose text NOT NULL,
+    target_client_id uuid,
+    code_hash bytea NOT NULL,
+    failed_attempts integer DEFAULT 0 NOT NULL,
+    delivery_deadline timestamp with time zone NOT NULL,
+    delivery_accepted_at timestamp with time zone,
+    verify_expires_at timestamp with time zone,
+    consumed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT provider_auth_challenges_delivery_channel_check CHECK ((delivery_channel = ANY (ARRAY['email'::text, 'whatsapp'::text]))),
+    CONSTRAINT provider_auth_challenges_delivery_state_check CHECK ((((delivery_accepted_at IS NULL) AND (verify_expires_at IS NULL)) OR ((delivery_accepted_at IS NOT NULL) AND (verify_expires_at IS NOT NULL) AND (verify_expires_at > delivery_accepted_at)))),
+    CONSTRAINT provider_auth_challenges_failed_attempts_check CHECK (((failed_attempts >= 0) AND (failed_attempts <= 6))),
+    CONSTRAINT provider_auth_challenges_identifier_type_check CHECK ((identifier_type = ANY (ARRAY['email'::text, 'phone'::text]))),
+    CONSTRAINT provider_auth_challenges_purpose_check CHECK ((purpose = ANY (ARRAY['sign_in'::text, 'link_identity'::text, 'password_reset'::text]))),
+    CONSTRAINT provider_auth_challenges_target_check CHECK ((((purpose = 'sign_in'::text) AND (target_client_id IS NULL)) OR ((purpose = 'link_identity'::text) AND (target_client_id IS NOT NULL)) OR (purpose = 'password_reset'::text)))
+);
+
+
+--
+-- Name: provider_auth_identities; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.provider_auth_identities (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    client_id uuid NOT NULL,
+    identity_type text NOT NULL,
+    normalized_identifier text NOT NULL,
+    verified_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT provider_auth_identities_normalized_value_check CHECK ((((identity_type = 'email'::text) AND (normalized_identifier = lower(btrim(normalized_identifier)))) OR ((identity_type = 'phone'::text) AND (normalized_identifier ~ '^\+[1-9][0-9]{9,14}$'::text)))),
+    CONSTRAINT provider_auth_identities_type_check CHECK ((identity_type = ANY (ARRAY['email'::text, 'phone'::text]))),
+    CONSTRAINT provider_auth_identities_value_check CHECK ((btrim(normalized_identifier) <> ''::text))
+);
+
+
+--
 -- Name: provider_availability_windows; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2976,6 +3165,28 @@ CREATE TABLE public.provider_availability_windows (
     slot_interval_minutes integer DEFAULT 30 NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT provider_availability_windows_day_of_week_check CHECK (((day_of_week >= 0) AND (day_of_week <= 6)))
+);
+
+
+--
+-- Name: provider_customer_contact_challenges; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.provider_customer_contact_challenges (
+    id uuid NOT NULL,
+    client_id uuid NOT NULL,
+    token_hash bytea NOT NULL,
+    destination_hmac bytea NOT NULL,
+    contact_revision bigint NOT NULL,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    consumed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT provider_customer_contact_challenges_attempt_count_check CHECK (((attempt_count >= 0) AND (attempt_count <= 5))),
+    CONSTRAINT provider_customer_contact_challenges_check CHECK ((expires_at > created_at)),
+    CONSTRAINT provider_customer_contact_challenges_contact_revision_check CHECK ((contact_revision > 0)),
+    CONSTRAINT provider_customer_contact_challenges_destination_hmac_check CHECK ((octet_length(destination_hmac) = 32)),
+    CONSTRAINT provider_customer_contact_challenges_token_hash_check CHECK ((octet_length(token_hash) = 32))
 );
 
 
@@ -3390,8 +3601,8 @@ CREATE TABLE public.tessa_events (
     payload jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT tessa_events_payload_check CHECK (((jsonb_typeof(payload) = 'object'::text) AND (octet_length((payload)::text) <= 4096))),
-    CONSTRAINT tessa_events_reference_check CHECK ((((event_type = 'thread.created'::text) AND (message_id IS NULL) AND (run_id IS NULL)) OR ((event_type = 'message.created'::text) AND (message_id IS NOT NULL)) OR ((event_type ~~ 'run.%'::text) AND (run_id IS NOT NULL)))),
-    CONSTRAINT tessa_events_type_check CHECK ((event_type = ANY (ARRAY['thread.created'::text, 'message.created'::text, 'run.started'::text, 'run.stage_changed'::text, 'run.completed'::text, 'run.failed'::text, 'run.cancelled'::text])))
+    CONSTRAINT tessa_events_reference_check CHECK ((((event_type = 'thread.created'::text) AND (message_id IS NULL) AND (run_id IS NULL)) OR ((event_type = ANY (ARRAY['message.created'::text, 'message.delivery_changed'::text])) AND (message_id IS NOT NULL)) OR ((event_type ~~ 'run.%'::text) AND (run_id IS NOT NULL)))),
+    CONSTRAINT tessa_events_type_check CHECK ((event_type = ANY (ARRAY['thread.created'::text, 'message.created'::text, 'message.delivery_changed'::text, 'run.started'::text, 'run.stage_changed'::text, 'run.completed'::text, 'run.failed'::text, 'run.cancelled'::text])))
 )
 WITH (autovacuum_vacuum_scale_factor='0.02', autovacuum_analyze_scale_factor='0.01', autovacuum_vacuum_threshold='1000', autovacuum_analyze_threshold='1000');
 
@@ -3428,7 +3639,7 @@ CREATE TABLE public.tessa_messages (
     entity_references jsonb DEFAULT '[]'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     run_id uuid,
-    CONSTRAINT tessa_messages_channel_check CHECK ((source_channel = 'web'::text)),
+    CONSTRAINT tessa_messages_channel_check CHECK ((source_channel = ANY (ARRAY['web'::text, 'whatsapp'::text]))),
     CONSTRAINT tessa_messages_content_check CHECK (((btrim(content) <> ''::text) AND (char_length(content) <= 4000))),
     CONSTRAINT tessa_messages_idempotency_check CHECK ((((sender_type = 'provider'::text) AND (client_message_id IS NOT NULL) AND (request_fingerprint ~ '^[a-f0-9]{64}$'::text)) OR ((sender_type <> 'provider'::text) AND (client_message_id IS NULL) AND (request_fingerprint IS NULL)))),
     CONSTRAINT tessa_messages_presentation_check CHECK (((jsonb_typeof(presentation) = 'object'::text) AND (jsonb_typeof(entity_references) = 'array'::text) AND (octet_length((presentation)::text) <= 4096) AND (octet_length((entity_references)::text) <= 8192))),
@@ -3558,6 +3769,282 @@ CREATE TABLE public.tessa_threads (
 
 
 --
+-- Name: tessa_whatsapp_connections; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tessa_whatsapp_connections (
+    client_id uuid NOT NULL,
+    phone_number_id text NOT NULL,
+    destination text NOT NULL,
+    status text NOT NULL,
+    revision bigint DEFAULT 1 NOT NULL,
+    security_revision bigint NOT NULL,
+    notice_revision text NOT NULL,
+    linked_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_active_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    revoked_at timestamp with time zone,
+    CONSTRAINT tessa_whatsapp_connections_destination_check CHECK ((destination ~ '^\+[1-9][0-9]{7,14}$'::text)),
+    CONSTRAINT tessa_whatsapp_connections_status_check CHECK ((status = ANY (ARRAY['active'::text, 'revoked'::text])))
+);
+
+
+--
+-- Name: tessa_whatsapp_email_challenges; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tessa_whatsapp_email_challenges (
+    id uuid NOT NULL,
+    source_receipt_id uuid NOT NULL,
+    client_id uuid NOT NULL,
+    purpose text DEFAULT 'tessa_whatsapp_link'::text NOT NULL,
+    phone_number_id text NOT NULL,
+    destination text NOT NULL,
+    security_revision bigint NOT NULL,
+    notice_revision text NOT NULL,
+    code_hash bytea NOT NULL,
+    failed_attempts integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone DEFAULT (now() + '00:10:00'::interval) NOT NULL,
+    delivery_accepted_at timestamp with time zone,
+    consumed_at timestamp with time zone,
+    CONSTRAINT tessa_whatsapp_email_challenges_code_hash_check CHECK ((octet_length(code_hash) = 32)),
+    CONSTRAINT tessa_whatsapp_email_challenges_destination_check CHECK ((destination ~ '^\+[1-9][0-9]{7,14}$'::text)),
+    CONSTRAINT tessa_whatsapp_email_challenges_failed_attempts_check CHECK (((failed_attempts >= 0) AND (failed_attempts <= 5))),
+    CONSTRAINT tessa_whatsapp_email_challenges_phone_number_id_check CHECK ((phone_number_id ~ '^[0-9]{1,32}$'::text)),
+    CONSTRAINT tessa_whatsapp_email_challenges_purpose_check CHECK ((purpose = 'tessa_whatsapp_link'::text))
+);
+
+
+--
+-- Name: tessa_whatsapp_ingress; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tessa_whatsapp_ingress (
+    id uuid NOT NULL,
+    sequence bigint NOT NULL,
+    source_receipt_id uuid NOT NULL,
+    client_id uuid NOT NULL,
+    thread_id uuid,
+    phone_number_id text NOT NULL,
+    destination text NOT NULL,
+    connection_revision bigint NOT NULL,
+    security_revision bigint NOT NULL,
+    source_message_id text NOT NULL,
+    source_timestamp timestamp with time zone NOT NULL,
+    content text,
+    status text NOT NULL,
+    reason text DEFAULT ''::text NOT NULL,
+    message_id uuid,
+    run_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone DEFAULT (now() + '00:05:00'::interval) NOT NULL,
+    completed_at timestamp with time zone,
+    CONSTRAINT tessa_whatsapp_ingress_check CHECK ((((status = 'pending'::text) AND (content IS NOT NULL) AND (btrim(content) <> ''::text) AND (char_length(content) <= 4000) AND (thread_id IS NOT NULL) AND (completed_at IS NULL)) OR ((status <> 'pending'::text) AND (content IS NULL) AND (completed_at IS NOT NULL)))),
+    CONSTRAINT tessa_whatsapp_ingress_check1 CHECK ((((status = 'admitted'::text) AND (message_id IS NOT NULL) AND (run_id IS NOT NULL)) OR ((status <> 'admitted'::text) AND (message_id IS NULL) AND (run_id IS NULL)))),
+    CONSTRAINT tessa_whatsapp_ingress_source_message_id_check CHECK (((char_length(source_message_id) >= 1) AND (char_length(source_message_id) <= 512))),
+    CONSTRAINT tessa_whatsapp_ingress_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'admitted'::text, 'rejected'::text, 'expired'::text, 'cancelled'::text])))
+);
+
+
+--
+-- Name: tessa_whatsapp_ingress_sequence_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+ALTER TABLE public.tessa_whatsapp_ingress ALTER COLUMN sequence ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.tessa_whatsapp_ingress_sequence_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+--
+-- Name: tessa_whatsapp_link_challenges; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tessa_whatsapp_link_challenges (
+    id uuid NOT NULL,
+    client_id uuid NOT NULL,
+    token_hash bytea NOT NULL,
+    phone_number_id text NOT NULL,
+    destination text NOT NULL,
+    security_revision bigint NOT NULL,
+    notice_revision text NOT NULL,
+    attempts integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    consumed_at timestamp with time zone,
+    CONSTRAINT tessa_whatsapp_link_challenges_attempts_check CHECK (((attempts >= 0) AND (attempts <= 5))),
+    CONSTRAINT tessa_whatsapp_link_challenges_token_hash_check CHECK ((octet_length(token_hash) = 32))
+);
+
+
+--
+-- Name: tessa_whatsapp_onboarding; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tessa_whatsapp_onboarding (
+    id uuid NOT NULL,
+    phone_number_id text NOT NULL,
+    destination text NOT NULL,
+    stage text NOT NULL,
+    revision bigint DEFAULT 1 NOT NULL,
+    client_id uuid,
+    challenge_id uuid,
+    notice_revision text DEFAULT ''::text NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    last_inbound_at timestamp with time zone NOT NULL,
+    last_reply_at timestamp with time zone DEFAULT now() NOT NULL,
+    reply_window_started_at timestamp with time zone DEFAULT now() NOT NULL,
+    reply_count integer DEFAULT 1 NOT NULL,
+    CONSTRAINT tessa_whatsapp_onboarding_destination_check CHECK ((destination ~ '^\+[1-9][0-9]{7,14}$'::text)),
+    CONSTRAINT tessa_whatsapp_onboarding_phone_number_id_check CHECK ((phone_number_id ~ '^[0-9]{1,32}$'::text)),
+    CONSTRAINT tessa_whatsapp_onboarding_reply_count_check CHECK (((reply_count >= 0) AND (reply_count <= 30))),
+    CONSTRAINT tessa_whatsapp_onboarding_stage_check CHECK ((stage = ANY (ARRAY['menu'::text, 'consent'::text, 'email'::text, 'code'::text, 'closed'::text])))
+);
+
+
+--
+-- Name: tessa_whatsapp_outbox; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tessa_whatsapp_outbox (
+    id uuid NOT NULL,
+    source_receipt_id uuid NOT NULL,
+    challenge_id uuid,
+    client_id uuid,
+    phone_number_id text NOT NULL,
+    destination text NOT NULL,
+    connection_revision bigint NOT NULL,
+    security_revision bigint NOT NULL,
+    kind text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    window_expires_at timestamp with time zone NOT NULL,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    available_at timestamp with time zone DEFAULT now() NOT NULL,
+    lease_token uuid,
+    lease_expires_at timestamp with time zone,
+    provider_message_id text DEFAULT ''::text NOT NULL,
+    status_at timestamp with time zone,
+    reconcile_after timestamp with time zone,
+    last_error_code text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    completed_at timestamp with time zone,
+    onboarding_id uuid,
+    onboarding_revision bigint,
+    assistant_message_id uuid,
+    thread_id uuid,
+    core_notice_revision text,
+    accepted_at timestamp with time zone,
+    sent_at timestamp with time zone,
+    delivered_at timestamp with time zone,
+    read_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT tessa_whatsapp_outbox_answer_check CHECK ((((kind = 'answer'::text) AND (assistant_message_id IS NOT NULL) AND (thread_id IS NOT NULL) AND (core_notice_revision IS NOT NULL) AND (btrim(core_notice_revision) <> ''::text)) OR ((kind <> 'answer'::text) AND (assistant_message_id IS NULL) AND (thread_id IS NULL) AND (core_notice_revision IS NULL)))),
+    CONSTRAINT tessa_whatsapp_outbox_kind_check CHECK ((((kind = ANY (ARRAY['answer'::text, 'linked'::text, 'disconnected'::text, 'mismatch'::text, 'unavailable'::text, 'queue_busy'::text, 'queue_expired'::text, 'queue_unavailable'::text])) AND (client_id IS NOT NULL) AND (onboarding_id IS NULL) AND (onboarding_revision IS NULL)) OR ((kind = ANY (ARRAY['onboarding_menu'::text, 'onboarding_consent'::text, 'onboarding_email'::text, 'onboarding_code'::text, 'onboarding_invalid'::text, 'onboarding_signup'::text, 'onboarding_failed'::text])) AND (client_id IS NULL) AND (onboarding_id IS NOT NULL) AND (onboarding_revision IS NOT NULL) AND (challenge_id IS NULL) AND (connection_revision = 0) AND (security_revision = 0)))),
+    CONSTRAINT tessa_whatsapp_outbox_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'dispatching'::text, 'retry'::text, 'accepted'::text, 'sent'::text, 'delivered'::text, 'read'::text, 'failed'::text, 'cancelled'::text, 'expired'::text, 'unknown'::text, 'manual_review'::text])))
+);
+
+
+--
+-- Name: tessa_whatsapp_security_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.tessa_whatsapp_security_events (
+    id uuid NOT NULL,
+    client_id uuid NOT NULL,
+    connection_revision bigint NOT NULL,
+    kind text NOT NULL,
+    destination text NOT NULL,
+    recipient_email text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    email_deadline timestamp with time zone DEFAULT (now() + '24:00:00'::interval) NOT NULL,
+    email_queued_at timestamp with time zone,
+    email_accepted_at timestamp with time zone,
+    skip_reason text DEFAULT ''::text NOT NULL,
+    CONSTRAINT tessa_whatsapp_security_events_destination_check CHECK ((destination ~ '^\+[1-9][0-9]{7,14}$'::text)),
+    CONSTRAINT tessa_whatsapp_security_events_kind_check CHECK ((kind = ANY (ARRAY['linked'::text, 'replaced'::text, 'disconnected'::text]))),
+    CONSTRAINT tessa_whatsapp_security_events_recipient_email_check CHECK ((char_length(recipient_email) <= 320)),
+    CONSTRAINT tessa_whatsapp_security_events_skip_reason_check CHECK ((skip_reason = ANY (ARRAY[''::text, 'no_verified_email'::text, 'expired'::text, 'invalid_recipient'::text])))
+);
+
+
+--
+-- Name: welcome_email_jobs; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.welcome_email_jobs (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    idempotency_key text NOT NULL,
+    audience text NOT NULL,
+    provider_client_id uuid,
+    marketplace_customer_id uuid,
+    template_id uuid NOT NULL,
+    template_version integer NOT NULL,
+    recipient_email text NOT NULL,
+    recipient_name text DEFAULT ''::text NOT NULL,
+    subject text NOT NULL,
+    html_body text NOT NULL,
+    text_body text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    attempt_count integer DEFAULT 0 NOT NULL,
+    next_attempt_at timestamp with time zone DEFAULT now() NOT NULL,
+    lease_owner text DEFAULT ''::text NOT NULL,
+    lease_expires_at timestamp with time zone,
+    last_error_code text DEFAULT ''::text NOT NULL,
+    accepted_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT welcome_email_jobs_attempt_count_check CHECK (((attempt_count >= 0) AND (attempt_count <= 8))),
+    CONSTRAINT welcome_email_jobs_audience_check CHECK ((audience = ANY (ARRAY['provider'::text, 'marketplace_customer'::text]))),
+    CONSTRAINT welcome_email_jobs_check CHECK ((((audience = 'provider'::text) AND (provider_client_id IS NOT NULL) AND (marketplace_customer_id IS NULL)) OR ((audience = 'marketplace_customer'::text) AND (provider_client_id IS NULL) AND (marketplace_customer_id IS NOT NULL)))),
+    CONSTRAINT welcome_email_jobs_check1 CHECK ((((status = 'processing'::text) AND (lease_owner <> ''::text) AND (lease_expires_at IS NOT NULL)) OR (status <> 'processing'::text))),
+    CONSTRAINT welcome_email_jobs_check2 CHECK ((((status = 'accepted'::text) AND (accepted_at IS NOT NULL) AND (completed_at IS NOT NULL)) OR (status <> 'accepted'::text))),
+    CONSTRAINT welcome_email_jobs_check3 CHECK ((((status = 'failed'::text) AND (completed_at IS NOT NULL)) OR (status <> 'failed'::text))),
+    CONSTRAINT welcome_email_jobs_html_body_check CHECK (((char_length(html_body) >= 1) AND (char_length(html_body) <= 200000))),
+    CONSTRAINT welcome_email_jobs_idempotency_key_check CHECK (((char_length(idempotency_key) >= 1) AND (char_length(idempotency_key) <= 200))),
+    CONSTRAINT welcome_email_jobs_last_error_code_check CHECK ((char_length(last_error_code) <= 100)),
+    CONSTRAINT welcome_email_jobs_recipient_email_check CHECK (((char_length(recipient_email) >= 3) AND (char_length(recipient_email) <= 320))),
+    CONSTRAINT welcome_email_jobs_recipient_name_check CHECK ((char_length(recipient_name) <= 200)),
+    CONSTRAINT welcome_email_jobs_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'retry'::text, 'accepted'::text, 'failed'::text, 'manual_review'::text]))),
+    CONSTRAINT welcome_email_jobs_subject_check CHECK (((char_length(subject) >= 1) AND (char_length(subject) <= 300))),
+    CONSTRAINT welcome_email_jobs_template_version_check CHECK ((template_version > 0)),
+    CONSTRAINT welcome_email_jobs_text_body_check CHECK (((char_length(text_body) >= 1) AND (char_length(text_body) <= 100000)))
+);
+
+
+--
+-- Name: welcome_email_templates; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.welcome_email_templates (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    audience text NOT NULL,
+    version integer NOT NULL,
+    name text NOT NULL,
+    subject_template text NOT NULL,
+    html_template text NOT NULL,
+    text_template text NOT NULL,
+    status text DEFAULT 'draft'::text NOT NULL,
+    activated_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT welcome_email_templates_audience_check CHECK ((audience = ANY (ARRAY['provider'::text, 'marketplace_customer'::text]))),
+    CONSTRAINT welcome_email_templates_check CHECK ((((status = 'active'::text) AND (activated_at IS NOT NULL)) OR (status <> 'active'::text))),
+    CONSTRAINT welcome_email_templates_html_template_check CHECK (((char_length(html_template) >= 1) AND (char_length(html_template) <= 200000))),
+    CONSTRAINT welcome_email_templates_name_check CHECK (((char_length(btrim(name)) >= 1) AND (char_length(btrim(name)) <= 120))),
+    CONSTRAINT welcome_email_templates_status_check CHECK ((status = ANY (ARRAY['draft'::text, 'active'::text, 'archived'::text]))),
+    CONSTRAINT welcome_email_templates_subject_template_check CHECK (((char_length(subject_template) >= 1) AND (char_length(subject_template) <= 300))),
+    CONSTRAINT welcome_email_templates_text_template_check CHECK (((char_length(text_template) >= 1) AND (char_length(text_template) <= 100000))),
+    CONSTRAINT welcome_email_templates_version_check CHECK ((version > 0))
+);
+
+
+--
 -- Name: administrative_regions administrative_regions_country_code_code_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3678,35 +4165,75 @@ ALTER TABLE ONLY public.agreement_template_versions
 
 
 --
--- Name: auth_password_reset_tokens auth_password_reset_tokens_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: auth_code_delivery_jobs auth_code_delivery_jobs_marketplace_challenge_unique; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.auth_password_reset_tokens
-    ADD CONSTRAINT auth_password_reset_tokens_pkey PRIMARY KEY (id);
-
-
---
--- Name: auth_password_reset_tokens auth_password_reset_tokens_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.auth_password_reset_tokens
-    ADD CONSTRAINT auth_password_reset_tokens_token_hash_key UNIQUE (token_hash);
+ALTER TABLE ONLY public.auth_code_delivery_jobs
+    ADD CONSTRAINT auth_code_delivery_jobs_marketplace_challenge_unique UNIQUE (marketplace_challenge_id);
 
 
 --
--- Name: auth_pending_registrations auth_pending_registrations_email_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: auth_code_delivery_jobs auth_code_delivery_jobs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.auth_pending_registrations
-    ADD CONSTRAINT auth_pending_registrations_email_key UNIQUE (email);
+ALTER TABLE ONLY public.auth_code_delivery_jobs
+    ADD CONSTRAINT auth_code_delivery_jobs_pkey PRIMARY KEY (id);
 
 
 --
--- Name: auth_pending_registrations auth_pending_registrations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: auth_code_delivery_jobs auth_code_delivery_jobs_provider_challenge_unique; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.auth_pending_registrations
-    ADD CONSTRAINT auth_pending_registrations_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.auth_code_delivery_jobs
+    ADD CONSTRAINT auth_code_delivery_jobs_provider_challenge_unique UNIQUE (provider_challenge_id);
+
+
+--
+-- Name: auth_code_delivery_jobs auth_code_delivery_jobs_tessa_link_challenge_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_code_delivery_jobs
+    ADD CONSTRAINT auth_code_delivery_jobs_tessa_link_challenge_id_key UNIQUE (tessa_link_challenge_id);
+
+
+--
+-- Name: auth_code_delivery_jobs auth_code_delivery_jobs_tessa_security_event_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_code_delivery_jobs
+    ADD CONSTRAINT auth_code_delivery_jobs_tessa_security_event_id_key UNIQUE (tessa_security_event_id);
+
+
+--
+-- Name: auth_password_reset_grants auth_password_reset_grants_grant_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_password_reset_grants
+    ADD CONSTRAINT auth_password_reset_grants_grant_hash_key UNIQUE (grant_hash);
+
+
+--
+-- Name: auth_password_reset_grants auth_password_reset_grants_marketplace_challenge_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_password_reset_grants
+    ADD CONSTRAINT auth_password_reset_grants_marketplace_challenge_unique UNIQUE (marketplace_challenge_id);
+
+
+--
+-- Name: auth_password_reset_grants auth_password_reset_grants_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_password_reset_grants
+    ADD CONSTRAINT auth_password_reset_grants_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: auth_password_reset_grants auth_password_reset_grants_provider_challenge_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_password_reset_grants
+    ADD CONSTRAINT auth_password_reset_grants_provider_challenge_unique UNIQUE (provider_challenge_id);
 
 
 --
@@ -4574,11 +5101,59 @@ ALTER TABLE ONLY public.promotions
 
 
 --
+-- Name: provider_auth_challenges provider_auth_challenges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_auth_challenges
+    ADD CONSTRAINT provider_auth_challenges_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: provider_auth_identities provider_auth_identities_client_type_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_auth_identities
+    ADD CONSTRAINT provider_auth_identities_client_type_unique UNIQUE (client_id, identity_type);
+
+
+--
+-- Name: provider_auth_identities provider_auth_identities_owner_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_auth_identities
+    ADD CONSTRAINT provider_auth_identities_owner_unique UNIQUE (identity_type, normalized_identifier);
+
+
+--
+-- Name: provider_auth_identities provider_auth_identities_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_auth_identities
+    ADD CONSTRAINT provider_auth_identities_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: provider_availability_windows provider_availability_windows_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.provider_availability_windows
     ADD CONSTRAINT provider_availability_windows_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: provider_customer_contact_challenges provider_customer_contact_challenges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_customer_contact_challenges
+    ADD CONSTRAINT provider_customer_contact_challenges_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: provider_customer_contact_challenges provider_customer_contact_challenges_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_customer_contact_challenges
+    ADD CONSTRAINT provider_customer_contact_challenges_token_hash_key UNIQUE (token_hash);
 
 
 --
@@ -4878,6 +5453,142 @@ ALTER TABLE ONLY public.tessa_threads
 
 
 --
+-- Name: tessa_whatsapp_connections tessa_whatsapp_connections_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_connections
+    ADD CONSTRAINT tessa_whatsapp_connections_pkey PRIMARY KEY (client_id);
+
+
+--
+-- Name: tessa_whatsapp_email_challenges tessa_whatsapp_email_challenges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_email_challenges
+    ADD CONSTRAINT tessa_whatsapp_email_challenges_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tessa_whatsapp_email_challenges tessa_whatsapp_email_challenges_source_receipt_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_email_challenges
+    ADD CONSTRAINT tessa_whatsapp_email_challenges_source_receipt_id_key UNIQUE (source_receipt_id);
+
+
+--
+-- Name: tessa_whatsapp_ingress tessa_whatsapp_ingress_phone_number_id_source_message_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_ingress
+    ADD CONSTRAINT tessa_whatsapp_ingress_phone_number_id_source_message_id_key UNIQUE (phone_number_id, source_message_id);
+
+
+--
+-- Name: tessa_whatsapp_ingress tessa_whatsapp_ingress_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_ingress
+    ADD CONSTRAINT tessa_whatsapp_ingress_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tessa_whatsapp_ingress tessa_whatsapp_ingress_run_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_ingress
+    ADD CONSTRAINT tessa_whatsapp_ingress_run_id_key UNIQUE (run_id);
+
+
+--
+-- Name: tessa_whatsapp_ingress tessa_whatsapp_ingress_sequence_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_ingress
+    ADD CONSTRAINT tessa_whatsapp_ingress_sequence_key UNIQUE (sequence);
+
+
+--
+-- Name: tessa_whatsapp_ingress tessa_whatsapp_ingress_source_receipt_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_ingress
+    ADD CONSTRAINT tessa_whatsapp_ingress_source_receipt_id_key UNIQUE (source_receipt_id);
+
+
+--
+-- Name: tessa_whatsapp_link_challenges tessa_whatsapp_link_challenges_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_link_challenges
+    ADD CONSTRAINT tessa_whatsapp_link_challenges_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tessa_whatsapp_link_challenges tessa_whatsapp_link_challenges_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_link_challenges
+    ADD CONSTRAINT tessa_whatsapp_link_challenges_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: tessa_whatsapp_onboarding tessa_whatsapp_onboarding_phone_number_id_destination_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_onboarding
+    ADD CONSTRAINT tessa_whatsapp_onboarding_phone_number_id_destination_key UNIQUE (phone_number_id, destination);
+
+
+--
+-- Name: tessa_whatsapp_onboarding tessa_whatsapp_onboarding_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_onboarding
+    ADD CONSTRAINT tessa_whatsapp_onboarding_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tessa_whatsapp_outbox tessa_whatsapp_outbox_assistant_message_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_outbox
+    ADD CONSTRAINT tessa_whatsapp_outbox_assistant_message_id_key UNIQUE (assistant_message_id);
+
+
+--
+-- Name: tessa_whatsapp_outbox tessa_whatsapp_outbox_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_outbox
+    ADD CONSTRAINT tessa_whatsapp_outbox_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: tessa_whatsapp_outbox tessa_whatsapp_outbox_source_receipt_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_outbox
+    ADD CONSTRAINT tessa_whatsapp_outbox_source_receipt_id_key UNIQUE (source_receipt_id);
+
+
+--
+-- Name: tessa_whatsapp_security_events tessa_whatsapp_security_event_client_id_connection_revision_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_security_events
+    ADD CONSTRAINT tessa_whatsapp_security_event_client_id_connection_revision_key UNIQUE (client_id, connection_revision, kind);
+
+
+--
+-- Name: tessa_whatsapp_security_events tessa_whatsapp_security_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_security_events
+    ADD CONSTRAINT tessa_whatsapp_security_events_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: clients users_email_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4891,6 +5602,38 @@ ALTER TABLE ONLY public.clients
 
 ALTER TABLE ONLY public.clients
     ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: welcome_email_jobs welcome_email_jobs_idempotency_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.welcome_email_jobs
+    ADD CONSTRAINT welcome_email_jobs_idempotency_key_key UNIQUE (idempotency_key);
+
+
+--
+-- Name: welcome_email_jobs welcome_email_jobs_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.welcome_email_jobs
+    ADD CONSTRAINT welcome_email_jobs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: welcome_email_templates welcome_email_templates_audience_version_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.welcome_email_templates
+    ADD CONSTRAINT welcome_email_templates_audience_version_key UNIQUE (audience, version);
+
+
+--
+-- Name: welcome_email_templates welcome_email_templates_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.welcome_email_templates
+    ADD CONSTRAINT welcome_email_templates_pkey PRIMARY KEY (id);
 
 
 --
@@ -5027,24 +5770,49 @@ CREATE UNIQUE INDEX agreement_template_versions_one_draft_idx ON public.agreemen
 
 
 --
--- Name: auth_password_reset_tokens_expires_at_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: auth_code_delivery_jobs_claim_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX auth_password_reset_tokens_expires_at_idx ON public.auth_password_reset_tokens USING btree (expires_at);
-
-
---
--- Name: auth_password_reset_tokens_user_id_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX auth_password_reset_tokens_user_id_idx ON public.auth_password_reset_tokens USING btree (client_id);
+CREATE INDEX auth_code_delivery_jobs_claim_idx ON public.auth_code_delivery_jobs USING btree (next_attempt_at, created_at) WHERE (status = ANY (ARRAY['pending'::text, 'retry'::text]));
 
 
 --
--- Name: auth_pending_registrations_expires_at_idx; Type: INDEX; Schema: public; Owner: -
+-- Name: auth_code_delivery_jobs_deadline_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX auth_pending_registrations_expires_at_idx ON public.auth_pending_registrations USING btree (expires_at);
+CREATE INDEX auth_code_delivery_jobs_deadline_idx ON public.auth_code_delivery_jobs USING btree (delivery_deadline) WHERE (status = ANY (ARRAY['pending'::text, 'processing'::text, 'retry'::text, 'unknown'::text]));
+
+
+--
+-- Name: auth_code_delivery_jobs_lease_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX auth_code_delivery_jobs_lease_idx ON public.auth_code_delivery_jobs USING btree (lease_expires_at) WHERE (status = 'processing'::text);
+
+
+--
+-- Name: auth_code_delivery_jobs_whatsapp_message_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX auth_code_delivery_jobs_whatsapp_message_idx ON public.auth_code_delivery_jobs USING btree (provider_message_id) WHERE ((channel = 'whatsapp'::text) AND (provider_message_id <> ''::text));
+
+
+--
+-- Name: auth_email_delivery_priority_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX auth_email_delivery_priority_idx ON public.auth_code_delivery_jobs USING btree (channel, (
+CASE
+    WHEN (template_key = 'tessa_security_email'::text) THEN 1
+    ELSE 0
+END), next_attempt_at, created_at, id) WHERE (status = ANY (ARRAY['pending'::text, 'retry'::text]));
+
+
+--
+-- Name: auth_password_reset_grants_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX auth_password_reset_grants_expiry_idx ON public.auth_password_reset_grants USING btree (expires_at) WHERE (consumed_at IS NULL);
 
 
 --
@@ -5087,6 +5855,13 @@ CREATE INDEX booking_change_quotes_booking_idx ON public.booking_change_quotes U
 --
 
 CREATE INDEX booking_change_quotes_expired_unconsumed_idx ON public.booking_change_quotes USING btree (expires_at, id) WHERE (consumed_at IS NULL);
+
+
+--
+-- Name: booking_domain_events_booking_sequence_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX booking_domain_events_booking_sequence_idx ON public.booking_domain_events USING btree (booking_id, sequence DESC) INCLUDE (id);
 
 
 --
@@ -5608,20 +6383,6 @@ CREATE INDEX inbox_participant_states_actor_archive_idx ON public.inbox_particip
 
 
 --
--- Name: marketplace_auth_challenges_cleanup_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX marketplace_auth_challenges_cleanup_idx ON public.marketplace_auth_challenges USING btree (expires_at, id);
-
-
---
--- Name: marketplace_auth_challenges_expiry_idx; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX marketplace_auth_challenges_expiry_idx ON public.marketplace_auth_challenges USING btree (expires_at) WHERE (consumed_at IS NULL);
-
-
---
 -- Name: marketplace_auth_challenges_identifier_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5671,13 +6432,6 @@ CREATE INDEX marketplace_customer_identities_customer_idx ON public.marketplace_
 
 
 --
--- Name: marketplace_customer_identities_phone_contact_unique; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX marketplace_customer_identities_phone_contact_unique ON public.marketplace_customer_identities USING btree (normalized_identifier) WHERE (identifier_type = ANY (ARRAY['phone'::text, 'whatsapp'::text]));
-
-
---
 -- Name: marketplace_customers_email_key; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5696,13 +6450,6 @@ CREATE INDEX marketplace_customers_inbox_name_trgm_idx ON public.marketplace_cus
 --
 
 CREATE UNIQUE INDEX marketplace_customers_phone_key ON public.marketplace_customers USING btree (phone_e164) WHERE (phone_e164 IS NOT NULL);
-
-
---
--- Name: marketplace_customers_whatsapp_key; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE UNIQUE INDEX marketplace_customers_whatsapp_key ON public.marketplace_customers USING btree (whatsapp_e164) WHERE (whatsapp_e164 IS NOT NULL);
 
 
 --
@@ -5839,10 +6586,43 @@ CREATE INDEX marketplace_service_documents_state_provider_idx ON public.marketpl
 
 
 --
+-- Name: meta_whatsapp_owned_due_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX meta_whatsapp_owned_due_idx ON public.meta_whatsapp_webhook_receipts USING btree (processing_owner, (
+CASE
+    WHEN (processing_status = 'processing'::text) THEN lease_expires_at
+    ELSE available_at
+END), created_at, id) WHERE ((event_kind = 'status'::text) AND (processing_status = ANY (ARRAY['pending'::text, 'retry'::text, 'processing'::text])));
+
+
+--
+-- Name: meta_whatsapp_unassigned_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX meta_whatsapp_unassigned_idx ON public.meta_whatsapp_webhook_receipts USING btree ((
+CASE
+    WHEN (processing_status = 'processing'::text) THEN lease_expires_at
+    ELSE available_at
+END), created_at, id) WHERE ((event_kind = 'status'::text) AND (processing_owner = 'unassigned'::text) AND (processing_status = ANY (ARRAY['pending'::text, 'retry'::text, 'processing'::text])));
+
+
+--
 -- Name: meta_whatsapp_webhook_receipts_pending_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX meta_whatsapp_webhook_receipts_pending_idx ON public.meta_whatsapp_webhook_receipts USING btree (available_at, created_at, id) WHERE (processing_status = ANY (ARRAY['pending'::text, 'retry'::text, 'processing'::text]));
+CREATE INDEX meta_whatsapp_webhook_receipts_pending_idx ON public.meta_whatsapp_webhook_receipts USING btree ((
+CASE
+    WHEN (processing_status = 'processing'::text) THEN lease_expires_at
+    ELSE available_at
+END), created_at, id) WHERE ((event_kind = 'status'::text) AND (processing_status = ANY (ARRAY['pending'::text, 'retry'::text, 'processing'::text])));
+
+
+--
+-- Name: meta_whatsapp_webhook_receipts_terminal_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX meta_whatsapp_webhook_receipts_terminal_retention_idx ON public.meta_whatsapp_webhook_receipts USING btree (processed_at, id) WHERE (processing_status = ANY (ARRAY['completed'::text, 'dead_letter'::text]));
 
 
 --
@@ -5850,6 +6630,20 @@ CREATE INDEX meta_whatsapp_webhook_receipts_pending_idx ON public.meta_whatsapp_
 --
 
 CREATE INDEX notification_deliveries_booking_active_idx ON public.notification_deliveries USING btree (booking_id, notification_type, status, scheduled_for, id) WHERE (status = ANY (ARRAY['pending'::text, 'retry'::text, 'processing'::text, 'dispatching'::text, 'unknown'::text, 'manual_review'::text]));
+
+
+--
+-- Name: notification_deliveries_booking_channel_status_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notification_deliveries_booking_channel_status_idx ON public.notification_deliveries USING btree (booking_id, audience_type, channel, updated_at DESC, id DESC);
+
+
+--
+-- Name: notification_deliveries_dispatch_reconcile_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notification_deliveries_dispatch_reconcile_idx ON public.notification_deliveries USING btree (reconcile_after, id) WHERE (status = ANY (ARRAY['dispatching'::text, 'unknown'::text]));
 
 
 --
@@ -5874,7 +6668,7 @@ CREATE UNIQUE INDEX notification_deliveries_provider_message_idx ON public.notif
 -- Name: notification_deliveries_terminal_retention_idx; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX notification_deliveries_terminal_retention_idx ON public.notification_deliveries USING btree (completed_at, id) WHERE (status = ANY (ARRAY['failed'::text, 'deleted'::text, 'cancelled'::text, 'read'::text, 'delivered'::text]));
+CREATE INDEX notification_deliveries_terminal_retention_idx ON public.notification_deliveries USING btree (completed_at, id) WHERE ((status = ANY (ARRAY['failed'::text, 'deleted'::text, 'cancelled'::text, 'read'::text, 'delivered'::text])) OR ((channel = 'email'::text) AND (status = 'accepted'::text)));
 
 
 --
@@ -5889,6 +6683,27 @@ END), event_sequence, booking_event_id) WHERE (status = ANY (ARRAY['pending'::te
 
 
 --
+-- Name: notification_event_jobs_dead_letter_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notification_event_jobs_dead_letter_idx ON public.notification_event_jobs USING btree (booking_event_id) WHERE (status = 'dead_letter'::text);
+
+
+--
+-- Name: notification_event_jobs_terminal_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notification_event_jobs_terminal_retention_idx ON public.notification_event_jobs USING btree (completed_at, booking_event_id) WHERE (status = ANY (ARRAY['completed'::text, 'dead_letter'::text]));
+
+
+--
+-- Name: notification_in_app_jobs_dead_letter_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notification_in_app_jobs_dead_letter_idx ON public.notification_in_app_jobs USING btree (id) WHERE (status = 'dead_letter'::text);
+
+
+--
 -- Name: notification_in_app_jobs_due_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5900,6 +6715,13 @@ END), scheduled_for, id) WHERE (status = ANY (ARRAY['pending'::text, 'retry'::te
 
 
 --
+-- Name: notification_in_app_jobs_terminal_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notification_in_app_jobs_terminal_retention_idx ON public.notification_in_app_jobs USING btree (completed_at, id) WHERE (status = ANY (ARRAY['completed'::text, 'dead_letter'::text, 'cancelled'::text]));
+
+
+--
 -- Name: notification_scope_replan_claim_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5908,6 +6730,20 @@ CASE
     WHEN (status = 'processing'::text) THEN lease_expires_at
     ELSE next_attempt_at
 END), created_at, client_id, preference_revision) WHERE (status = ANY (ARRAY['pending'::text, 'retry'::text, 'processing'::text]));
+
+
+--
+-- Name: notification_scope_replan_dead_letter_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notification_scope_replan_dead_letter_idx ON public.notification_scope_replan_jobs USING btree (client_id, preference_revision) WHERE (status = 'dead_letter'::text);
+
+
+--
+-- Name: notification_scope_replan_terminal_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX notification_scope_replan_terminal_retention_idx ON public.notification_scope_replan_jobs USING btree (completed_at, client_id, preference_revision) WHERE (status = ANY (ARRAY['completed'::text, 'dead_letter'::text, 'superseded'::text]));
 
 
 --
@@ -6156,10 +6992,52 @@ CREATE INDEX promotions_client_type_updated_id_idx ON public.promotions USING bt
 
 
 --
+-- Name: provider_auth_challenges_delivery_deadline_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX provider_auth_challenges_delivery_deadline_idx ON public.provider_auth_challenges USING btree (delivery_deadline) WHERE (consumed_at IS NULL);
+
+
+--
+-- Name: provider_auth_challenges_identifier_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX provider_auth_challenges_identifier_idx ON public.provider_auth_challenges USING btree (identifier_type, identifier, purpose, created_at DESC);
+
+
+--
+-- Name: provider_auth_challenges_target_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX provider_auth_challenges_target_idx ON public.provider_auth_challenges USING btree (target_client_id, created_at DESC) WHERE (target_client_id IS NOT NULL);
+
+
+--
+-- Name: provider_auth_identities_client_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX provider_auth_identities_client_idx ON public.provider_auth_identities USING btree (client_id, created_at);
+
+
+--
 -- Name: provider_availability_windows_client_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX provider_availability_windows_client_id_idx ON public.provider_availability_windows USING btree (client_id);
+
+
+--
+-- Name: provider_customer_contact_challenge_active_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX provider_customer_contact_challenge_active_idx ON public.provider_customer_contact_challenges USING btree (client_id) WHERE (consumed_at IS NULL);
+
+
+--
+-- Name: provider_customer_contact_challenge_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX provider_customer_contact_challenge_expiry_idx ON public.provider_customer_contact_challenges USING btree (expires_at);
 
 
 --
@@ -6380,6 +7258,48 @@ CREATE INDEX services_marketplace_travel_extent_idx ON public.services USING btr
 
 
 --
+-- Name: tessa_email_link_active_client_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX tessa_email_link_active_client_idx ON public.tessa_whatsapp_email_challenges USING btree (client_id) WHERE (consumed_at IS NULL);
+
+
+--
+-- Name: tessa_email_link_active_sender_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX tessa_email_link_active_sender_idx ON public.tessa_whatsapp_email_challenges USING btree (phone_number_id, destination) WHERE (consumed_at IS NULL);
+
+
+--
+-- Name: tessa_email_link_client_budget_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_email_link_client_budget_idx ON public.tessa_whatsapp_email_challenges USING btree (client_id, created_at);
+
+
+--
+-- Name: tessa_email_link_created_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_email_link_created_idx ON public.tessa_whatsapp_email_challenges USING btree (created_at, id);
+
+
+--
+-- Name: tessa_email_link_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_email_link_expiry_idx ON public.tessa_whatsapp_email_challenges USING btree (expires_at, id);
+
+
+--
+-- Name: tessa_email_link_sender_budget_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_email_link_sender_budget_idx ON public.tessa_whatsapp_email_challenges USING btree (phone_number_id, destination, created_at);
+
+
+--
 -- Name: tessa_events_client_sequence_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6457,6 +7377,20 @@ CREATE INDEX tessa_runs_recent_completed_metrics_idx ON public.tessa_runs USING 
 
 
 --
+-- Name: tessa_security_email_pending_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_security_email_pending_idx ON public.tessa_whatsapp_security_events USING btree (created_at, id) WHERE ((email_queued_at IS NULL) AND (skip_reason = ''::text));
+
+
+--
+-- Name: tessa_security_event_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_security_event_retention_idx ON public.tessa_whatsapp_security_events USING btree (created_at, id);
+
+
+--
 -- Name: tessa_threads_archived_retention_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6478,6 +7412,209 @@ CREATE UNIQUE INDEX tessa_threads_one_active_per_client ON public.tessa_threads 
 
 
 --
+-- Name: tessa_whatsapp_active_sender_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX tessa_whatsapp_active_sender_idx ON public.tessa_whatsapp_connections USING btree (phone_number_id, destination) WHERE (status = 'active'::text);
+
+
+--
+-- Name: tessa_whatsapp_challenge_cooldown_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_challenge_cooldown_idx ON public.tessa_whatsapp_link_challenges USING btree (client_id, created_at);
+
+
+--
+-- Name: tessa_whatsapp_challenge_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_challenge_retention_idx ON public.tessa_whatsapp_link_challenges USING btree (expires_at, id);
+
+
+--
+-- Name: tessa_whatsapp_ingress_client_pending_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_ingress_client_pending_idx ON public.tessa_whatsapp_ingress USING btree (client_id, sequence) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: tessa_whatsapp_ingress_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_ingress_expiry_idx ON public.tessa_whatsapp_ingress USING btree (expires_at, sequence) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: tessa_whatsapp_ingress_pending_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_ingress_pending_idx ON public.tessa_whatsapp_ingress USING btree (sequence) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: tessa_whatsapp_ingress_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_ingress_retention_idx ON public.tessa_whatsapp_ingress USING btree (completed_at, id) WHERE (status <> 'pending'::text);
+
+
+--
+-- Name: tessa_whatsapp_ingress_thread_pending_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_ingress_thread_pending_idx ON public.tessa_whatsapp_ingress USING btree (thread_id) WHERE (status = 'pending'::text);
+
+
+--
+-- Name: tessa_whatsapp_onboarding_budget_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_onboarding_budget_idx ON public.tessa_whatsapp_outbox USING btree (created_at) WHERE (onboarding_id IS NOT NULL);
+
+
+--
+-- Name: tessa_whatsapp_onboarding_challenge_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_onboarding_challenge_idx ON public.tessa_whatsapp_onboarding USING btree (challenge_id) WHERE (challenge_id IS NOT NULL);
+
+
+--
+-- Name: tessa_whatsapp_onboarding_client_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_onboarding_client_idx ON public.tessa_whatsapp_onboarding USING btree (client_id) WHERE (stage <> 'closed'::text);
+
+
+--
+-- Name: tessa_whatsapp_onboarding_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_onboarding_expiry_idx ON public.tessa_whatsapp_onboarding USING btree (expires_at, id);
+
+
+--
+-- Name: tessa_whatsapp_onboarding_outbox_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_onboarding_outbox_idx ON public.tessa_whatsapp_outbox USING btree (onboarding_id) WHERE (status = ANY (ARRAY['pending'::text, 'retry'::text, 'processing'::text]));
+
+
+--
+-- Name: tessa_whatsapp_one_challenge_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX tessa_whatsapp_one_challenge_idx ON public.tessa_whatsapp_link_challenges USING btree (client_id) WHERE (consumed_at IS NULL);
+
+
+--
+-- Name: tessa_whatsapp_outbox_challenge_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_outbox_challenge_idx ON public.tessa_whatsapp_outbox USING btree (challenge_id) WHERE (challenge_id IS NOT NULL);
+
+
+--
+-- Name: tessa_whatsapp_outbox_client_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_outbox_client_idx ON public.tessa_whatsapp_outbox USING btree (client_id) WHERE (status = ANY (ARRAY['pending'::text, 'retry'::text, 'processing'::text]));
+
+
+--
+-- Name: tessa_whatsapp_outbox_due_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_outbox_due_idx ON public.tessa_whatsapp_outbox USING btree (available_at, id) WHERE (status = ANY (ARRAY['pending'::text, 'retry'::text, 'processing'::text]));
+
+
+--
+-- Name: tessa_whatsapp_outbox_onboarding_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_outbox_onboarding_idx ON public.tessa_whatsapp_outbox USING btree (onboarding_id) WHERE (onboarding_id IS NOT NULL);
+
+
+--
+-- Name: tessa_whatsapp_outbox_reconcile_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_outbox_reconcile_idx ON public.tessa_whatsapp_outbox USING btree (reconcile_after, id) WHERE (status = ANY (ARRAY['dispatching'::text, 'unknown'::text]));
+
+
+--
+-- Name: tessa_whatsapp_outbox_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_outbox_retention_idx ON public.tessa_whatsapp_outbox USING btree (completed_at, id) WHERE (completed_at IS NOT NULL);
+
+
+--
+-- Name: tessa_whatsapp_outbox_sender_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_outbox_sender_idx ON public.tessa_whatsapp_outbox USING btree (phone_number_id, destination, client_id) WHERE (status = ANY (ARRAY['pending'::text, 'retry'::text, 'processing'::text]));
+
+
+--
+-- Name: tessa_whatsapp_outbox_terminal_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_outbox_terminal_retention_idx ON public.tessa_whatsapp_outbox USING btree (updated_at, id) WHERE (status = ANY (ARRAY['accepted'::text, 'sent'::text, 'delivered'::text, 'read'::text, 'failed'::text, 'cancelled'::text, 'expired'::text, 'manual_review'::text]));
+
+
+--
+-- Name: tessa_whatsapp_outbox_wamid_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX tessa_whatsapp_outbox_wamid_idx ON public.tessa_whatsapp_outbox USING btree (provider_message_id) WHERE (provider_message_id <> ''::text);
+
+
+--
+-- Name: tessa_whatsapp_pending_sender_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_pending_sender_idx ON public.tessa_whatsapp_link_challenges USING btree (phone_number_id, destination, client_id) WHERE (consumed_at IS NULL);
+
+
+--
+-- Name: tessa_whatsapp_queue_notice_budget_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX tessa_whatsapp_queue_notice_budget_idx ON public.tessa_whatsapp_outbox USING btree (client_id, created_at) WHERE (kind = ANY (ARRAY['queue_busy'::text, 'queue_expired'::text, 'queue_unavailable'::text]));
+
+
+--
+-- Name: welcome_email_jobs_due_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX welcome_email_jobs_due_idx ON public.welcome_email_jobs USING btree (next_attempt_at, created_at, id) WHERE (status = ANY (ARRAY['pending'::text, 'retry'::text]));
+
+
+--
+-- Name: welcome_email_jobs_expired_lease_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX welcome_email_jobs_expired_lease_idx ON public.welcome_email_jobs USING btree (lease_expires_at, id) WHERE (status = 'processing'::text);
+
+
+--
+-- Name: welcome_email_jobs_terminal_retention_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX welcome_email_jobs_terminal_retention_idx ON public.welcome_email_jobs USING btree (completed_at, id) WHERE (status = ANY (ARRAY['accepted'::text, 'failed'::text]));
+
+
+--
+-- Name: welcome_email_templates_one_active_audience_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX welcome_email_templates_one_active_audience_idx ON public.welcome_email_templates USING btree (audience) WHERE (status = 'active'::text);
+
+
+--
 -- Name: agreement_jobs agreement_jobs_wake_core; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -6496,6 +7633,13 @@ CREATE TRIGGER agreement_template_families_public_resource_trigger AFTER INSERT 
 --
 
 CREATE TRIGGER agreement_template_generation_jobs_wake_core AFTER INSERT OR UPDATE OF status, run_at ON public.agreement_template_generation_jobs FOR EACH ROW EXECUTE FUNCTION public.notify_core_worker_queue();
+
+
+--
+-- Name: auth_code_delivery_jobs auth_code_delivery_jobs_wake; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER auth_code_delivery_jobs_wake AFTER INSERT ON public.auth_code_delivery_jobs FOR EACH STATEMENT EXECUTE FUNCTION public.notify_auth_code_delivery_job();
 
 
 --
@@ -6601,6 +7745,13 @@ CREATE TRIGGER business_locations_public_resource_update_trigger AFTER UPDATE OF
 --
 
 CREATE TRIGGER client_profile_handles_public_resource_trigger AFTER INSERT OR DELETE OR UPDATE ON public.client_profile_handles FOR EACH ROW EXECUTE FUNCTION public.bump_public_provider_resource_revision_direct();
+
+
+--
+-- Name: client_profiles client_profiles_contact_public_revision_trigger; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER client_profiles_contact_public_revision_trigger AFTER UPDATE OF customer_contact_phone, customer_contact_verified_at, show_contact_on_public_profile ON public.client_profiles FOR EACH ROW EXECUTE FUNCTION public.bump_public_provider_resource_revision_direct();
 
 
 --
@@ -6814,6 +7965,27 @@ CREATE TRIGGER tessa_runs_wake_ai AFTER INSERT OR UPDATE OF status, available_at
 
 
 --
+-- Name: tessa_whatsapp_outbox tessa_whatsapp_delivery_timestamps; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER tessa_whatsapp_delivery_timestamps BEFORE UPDATE OF status ON public.tessa_whatsapp_outbox FOR EACH ROW EXECUTE FUNCTION public.tessa_whatsapp_delivery_timestamps();
+
+
+--
+-- Name: tessa_whatsapp_outbox tessa_whatsapp_publish_delivery; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER tessa_whatsapp_publish_delivery AFTER UPDATE OF status ON public.tessa_whatsapp_outbox FOR EACH ROW EXECUTE FUNCTION public.tessa_whatsapp_publish_delivery();
+
+
+--
+-- Name: welcome_email_jobs welcome_email_jobs_wake; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER welcome_email_jobs_wake AFTER INSERT ON public.welcome_email_jobs FOR EACH STATEMENT EXECUTE FUNCTION public.notify_welcome_email_job();
+
+
+--
 -- Name: administrative_regions administrative_regions_parent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -6966,11 +8138,67 @@ ALTER TABLE ONLY public.agreement_template_versions
 
 
 --
--- Name: auth_password_reset_tokens auth_password_reset_tokens_user_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: auth_code_delivery_jobs auth_code_delivery_jobs_marketplace_challenge_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
-ALTER TABLE ONLY public.auth_password_reset_tokens
-    ADD CONSTRAINT auth_password_reset_tokens_user_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.auth_code_delivery_jobs
+    ADD CONSTRAINT auth_code_delivery_jobs_marketplace_challenge_id_fkey FOREIGN KEY (marketplace_challenge_id) REFERENCES public.marketplace_auth_challenges(id) ON DELETE CASCADE;
+
+
+--
+-- Name: auth_code_delivery_jobs auth_code_delivery_jobs_provider_challenge_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_code_delivery_jobs
+    ADD CONSTRAINT auth_code_delivery_jobs_provider_challenge_id_fkey FOREIGN KEY (provider_challenge_id) REFERENCES public.provider_auth_challenges(id) ON DELETE CASCADE;
+
+
+--
+-- Name: auth_code_delivery_jobs auth_code_delivery_jobs_tessa_link_challenge_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_code_delivery_jobs
+    ADD CONSTRAINT auth_code_delivery_jobs_tessa_link_challenge_id_fkey FOREIGN KEY (tessa_link_challenge_id) REFERENCES public.tessa_whatsapp_email_challenges(id) ON DELETE CASCADE;
+
+
+--
+-- Name: auth_code_delivery_jobs auth_code_delivery_jobs_tessa_security_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_code_delivery_jobs
+    ADD CONSTRAINT auth_code_delivery_jobs_tessa_security_event_id_fkey FOREIGN KEY (tessa_security_event_id) REFERENCES public.tessa_whatsapp_security_events(id) ON DELETE CASCADE;
+
+
+--
+-- Name: auth_password_reset_grants auth_password_reset_grants_marketplace_challenge_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_password_reset_grants
+    ADD CONSTRAINT auth_password_reset_grants_marketplace_challenge_id_fkey FOREIGN KEY (marketplace_challenge_id) REFERENCES public.marketplace_auth_challenges(id) ON DELETE CASCADE;
+
+
+--
+-- Name: auth_password_reset_grants auth_password_reset_grants_marketplace_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_password_reset_grants
+    ADD CONSTRAINT auth_password_reset_grants_marketplace_customer_id_fkey FOREIGN KEY (marketplace_customer_id) REFERENCES public.marketplace_customers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: auth_password_reset_grants auth_password_reset_grants_provider_challenge_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_password_reset_grants
+    ADD CONSTRAINT auth_password_reset_grants_provider_challenge_id_fkey FOREIGN KEY (provider_challenge_id) REFERENCES public.provider_auth_challenges(id) ON DELETE CASCADE;
+
+
+--
+-- Name: auth_password_reset_grants auth_password_reset_grants_provider_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_password_reset_grants
+    ADD CONSTRAINT auth_password_reset_grants_provider_client_id_fkey FOREIGN KEY (provider_client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
 
 
 --
@@ -8134,11 +9362,35 @@ ALTER TABLE ONLY public.promotions
 
 
 --
+-- Name: provider_auth_challenges provider_auth_challenges_target_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_auth_challenges
+    ADD CONSTRAINT provider_auth_challenges_target_client_id_fkey FOREIGN KEY (target_client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+--
+-- Name: provider_auth_identities provider_auth_identities_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_auth_identities
+    ADD CONSTRAINT provider_auth_identities_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+--
 -- Name: provider_availability_windows provider_availability_windows_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.provider_availability_windows
     ADD CONSTRAINT provider_availability_windows_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+--
+-- Name: provider_customer_contact_challenges provider_customer_contact_challenges_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.provider_customer_contact_challenges
+    ADD CONSTRAINT provider_customer_contact_challenges_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.client_profiles(client_id) ON DELETE CASCADE;
 
 
 --
@@ -8414,6 +9666,166 @@ ALTER TABLE ONLY public.tessa_threads
 
 
 --
+-- Name: tessa_whatsapp_connections tessa_whatsapp_connections_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_connections
+    ADD CONSTRAINT tessa_whatsapp_connections_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_email_challenges tessa_whatsapp_email_challenges_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_email_challenges
+    ADD CONSTRAINT tessa_whatsapp_email_challenges_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_email_challenges tessa_whatsapp_email_challenges_source_receipt_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_email_challenges
+    ADD CONSTRAINT tessa_whatsapp_email_challenges_source_receipt_id_fkey FOREIGN KEY (source_receipt_id) REFERENCES public.meta_whatsapp_webhook_receipts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_ingress tessa_whatsapp_ingress_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_ingress
+    ADD CONSTRAINT tessa_whatsapp_ingress_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_ingress tessa_whatsapp_ingress_message_id_thread_id_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_ingress
+    ADD CONSTRAINT tessa_whatsapp_ingress_message_id_thread_id_client_id_fkey FOREIGN KEY (message_id, thread_id, client_id) REFERENCES public.tessa_messages(id, thread_id, client_id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_ingress tessa_whatsapp_ingress_run_id_thread_id_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_ingress
+    ADD CONSTRAINT tessa_whatsapp_ingress_run_id_thread_id_client_id_fkey FOREIGN KEY (run_id, thread_id, client_id) REFERENCES public.tessa_runs(id, thread_id, client_id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_ingress tessa_whatsapp_ingress_source_receipt_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_ingress
+    ADD CONSTRAINT tessa_whatsapp_ingress_source_receipt_id_fkey FOREIGN KEY (source_receipt_id) REFERENCES public.meta_whatsapp_webhook_receipts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_ingress tessa_whatsapp_ingress_thread_id_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_ingress
+    ADD CONSTRAINT tessa_whatsapp_ingress_thread_id_client_id_fkey FOREIGN KEY (thread_id, client_id) REFERENCES public.tessa_threads(id, client_id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_link_challenges tessa_whatsapp_link_challenges_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_link_challenges
+    ADD CONSTRAINT tessa_whatsapp_link_challenges_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_onboarding tessa_whatsapp_onboarding_challenge_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_onboarding
+    ADD CONSTRAINT tessa_whatsapp_onboarding_challenge_id_fkey FOREIGN KEY (challenge_id) REFERENCES public.tessa_whatsapp_email_challenges(id) ON DELETE SET NULL;
+
+
+--
+-- Name: tessa_whatsapp_onboarding tessa_whatsapp_onboarding_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_onboarding
+    ADD CONSTRAINT tessa_whatsapp_onboarding_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_outbox tessa_whatsapp_outbox_answer_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_outbox
+    ADD CONSTRAINT tessa_whatsapp_outbox_answer_fk FOREIGN KEY (assistant_message_id, thread_id, client_id) REFERENCES public.tessa_messages(id, thread_id, client_id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_outbox tessa_whatsapp_outbox_challenge_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_outbox
+    ADD CONSTRAINT tessa_whatsapp_outbox_challenge_id_fkey FOREIGN KEY (challenge_id) REFERENCES public.tessa_whatsapp_link_challenges(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_outbox tessa_whatsapp_outbox_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_outbox
+    ADD CONSTRAINT tessa_whatsapp_outbox_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_outbox tessa_whatsapp_outbox_onboarding_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_outbox
+    ADD CONSTRAINT tessa_whatsapp_outbox_onboarding_id_fkey FOREIGN KEY (onboarding_id) REFERENCES public.tessa_whatsapp_onboarding(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_outbox tessa_whatsapp_outbox_source_receipt_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_outbox
+    ADD CONSTRAINT tessa_whatsapp_outbox_source_receipt_id_fkey FOREIGN KEY (source_receipt_id) REFERENCES public.meta_whatsapp_webhook_receipts(id) ON DELETE CASCADE;
+
+
+--
+-- Name: tessa_whatsapp_security_events tessa_whatsapp_security_events_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.tessa_whatsapp_security_events
+    ADD CONSTRAINT tessa_whatsapp_security_events_client_id_fkey FOREIGN KEY (client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+--
+-- Name: welcome_email_jobs welcome_email_jobs_marketplace_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.welcome_email_jobs
+    ADD CONSTRAINT welcome_email_jobs_marketplace_customer_id_fkey FOREIGN KEY (marketplace_customer_id) REFERENCES public.marketplace_customers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: welcome_email_jobs welcome_email_jobs_provider_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.welcome_email_jobs
+    ADD CONSTRAINT welcome_email_jobs_provider_client_id_fkey FOREIGN KEY (provider_client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+--
+-- Name: welcome_email_jobs welcome_email_jobs_template_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.welcome_email_jobs
+    ADD CONSTRAINT welcome_email_jobs_template_id_fkey FOREIGN KEY (template_id) REFERENCES public.welcome_email_templates(id) ON DELETE RESTRICT;
+
+
+--
 -- PostgreSQL database dump complete
 --
 
@@ -8481,4 +9893,27 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260904020000'),
     ('20260904030000'),
     ('20260904031000'),
-    ('20260904032000');
+    ('20260904032000'),
+    ('20260904033000'),
+    ('20260904034000'),
+    ('20260904035000'),
+    ('20260904036000'),
+    ('20260904037000'),
+    ('20260904038000'),
+    ('20260905010000'),
+    ('20260905020000'),
+    ('20260905021000'),
+    ('20260905022000'),
+    ('20260905023000'),
+    ('20260905024000'),
+    ('20260905025000'),
+    ('20260905030000'),
+    ('20260906010000'),
+    ('20260906011000'),
+    ('20260906012000'),
+    ('20260906013000'),
+    ('20260906014000'),
+    ('20260906015000'),
+    ('20260906016000'),
+    ('20260906017000'),
+    ('20260906018000');

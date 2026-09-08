@@ -41,9 +41,11 @@ type ProviderNotificationPreferences struct {
 	AppointmentReminderEnabled    bool       `json:"appointment_reminder_enabled"`
 	AppointmentReminderMinutes    int        `json:"appointment_reminder_minutes"`
 	EmailAvailable                bool       `json:"email_available"`
+	EmailDeliveryEnabled          bool       `json:"email_delivery_enabled"`
 	WhatsAppE164                  string     `json:"whatsapp_e164,omitempty"`
 	WhatsAppVerifiedAt            *time.Time `json:"whatsapp_verified_at,omitempty"`
 	WhatsAppVerificationAvailable bool       `json:"whatsapp_verification_available"`
+	WhatsAppDeliveryEnabled       bool       `json:"whatsapp_delivery_enabled"`
 	PreferenceRevision            int64      `json:"preference_revision"`
 	UpdatedAt                     time.Time  `json:"updated_at"`
 }
@@ -62,17 +64,19 @@ type ProviderWhatsAppVerification struct {
 }
 
 type ContactFoundationRepository struct {
-	db                    *pgxpool.Pool
-	destinationHMACKey    []byte
-	businessWhatsAppE164  string
-	verificationAvailable bool
-	now                   func() time.Time
+	db                      *pgxpool.Pool
+	destinationHMACKey      []byte
+	businessWhatsAppE164    string
+	verificationAvailable   bool
+	emailDeliveryEnabled    bool
+	whatsAppDeliveryEnabled bool
+	now                     func() time.Time
 }
 
 func NewContactFoundationRepository(
 	db *pgxpool.Pool,
 	destinationHMACKey, businessWhatsAppE164 string,
-	verificationAvailable bool,
+	verificationAvailable, emailDeliveryEnabled, whatsAppDeliveryEnabled bool,
 ) (*ContactFoundationRepository, error) {
 	if db == nil || len(destinationHMACKey) < 32 {
 		return nil, ErrNotificationFoundationUnavailable
@@ -83,9 +87,11 @@ func NewContactFoundationRepository(
 	}
 	return &ContactFoundationRepository{
 		db: db, destinationHMACKey: []byte(destinationHMACKey),
-		businessWhatsAppE164:  normalizedBusinessNumber,
-		verificationAvailable: verificationAvailable,
-		now:                   func() time.Time { return time.Now().UTC() },
+		businessWhatsAppE164:    normalizedBusinessNumber,
+		verificationAvailable:   verificationAvailable,
+		emailDeliveryEnabled:    emailDeliveryEnabled,
+		whatsAppDeliveryEnabled: whatsAppDeliveryEnabled,
+		now:                     func() time.Time { return time.Now().UTC() },
 	}, nil
 }
 
@@ -113,6 +119,8 @@ func (repository *ContactFoundationRepository) GetProviderPreferences(
 		WHERE client.id=$1
 	`, clientID))
 	item.WhatsAppVerificationAvailable = repository.verificationAvailable
+	item.EmailDeliveryEnabled = repository.emailDeliveryEnabled
+	item.WhatsAppDeliveryEnabled = repository.whatsAppDeliveryEnabled
 	return item, err
 }
 
@@ -155,6 +163,8 @@ func (repository *ContactFoundationRepository) UpdateProviderPreferences(
 		return ProviderNotificationPreferences{}, err
 	}
 	current.WhatsAppVerificationAvailable = repository.verificationAvailable
+	current.EmailDeliveryEnabled = repository.emailDeliveryEnabled
+	current.WhatsAppDeliveryEnabled = repository.whatsAppDeliveryEnabled
 	next := current
 	if patch.BookingEmail != nil {
 		next.BookingEmail = *patch.BookingEmail
@@ -308,7 +318,7 @@ func (repository *ContactFoundationRepository) applyInboundControlTx(
 	tx pgx.Tx,
 	control inboundControl,
 ) error {
-	if control.kind == "" {
+	if control.kind != "stop" && control.kind != "start" && control.kind != "verify" {
 		return nil
 	}
 	normalizedSender, err := normalizeInternationalE164(control.sender)
@@ -332,6 +342,9 @@ func (repository *ContactFoundationRepository) applyInboundControlTx(
 		`, senderHMAC)
 	case "verify":
 		err = repository.consumeVerificationTx(ctx, tx, senderHMAC, control.token)
+		if err == nil {
+			err = repository.consumeCustomerContactVerificationTx(ctx, tx, senderHMAC, control.token)
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("apply inbound WhatsApp control: %w", err)

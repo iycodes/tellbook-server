@@ -3,6 +3,46 @@ info:
   title: Tellbook Tessa API
   version: 1.0.0
 paths:
+  /v1/app/tessa/whatsapp:
+    get:
+      operationId: getTessaWhatsApp
+      responses:
+        '200':
+          description: Actual connection and rollout capability
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WhatsAppState' }
+        default: { $ref: '#/components/responses/Error' }
+    delete:
+      operationId: disconnectTessaWhatsApp
+      responses:
+        '200':
+          description: Revoked connection state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WhatsAppState' }
+        default: { $ref: '#/components/responses/Error' }
+  /v1/app/tessa/whatsapp/link:
+    post:
+      operationId: startTessaWhatsAppLink
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [destination, notice_revision]
+              properties:
+                destination: { type: string, maxLength: 40 }
+                notice_revision: { type: string, maxLength: 80 }
+      responses:
+        '200':
+          description: Single-use link; never cached
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WhatsAppLinkChallenge' }
+        default: { $ref: '#/components/responses/Error' }
   /v1/app/tessa/bootstrap:
     get:
       operationId: getTessaBootstrap
@@ -177,7 +217,10 @@ components:
         thread_id: { type: string, format: uuid }
         sequence: { type: integer, format: int64, minimum: 1 }
         sender_type: { type: string, enum: [provider, tessa, system] }
-        source_channel: { type: string, enum: [web] }
+        source_channel:
+          type: string
+          enum: [web, whatsapp]
+          description: Origin of the turn, not evidence that an assistant answer was delivered to WhatsApp.
         client_message_id: { type: string, format: uuid }
         content: { type: string, minLength: 1, maxLength: 4000 }
         presentation: { $ref: '#/components/schemas/MessagePresentation' }
@@ -187,6 +230,22 @@ components:
           items: { $ref: '#/components/schemas/EntityReference' }
         run_id: { type: string, format: uuid }
         created_at: { type: string, format: date-time }
+        whatsapp_delivery: { $ref: '#/components/schemas/WhatsAppDelivery' }
+    WhatsAppDelivery:
+      type: object
+      additionalProperties: false
+      description: Present only for committed assistant answers with a WhatsApp delivery intent. Accepted is not delivered; no provider IDs or raw transport errors are exposed.
+      required: [status, updated_at]
+      properties:
+        status:
+          type: string
+          enum: [pending, accepted, sent, delivered, read, failed, cancelled, expired, unknown, manual_review]
+        reason: { type: string, enum: [customer_service_window_closed] }
+        updated_at: { type: string, format: date-time }
+        accepted_at: { type: string, format: date-time }
+        sent_at: { type: string, format: date-time }
+        delivered_at: { type: string, format: date-time }
+        read_at: { type: string, format: date-time }
     Run:
       type: object
       additionalProperties: false
@@ -256,6 +315,7 @@ components:
       additionalProperties: false
       required: [preferences, messages, has_more, realtime_cursor]
       properties:
+        whatsapp: { $ref: '#/components/schemas/WhatsAppState' }
         preferences: { $ref: '#/components/schemas/Preferences' }
         thread: { $ref: '#/components/schemas/Thread' }
         messages:
@@ -271,6 +331,26 @@ components:
       required: [notice_revision]
       properties:
         notice_revision: { type: string, minLength: 1, maxLength: 80 }
+    WhatsAppState:
+      type: object
+      additionalProperties: false
+      required: [linking_available, conversation_available, status, destination, notice_revision]
+      properties:
+        linking_available: { type: boolean }
+        conversation_available: { type: boolean }
+        status: { type: string, enum: [disconnected, connected, expired] }
+        destination: { type: string }
+        notice_revision: { type: string }
+        expires_at: { type: string, format: date-time }
+        pending_expires_at: { type: string, format: date-time }
+    WhatsAppLinkChallenge:
+      type: object
+      additionalProperties: false
+      required: [url, destination, expires_at]
+      properties:
+        url: { type: string, format: uri }
+        destination: { type: string }
+        expires_at: { type: string, format: date-time }
     CreateThreadRequest:
       type: object
       additionalProperties: false
@@ -312,6 +392,7 @@ components:
           enum:
             - thread.created
             - message.created
+            - message.delivery_changed
             - run.started
             - run.stage_changed
             - run.completed

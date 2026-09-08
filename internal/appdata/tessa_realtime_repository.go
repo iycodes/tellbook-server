@@ -128,10 +128,8 @@ func loadTessaMessagesByID(ctx context.Context, tx pgx.Tx, clientID uuid.UUID, i
 	if len(ids) == 0 {
 		return result, nil
 	}
-	rows, err := tx.Query(ctx, `
-		SELECT id,thread_id,sequence,sender_type,source_channel,client_message_id,content,
-			presentation,entity_references,run_id,created_at
-		FROM tessa_messages WHERE client_id=$1 AND id=ANY($2::uuid[])
+	rows, err := tx.Query(ctx, tessaMessageRead+`
+		WHERE m.client_id=$1 AND m.id=ANY($2::uuid[])
 	`, clientID, ids)
 	if err != nil {
 		return nil, err

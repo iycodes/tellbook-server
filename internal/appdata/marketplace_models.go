@@ -230,6 +230,7 @@ type BookingCommandResponse struct {
 }
 
 type MarketplaceBookingDetail struct {
+	ProviderContactPhone string `json:"provider_contact_phone,omitempty"`
 	MarketplaceBookingListItem
 	BookingToken         string                           `json:"booking_token"`
 	Source               string                           `json:"source"`
@@ -252,6 +253,7 @@ type MarketplaceBookingDetail struct {
 	PaymentHistory       []BookingDetailPaymentItem       `json:"payment_history"`
 	RefundHistory        []BookingDetailRefundItem        `json:"refund_history"`
 	ChangeHistory        []BookingDetailEvent             `json:"change_history"`
+	DeliveryStatus       PublicBookingDeliveryStatus      `json:"delivery_status"`
 	ConversationID       string                           `json:"conversation_id,omitempty"`
 	ReviewID             string                           `json:"review_id,omitempty"`
 	AllowedActions       MarketplaceBookingAllowedActions `json:"allowed_actions"`
