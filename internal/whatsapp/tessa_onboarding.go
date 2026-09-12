@@ -52,7 +52,7 @@ func (r *TessaLinkRepository) onboardTx(ctx context.Context, tx pgx.Tx, receipt 
       WHERE g.phone_number_id=$1 AND g.destination=$2 AND g.status='active' AND g.expires_at>NOW()
 	      AND g.security_revision=c.security_revision AND g.notice_revision=$3`, r.phoneID, sender, TessaWhatsAppNotice).Scan(&clientID, &connectionRevision, &securityRevision)
 	if err == nil {
-		if r.conversations != nil && r.allowed[clientID] && !tessaLinkingText(receipt.control.text) {
+		if r.conversations != nil && !tessaLinkingText(receipt.control.text) {
 			return r.conversations.StoreTessaWhatsAppMessageTx(ctx, tx, TessaInboundMessage{ReceiptID: receiptID, ClientID: clientID, PhoneNumberID: r.phoneID, Sender: sender, MessageID: receipt.MessageID, Content: receipt.control.text, ConnectionRevision: connectionRevision, SecurityRevision: securityRevision, SourceTimestamp: *receipt.ProviderTimestamp})
 		}
 		return nil
@@ -126,9 +126,6 @@ func (r *TessaLinkRepository) onboardTx(ctx context.Context, tx pgx.Tx, receipt 
 				return err
 			}
 		}
-		if !r.allowed[clientID] {
-			clientID = uuid.Nil
-		}
 		id, issueErr := r.emailLinks.IssueTessaEmailLinkTx(ctx, tx, TessaEmailLinkRequest{SourceReceiptID: receiptID, ClientID: clientID, Email: email, PhoneNumberID: r.phoneID, Sender: sender, NoticeRevision: s.Notice})
 		if issueErr != nil {
 			return issueErr
@@ -144,7 +141,7 @@ func (r *TessaLinkRepository) onboardTx(ctx context.Context, tx pgx.Tx, receipt 
 		if command == "RESEND" {
 			kind = "onboarding_code"
 			// Resolve only the original eligible account and unchanged security revision.
-			if s.ChallengeID != nil && s.ClientID != nil && r.allowed[*s.ClientID] {
+			if s.ChallengeID != nil && s.ClientID != nil {
 				var email string
 				err = tx.QueryRow(ctx, `SELECT c.email FROM clients c JOIN tessa_whatsapp_email_challenges q ON q.client_id=c.id WHERE q.id=$1 AND c.id=$2 AND c.security_revision=q.security_revision AND c.email_verified_at IS NOT NULL`, s.ChallengeID, s.ClientID).Scan(&email)
 				if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -160,7 +157,7 @@ func (r *TessaLinkRepository) onboardTx(ctx context.Context, tx pgx.Tx, receipt 
 					}
 				}
 			}
-		} else if s.ChallengeID != nil && s.ClientID != nil && r.allowed[*s.ClientID] {
+		} else if s.ChallengeID != nil && s.ClientID != nil {
 			proof, verifyErr := r.emailLinks.VerifyTessaEmailLinkTx(ctx, tx, *s.ChallengeID, r.phoneID, sender, text, s.Notice)
 			if verifyErr != nil {
 				return verifyErr

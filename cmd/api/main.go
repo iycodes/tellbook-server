@@ -632,7 +632,7 @@ func main() {
 
 	appdataHandler := appdata.NewHandler(appdataRepo, authHandler, destinationService, r2Service, smtpMailer, aiClient, checkoutService, payoutService, paymentEvents, paymentReconciliations, cfg.ClientPublicBaseURL, cfg.MarketplacePublicBaseURL)
 	var notificationContacts *whatsapp.ContactFoundationRepository
-	tessaLinks := whatsapp.NewTessaLinkRepository(dbPool, cfg.WABAPhoneNumberID, cfg.WABABusinessPhoneE164, cfg.TessaWhatsAppLinkingEnabled, cfg.TessaAIProviderAllowlist)
+	tessaLinks := whatsapp.NewTessaLinkRepository(dbPool, cfg.WABAPhoneNumberID, cfg.WABABusinessPhoneE164, cfg.TessaWhatsAppLinkingEnabled)
 	// A separate chat rollout switch preserves linking without starting AI replies.
 	var tessaWhatsAppClient *whatsapp.Client
 	if cfg.TessaWhatsAppLinkingEnabled && (runsCoreWorkers || (cfg.TessaWhatsAppConversationsEnabled && runsAIWorkers)) {
@@ -731,7 +731,7 @@ func main() {
 		tessaEvents := appdata.NewTessaEventBroker(directDBPool, logger)
 		go tessaEvents.Start(ctx)
 		appdataHandler.ConfigureTessa(
-			true, cfg.TessaAIProviderAllowlist, cfg.TessaAINoticeRevision,
+			true, cfg.TessaAINoticeRevision,
 			cfg.TessaAIPrimaryProvider, cfg.AIModelName(cfg.TessaAIPrimaryProvider),
 			cfg.TessaAIConfigHash(), tessaEvents,
 		)
@@ -766,7 +766,6 @@ func main() {
 		}
 		if cfg.TessaWhatsAppConversationsEnabled {
 			tessaWorkerConfig.WhatsAppPhoneNumberID = cfg.WABAPhoneNumberID
-			tessaWorkerConfig.WhatsAppProviderAllowlist = cfg.TessaAIProviderAllowlist
 		}
 		tessaWorker, workerErr := appdata.NewTessaWorker(
 			appdataRepo, tessaService, helpIndex, inboxAIGenerationLimiter, logger,

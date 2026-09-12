@@ -39,7 +39,6 @@ type Config struct {
 	TessaAIEnabled                        bool
 	TessaWhatsAppLinkingEnabled           bool
 	TessaWhatsAppConversationsEnabled     bool
-	TessaAIProviderAllowlist              []string
 	TessaAIPrimaryProvider                string
 	TessaAIFallbackProvider               string
 	TessaAIPrimaryRequestTimeout          time.Duration
@@ -370,7 +369,6 @@ func Load() (Config, error) {
 		TessaAIEnabled:                        tessaAIEnabled,
 		TessaWhatsAppLinkingEnabled:           getEnvBool("TESSA_WHATSAPP_LINKING_ENABLED", false),
 		TessaWhatsAppConversationsEnabled:     getEnvBool("TESSA_WHATSAPP_CONVERSATIONS_ENABLED", false),
-		TessaAIProviderAllowlist:              splitCSV(os.Getenv("TESSA_AI_PROVIDER_ALLOWLIST")),
 		TessaAIPrimaryProvider:                normalizeAIProvider(getEnv("TESSA_AI_PRIMARY_PROVIDER", AIProviderSelfHosted)),
 		TessaAIFallbackProvider:               normalizeAIProvider(os.Getenv("TESSA_AI_FALLBACK_PROVIDER")),
 		TessaAIPrimaryRequestTimeout:          getEnvDuration("TESSA_AI_PRIMARY_REQUEST_TIMEOUT", 30*time.Second),
@@ -662,16 +660,8 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST contains invalid UUID %q", rawID)
 		}
 	}
-	for _, rawID := range cfg.TessaAIProviderAllowlist {
-		if _, err := uuid.Parse(rawID); err != nil {
-			return Config{}, fmt.Errorf("TESSA_AI_PROVIDER_ALLOWLIST contains invalid UUID %q", rawID)
-		}
-	}
 	if cfg.InboxAIAutomationEnabled && len(cfg.InboxAIAutomationProviderAllowlist) == 0 {
 		return Config{}, fmt.Errorf("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST is required when automation is enabled")
-	}
-	if cfg.TessaAIEnabled && len(cfg.TessaAIProviderAllowlist) == 0 {
-		return Config{}, fmt.Errorf("TESSA_AI_PROVIDER_ALLOWLIST is required when Tessa is enabled")
 	}
 	if err := validateAIProvider("TESSA_AI_PRIMARY_PROVIDER", cfg.TessaAIPrimaryProvider); err != nil {
 		return Config{}, err

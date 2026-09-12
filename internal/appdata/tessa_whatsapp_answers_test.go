@@ -120,7 +120,7 @@ func TestTessaWhatsAppTypingAuthorityAndRetryIntegration(t *testing.T) {
 			case "queued":
 				_, err = repo.db.Exec(ctx, `UPDATE tessa_runs SET status='queued',lease_owner='',lease_token=NULL,lease_expires_at=NULL WHERE id=$1`, run.ID)
 			case "revoked":
-				err = whatsapp.NewTessaLinkRepository(repo.db, "19990001", "+2348000000000", true, []string{clientID.String()}).Disconnect(ctx, clientID)
+				err = whatsapp.NewTessaLinkRepository(repo.db, "19990001", "+2348000000000", true).Disconnect(ctx, clientID)
 			case "expired":
 				_, err = repo.db.Exec(ctx, `UPDATE tessa_whatsapp_ingress SET source_timestamp=NOW()-INTERVAL '25 hours' WHERE id=$1`, id)
 			}

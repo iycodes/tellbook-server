@@ -37,20 +37,18 @@ type TessaWorkerConfig struct {
 	ConfigHash     string
 	NoticeRevision string
 	// Deliberately unset in production until B4 reply delivery is wired.
-	WhatsAppPhoneNumberID     string
-	WhatsAppProviderAllowlist []string
+	WhatsAppPhoneNumberID string
 }
 
 type TessaWorker struct {
-	repo              *Repository
-	service           *tessa.Service
-	help              *tessa.HelpIndex
-	limiter           *InboxAIGenerationLimiter
-	logger            *slog.Logger
-	config            TessaWorkerConfig
-	workerPrefix      string
-	whatsAppProviders map[uuid.UUID]bool
-	whatsAppTyping    whatsapp.TypingSender
+	repo           *Repository
+	service        *tessa.Service
+	help           *tessa.HelpIndex
+	limiter        *InboxAIGenerationLimiter
+	logger         *slog.Logger
+	config         TessaWorkerConfig
+	workerPrefix   string
+	whatsAppTyping whatsapp.TypingSender
 }
 
 type tessaClaimedRun struct {
@@ -91,16 +89,9 @@ func NewTessaWorker(
 	if limiter == nil {
 		limiter = NewInboxAIGenerationLimiter(config.MaxConcurrency)
 	}
-	allowed := make(map[uuid.UUID]bool, len(config.WhatsAppProviderAllowlist))
-	for _, raw := range config.WhatsAppProviderAllowlist {
-		if id, err := uuid.Parse(raw); err == nil {
-			allowed[id] = true
-		}
-	}
 	return &TessaWorker{
 		repo: repo, service: service, help: help, limiter: limiter, logger: logger, config: config,
-		workerPrefix:      "tessa-" + uuid.NewString(),
-		whatsAppProviders: allowed,
+		workerPrefix: "tessa-" + uuid.NewString(),
 	}, nil
 }
 

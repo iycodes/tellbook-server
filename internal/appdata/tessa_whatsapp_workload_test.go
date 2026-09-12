@@ -71,11 +71,9 @@ func TestTessaWhatsAppMultiProviderWorkloadIntegration(t *testing.T) {
 	const providers, waves, turnsPerWave, concurrency = 24, 2, 2, 4
 	const phoneID = "19990001"
 	ids := make([]uuid.UUID, providers)
-	allowlist := make([]string, providers)
 	destinations := make([]string, providers)
 	for n := range providers {
 		ids[n] = insertTessaTestClient(t, ctx, pool)
-		allowlist[n] = ids[n].String()
 		destinations[n] = fmt.Sprintf("+23480009%05d", n)
 		if err := repo.CompleteTessaIntroduction(ctx, ids[n], "test-v1", "test-v1"); err != nil {
 			t.Fatal(err)
@@ -92,7 +90,7 @@ func TestTessaWhatsAppMultiProviderWorkloadIntegration(t *testing.T) {
 	base := newTessaIntegrationWorker(t, repo, g, nil)
 	config := base.config
 	config.MaxConcurrency = concurrency
-	config.WhatsAppPhoneNumberID, config.WhatsAppProviderAllowlist = phoneID, allowlist
+	config.WhatsAppPhoneNumberID = phoneID
 	limiter := NewInboxAIGenerationLimiter(concurrency)
 	var generationDuration time.Duration
 	for wave := range waves {
@@ -170,7 +168,7 @@ func TestTessaWhatsAppMultiProviderWorkloadIntegration(t *testing.T) {
 			}
 		}
 	}
-	links := whatsapp.NewTessaLinkRepository(pool, phoneID, "+2348000000000", true, allowlist)
+	links := whatsapp.NewTessaLinkRepository(pool, phoneID, "+2348000000000", true)
 	if err := links.WithAssistantReplies("https://provider.example.invalid", "test-v1"); err != nil {
 		t.Fatal(err)
 	}

@@ -55,7 +55,6 @@ func tessaWhatsAppFixture(t *testing.T) (context.Context, *Repository, uuid.UUID
 	base := newTessaIntegrationWorker(t, repo, g, nil)
 	config := base.config
 	config.WhatsAppPhoneNumberID = "19990001"
-	config.WhatsAppProviderAllowlist = []string{clientID.String()}
 	worker, err := NewTessaWorker(repo, base.service, base.help, nil, nil, config)
 	if err != nil {
 		t.Fatal(err)
@@ -347,7 +346,7 @@ func TestTessaWhatsAppBoundedQueueExpiryAndResetIntegration(t *testing.T) {
 			case "reset":
 				_, err = repo.CreateTessaThread(ctx, clientID, uuid.New(), "test-v1")
 			case "revocation":
-				err = whatsapp.NewTessaLinkRepository(repo.db, "19990001", "+2348000000000", true, []string{clientID.String()}).Disconnect(ctx, clientID)
+				err = whatsapp.NewTessaLinkRepository(repo.db, "19990001", "+2348000000000", true).Disconnect(ctx, clientID)
 			case "security_revision":
 				_, err = repo.db.Exec(ctx, `UPDATE clients SET security_revision=security_revision+1 WHERE id=$1`, clientID)
 			case "notice":
@@ -384,7 +383,7 @@ func TestTessaWhatsAppConcurrentAdmissionAndAuthorityIntegration(t *testing.T) {
 		t.Fatal("concurrent admission duplicated a run", err)
 	}
 	g.before = func() {
-		if err := whatsapp.NewTessaLinkRepository(repo.db, "19990001", "+2348000000000", true, []string{clientID.String()}).Disconnect(ctx, clientID); err != nil {
+		if err := whatsapp.NewTessaLinkRepository(repo.db, "19990001", "+2348000000000", true).Disconnect(ctx, clientID); err != nil {
 			t.Fatal(err)
 		}
 	}

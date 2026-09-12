@@ -39,24 +39,17 @@ type TessaLinkRepository struct {
 	db                         *pgxpool.Pool
 	phoneID, businessPhone     string
 	enabled                    bool
-	allowed                    map[uuid.UUID]bool
 	emailLinks                 TessaEmailLinkService
 	webURL                     string
 	conversations              TessaConversationIngress
 	answerOrigin, answerNotice string
 }
 
-func NewTessaLinkRepository(db *pgxpool.Pool, phoneID, businessPhone string, enabled bool, providerIDs []string) *TessaLinkRepository {
-	allowed := make(map[uuid.UUID]bool, len(providerIDs))
-	for _, raw := range providerIDs {
-		if id, err := uuid.Parse(raw); err == nil {
-			allowed[id] = true
-		}
-	}
-	return &TessaLinkRepository{db: db, phoneID: phoneID, businessPhone: businessPhone, enabled: enabled, allowed: allowed}
+func NewTessaLinkRepository(db *pgxpool.Pool, phoneID, businessPhone string, enabled bool) *TessaLinkRepository {
+	return &TessaLinkRepository{db: db, phoneID: phoneID, businessPhone: businessPhone, enabled: enabled}
 }
 func (r *TessaLinkRepository) State(ctx context.Context, clientID uuid.UUID) (TessaWhatsAppState, error) {
-	state := TessaWhatsAppState{LinkingAvailable: r.enabled && r.allowed[clientID], Status: "disconnected", NoticeRevision: TessaWhatsAppNotice}
+	state := TessaWhatsAppState{LinkingAvailable: r.enabled, Status: "disconnected", NoticeRevision: TessaWhatsAppNotice}
 	var destination string
 	err := r.db.QueryRow(ctx, `SELECT c.destination,CASE WHEN c.status='revoked' THEN 'disconnected'
 	 WHEN c.security_revision<>p.security_revision OR c.expires_at<=NOW() OR c.notice_revision<>$3 THEN 'expired'
@@ -74,7 +67,7 @@ func (r *TessaLinkRepository) State(ctx context.Context, clientID uuid.UUID) (Te
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = nil
 	}
-	state.ConversationAvailable = r.conversationAvailable() && r.allowed[clientID]
+	state.ConversationAvailable = r.conversationAvailable()
 	return state, err
 }
 
@@ -82,7 +75,7 @@ func (r *TessaLinkRepository) conversationAvailable() bool {
 	return r.enabled && r.conversations != nil && r.answerOrigin != "" && r.answerNotice != ""
 }
 func (r *TessaLinkRepository) Start(ctx context.Context, clientID uuid.UUID, number, notice string) (TessaLinkChallenge, error) {
-	if !r.enabled || !r.allowed[clientID] {
+	if !r.enabled {
 		return TessaLinkChallenge{}, ErrTessaLinkUnavailable
 	}
 	if notice != TessaWhatsAppNotice {
@@ -227,9 +220,6 @@ func (r *TessaLinkRepository) applyControlTx(ctx context.Context, tx pgx.Tx, rec
 	var revision int64
 	if err = tx.QueryRow(ctx, `SELECT security_revision FROM clients WHERE id=$1 FOR UPDATE`, clientID).Scan(&revision); err != nil {
 		return err
-	}
-	if !r.allowed[clientID] {
-		return nil
 	}
 	var id uuid.UUID
 	var expected, notice string

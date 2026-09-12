@@ -86,7 +86,7 @@ func TestTessaRevocationPublishesDeliveryCancellationIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = whatsapp.NewTessaLinkRepository(repo.db, "19990001", "+2348000000000", true, []string{clientID.String()}).Disconnect(ctx, clientID); err != nil {
+	if err = whatsapp.NewTessaLinkRepository(repo.db, "19990001", "+2348000000000", true).Disconnect(ctx, clientID); err != nil {
 		t.Fatal(err)
 	}
 	events, err := repo.ListTessaEventsAfter(ctx, clientID, initial.RealtimeCursor, 100)

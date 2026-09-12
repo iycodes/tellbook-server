@@ -32,7 +32,7 @@ func tessaLinkFixture(t *testing.T) (context.Context, *TessaLinkRepository, uuid
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := NewTessaLinkRepository(db, "19990001", "+2348000000000", true, []string{id.String()})
+	r := NewTessaLinkRepository(db, "19990001", "+2348000000000", true)
 	t.Cleanup(func() {
 		_, _ = db.Exec(context.Background(), `DELETE FROM meta_whatsapp_webhook_receipts WHERE id IN (SELECT source_receipt_id FROM tessa_whatsapp_outbox WHERE client_id=$1)`, id)
 		_, _ = db.Exec(context.Background(), `DELETE FROM clients WHERE id=$1`, id)
@@ -46,6 +46,33 @@ func tessaChallengeToken(t *testing.T, c TessaLinkChallenge) string {
 		t.Fatal(err)
 	}
 	return strings.TrimPrefix(u.Query().Get("text"), "TESSA LINK ")
+}
+
+func TestTessaLinkAvailableToEveryProviderIntegration(t *testing.T) {
+	ctx, repo, first, store := tessaLinkFixture(t)
+	_, _, second, _ := tessaLinkFixture(t)
+	for index, id := range []uuid.UUID{first, second} {
+		state, err := repo.State(ctx, id)
+		if err != nil || !state.LinkingAvailable {
+			t.Fatal("every provider must be eligible for verified linking", state, err)
+		}
+		sender := []string{"2348011111101", "2348011111102"}[index]
+		challenge, err := repo.Start(ctx, id, "+"+sender, TessaWhatsAppNotice)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.StoreWebhookReceipts(ctx, []WebhookReceipt{tessaInbound("tessa_link", tessaChallengeToken(t, challenge), sender)}); err != nil {
+			t.Fatal(err)
+		}
+		state, err = repo.State(ctx, id)
+		if err != nil || state.Status != "connected" {
+			t.Fatal("verified provider could not connect", state, err)
+		}
+	}
+	repo.enabled = false
+	if _, err := repo.Start(ctx, second, "+2348011111102", TessaWhatsAppNotice); !errors.Is(err, ErrTessaLinkUnavailable) {
+		t.Fatal("channel disable must still prevent linking", err)
+	}
 }
 func tessaInbound(kind, token, sender string) WebhookReceipt {
 	now := time.Now()
@@ -554,7 +581,6 @@ func TestTessaInboundDisconnectWhileDisabledIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			r.enabled = false
-			r.allowed = map[uuid.UUID]bool{}
 			if err = store.StoreWebhookReceipts(ctx, []WebhookReceipt{tessaInbound(command, "", "2348142751683")}); err != nil {
 				t.Fatal(err)
 			}

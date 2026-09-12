@@ -237,7 +237,7 @@ func TestTessaEmailLinkStaleDispatchIntegration(t *testing.T) {
 			r := tessaEmailRequest(t, ctx, s, clientID)
 			id := issueTessaEmail(t, ctx, s, r)
 			job, code := claimTessaEmail(t, ctx, s, id)
-			repo := whatsapp.NewTessaLinkRepository(s.db, r.PhoneNumberID, "+2348000000000", true, []string{clientID.String()})
+			repo := whatsapp.NewTessaLinkRepository(s.db, r.PhoneNumberID, "+2348000000000", true)
 			var err error
 			sender := &securityCaptureSender{}
 			switch scenario {

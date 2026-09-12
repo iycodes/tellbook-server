@@ -15,8 +15,6 @@ import (
 
 	"booking/go-server/internal/config"
 	"booking/go-server/internal/tessa"
-
-	"github.com/google/uuid"
 )
 
 func TestTessaHostedGeneratorNeverWritesFullResponseLog(t *testing.T) {
@@ -167,11 +165,6 @@ func liveTessaFallbackConfig(t *testing.T) config.Config {
 	}
 	if required("TESSA_AI_NOTICE_REVISION") == "" {
 		t.Fatal("TESSA_AI_NOTICE_REVISION is required")
-	}
-	for _, rawID := range strings.Split(required("TESSA_AI_PROVIDER_ALLOWLIST"), ",") {
-		if _, err := uuid.Parse(strings.TrimSpace(rawID)); err != nil {
-			t.Fatalf("TESSA_AI_PROVIDER_ALLOWLIST contains invalid UUID %q", rawID)
-		}
 	}
 	timeout := 20 * time.Second
 	if value := strings.TrimSpace(os.Getenv("TESSA_AI_FALLBACK_REQUEST_TIMEOUT")); value != "" {

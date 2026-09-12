@@ -84,7 +84,6 @@ func setRequiredConfig(t *testing.T) {
 	t.Setenv("TESSA_AI_ENABLED", "false")
 	t.Setenv("TESSA_WHATSAPP_LINKING_ENABLED", "false")
 	t.Setenv("TESSA_WHATSAPP_CONVERSATIONS_ENABLED", "false")
-	t.Setenv("TESSA_AI_PROVIDER_ALLOWLIST", "")
 	t.Setenv("TESSA_AI_PRIMARY_PROVIDER", AIProviderSelfHosted)
 	t.Setenv("TESSA_AI_FALLBACK_PROVIDER", "")
 	t.Setenv("TESSA_AI_EXTERNAL_PROCESSING_APPROVED", "false")
@@ -529,9 +528,7 @@ func TestLoadReadsAndValidatesInboxAIControls(t *testing.T) {
 
 func TestLoadReadsAndValidatesTessaAIControls(t *testing.T) {
 	setRequiredConfig(t)
-	providerID := "10000000-0000-4000-8000-000000000001"
 	t.Setenv("TESSA_AI_ENABLED", "true")
-	t.Setenv("TESSA_AI_PROVIDER_ALLOWLIST", providerID)
 	t.Setenv("TESSA_AI_FALLBACK_PROVIDER", AIProviderHosted)
 	t.Setenv("TESSA_AI_EXTERNAL_PROCESSING_APPROVED", "true")
 	t.Setenv("OPENAI_API_KEY", "test-openai-key")
@@ -540,21 +537,11 @@ func TestLoadReadsAndValidatesTessaAIControls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if !cfg.TessaAIEnabled || len(cfg.TessaAIProviderAllowlist) != 1 ||
-		cfg.TessaAIProviderAllowlist[0] != providerID || cfg.TessaAIPrimaryProvider != AIProviderSelfHosted ||
+	if !cfg.TessaAIEnabled || cfg.TessaAIPrimaryProvider != AIProviderSelfHosted ||
 		cfg.TessaAIFallbackProvider != AIProviderHosted || !cfg.TessaAIExternalProcessingApproved {
 		t.Fatalf("unexpected Tessa AI controls: %+v", cfg)
 	}
 
-	t.Setenv("TESSA_AI_PROVIDER_ALLOWLIST", "")
-	if _, err := Load(); err == nil {
-		t.Fatal("Load() enabled Tessa without an explicit provider allowlist")
-	}
-	t.Setenv("TESSA_AI_PROVIDER_ALLOWLIST", "not-a-uuid")
-	if _, err := Load(); err == nil {
-		t.Fatal("Load() accepted an invalid Tessa provider allowlist")
-	}
-	t.Setenv("TESSA_AI_PROVIDER_ALLOWLIST", providerID)
 	t.Setenv("TESSA_AI_NOTICE_REVISION", "")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() enabled Tessa without an explicit notice revision")
@@ -573,6 +560,22 @@ func TestLoadReadsAndValidatesTessaAIControls(t *testing.T) {
 	}
 }
 
+func TestLoadTessaIgnoresRemovedProviderAllowlist(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("TESSA_AI_ENABLED", "true")
+	for _, oldValue := range []string{"", "10000000-0000-4000-8000-000000000001", "obsolete-value"} {
+		t.Setenv("TESSA_AI_PROVIDER_ALLOWLIST", oldValue)
+		cfg, err := Load()
+		if err != nil || !cfg.TessaAIEnabled {
+			t.Fatalf("removed account restriction must not affect enabled Tessa: %v", err)
+		}
+	}
+	t.Setenv("TESSA_AI_ENABLED", "false")
+	if cfg, err := Load(); err != nil || cfg.TessaAIEnabled {
+		t.Fatalf("the global off switch must remain effective: %v", err)
+	}
+}
+
 func TestTessaWhatsAppConversationRollout(t *testing.T) {
 	setRequiredConfig(t)
 	cfg, err := Load()
@@ -584,7 +587,6 @@ func TestTessaWhatsAppConversationRollout(t *testing.T) {
 		t.Fatal("chat bypassed linking gate", err)
 	}
 	t.Setenv("TESSA_AI_ENABLED", "true")
-	t.Setenv("TESSA_AI_PROVIDER_ALLOWLIST", "10000000-0000-4000-8000-000000000001")
 	t.Setenv("TESSA_WHATSAPP_LINKING_ENABLED", "true")
 	t.Setenv("META_APP_SECRET", strings.Repeat("a", 32))
 	t.Setenv("META_VERIFY_TOKEN", strings.Repeat("b", 32))
@@ -682,7 +684,6 @@ func TestLoadBudgetsDatabasePoolForDedicatedListeners(t *testing.T) {
 		t.Fatalf("Load() rejected the API role's exact direct pool budget: %v", err)
 	}
 	t.Setenv("TESSA_AI_ENABLED", "true")
-	t.Setenv("TESSA_AI_PROVIDER_ALLOWLIST", "10c39b94-a234-4f63-b938-ef14e1cc1ab1")
 	t.Setenv("DATABASE_DIRECT_MAX_CONNECTIONS", "3")
 	if _, err := Load(); err == nil {
 		t.Fatal("Load() accepted an API direct pool without room for the Tessa listener")

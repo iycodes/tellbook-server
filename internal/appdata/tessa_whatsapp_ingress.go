@@ -175,7 +175,7 @@ func (worker *TessaWorker) admitWhatsApp(ctx context.Context) (bool, error) {
 		reason = "queue_expired"
 	} else if threadStatus != "active" {
 		reason = "thread_archived"
-	} else if !valid || !worker.whatsAppAllowed(clientID) {
+	} else if !valid {
 		reason = "connection_changed"
 	}
 	if reason == "" {
@@ -222,10 +222,6 @@ func (worker *TessaWorker) admitWhatsApp(ctx context.Context) (bool, error) {
 
 var errTessaWhatsAppAuthority = errors.New("Tessa WhatsApp authority changed")
 
-func (worker *TessaWorker) whatsAppAllowed(clientID uuid.UUID) bool {
-	return worker.whatsAppProviders[clientID]
-}
-
 func (worker *TessaWorker) checkWhatsAppAuthority(ctx context.Context, q tessaNoticeQueryRower, run tessaClaimedRun) error {
 	if run.SourceChannel == "web" {
 		return nil
@@ -242,7 +238,7 @@ func (worker *TessaWorker) checkWhatsAppAuthority(ctx context.Context, q tessaNo
 	if err != nil {
 		return err
 	}
-	if channel == "whatsapp" && (!valid || !worker.whatsAppAllowed(run.ClientID)) {
+	if channel == "whatsapp" && !valid {
 		return errTessaWhatsAppAuthority
 	}
 	return nil

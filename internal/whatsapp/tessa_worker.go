@@ -211,7 +211,7 @@ func (w *TessaControlWorker) authorize(ctx context.Context, j *tessaControlJob) 
 	if err != nil {
 		return false, err
 	}
-	if !valid || !answerValid || !window || !w.repo.enabled || (clientID != nil && !w.repo.allowed[*clientID]) {
+	if !valid || !answerValid || !window || !w.repo.enabled {
 		status, code := "cancelled", "grant_changed"
 		if !window {
 			status, code = "expired", "customer_service_window_closed"

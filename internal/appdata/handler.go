@@ -100,7 +100,6 @@ type Handler struct {
 	inboxAIGenerationLimiter *InboxAIGenerationLimiter
 	tessaEnabled             bool
 	tessaWhatsApp            *whatsapp.TessaLinkRepository
-	tessaProviderAllowlist   map[uuid.UUID]struct{}
 	tessaNoticeRevision      string
 	tessaPrimaryProvider     string
 	tessaPrimaryModel        string
@@ -142,7 +141,6 @@ func (h *Handler) ConfigureInboxCommandLimiter(shared interface {
 
 func (h *Handler) ConfigureTessa(
 	enabled bool,
-	providerAllowlist []string,
 	noticeRevision, primaryProvider, primaryModel, configHash string,
 	broker *TessaEventBroker,
 ) {
@@ -152,20 +150,13 @@ func (h *Handler) ConfigureTessa(
 	h.tessaPrimaryModel = strings.TrimSpace(primaryModel)
 	h.tessaConfigHash = strings.TrimSpace(configHash)
 	h.tessaEvents = broker
-	h.tessaProviderAllowlist = make(map[uuid.UUID]struct{}, len(providerAllowlist))
-	for _, rawID := range providerAllowlist {
-		if id, err := uuid.Parse(strings.TrimSpace(rawID)); err == nil {
-			h.tessaProviderAllowlist[id] = struct{}{}
-		}
-	}
 }
 
 func (h *Handler) tessaAvailable(clientID uuid.UUID) bool {
 	if !h.tessaEnabled || h.repo == nil || h.tessaEvents == nil {
 		return false
 	}
-	_, allowed := h.tessaProviderAllowlist[clientID]
-	return allowed
+	return clientID != uuid.Nil
 }
 
 func (h *Handler) ConfigureInboxAIDrafts(enabled bool, modelProvider, modelName, modelConfigHash string, providerAllowlist []string, limiter *InboxAIGenerationLimiter) {

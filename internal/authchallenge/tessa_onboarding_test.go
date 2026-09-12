@@ -32,7 +32,7 @@ func newOnboardingHarness(t *testing.T) *onboardingHarness {
 	if _, err := s.db.Exec(ctx, `DELETE FROM tessa_whatsapp_security_events WHERE id=$1`, eventID); err != nil {
 		t.Fatal(err)
 	}
-	repo := whatsapp.NewTessaLinkRepository(s.db, "19990001", "+2348000000000", true, []string{id.String()}).WithEmailLinking(s, "https://provider.example.invalid")
+	repo := whatsapp.NewTessaLinkRepository(s.db, "19990001", "+2348000000000", true).WithEmailLinking(s, "https://provider.example.invalid")
 	h, err := whatsapp.NewWebhookHandler(whatsapp.WebhookConfig{AppSecret: "test-only-secret", VerifyToken: "test-only-verify", BusinessID: "100", PhoneNumberID: "19990001"}, whatsapp.NewWebhookRepository(s.db, nil).WithTessaLinks(repo), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -180,7 +180,7 @@ func TestTessaOnboardingEmailReplacementIntegration(t *testing.T) {
 }
 
 func TestTessaOnboardingGenericEligibilityAndConsentIntegration(t *testing.T) {
-	for _, scenario := range []string{"unknown", "unverified", "not_allowed", "eligible"} {
+	for _, scenario := range []string{"unknown", "unverified", "eligible"} {
 		t.Run(scenario, func(t *testing.T) {
 			h := newOnboardingHarness(t)
 			email := h.clientID.String() + "@example.invalid"
@@ -189,13 +189,6 @@ func TestTessaOnboardingGenericEligibilityAndConsentIntegration(t *testing.T) {
 				email = "not-registered@example.invalid"
 			case "unverified":
 				if _, err := h.s.db.Exec(h.ctx, `UPDATE clients SET email_verified_at=NULL WHERE id=$1`, h.clientID); err != nil {
-					t.Fatal(err)
-				}
-			case "not_allowed":
-				h.repo = whatsapp.NewTessaLinkRepository(h.s.db, "19990001", "+2348000000000", true, nil).WithEmailLinking(h.s, "https://provider.example.invalid")
-				var err error
-				h.handler, err = whatsapp.NewWebhookHandler(whatsapp.WebhookConfig{AppSecret: "test-only-secret", VerifyToken: "test-only-verify", BusinessID: "100", PhoneNumberID: "19990001"}, whatsapp.NewWebhookRepository(h.s.db, nil).WithTessaLinks(h.repo), nil)
-				if err != nil {
 					t.Fatal(err)
 				}
 			}

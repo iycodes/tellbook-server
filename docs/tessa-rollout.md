@@ -155,9 +155,21 @@ external live suite was not rerun. No live messages were sent or services restar
 The repository-wide suite is not certified by this update: the existing unrelated
 `TestClassifyInboundControlIsExactAndBounded` expectation for `STOP now` remains unresolved.
 
-Tessa remains disabled unless `TESSA_AI_ENABLED=true` and the authenticated provider UUID is in
-`TESSA_AI_PROVIDER_ALLOWLIST`. Start with a small allowlist and expand it only after the gates below
-pass against the exact model and worker concurrency intended for that environment.
+Tessa is available to every authenticated provider when `TESSA_AI_ENABLED=true`; this is the
+global on/off switch. `TESSA_AI_PROVIDER_ALLOWLIST` has been removed and any stale value is ignored.
+WhatsApp still requires its channel switches, verified account linking, current consent and an
+unexpired connection. Tenant isolation, rate limits and delivery authority checks are unchanged.
+Test recipient restrictions belong only in opt-in live-test harnesses, not application access.
+Run the gates below against the exact model and worker concurrency intended for the environment.
+Deploy this change to the API, core worker and AI worker together, then restart those processes;
+changing or deleting the old environment variable alone does not update an older binary.
+
+Account-access update verification (12 September 2026): focused race tests, isolated PostgreSQL
+Tessa integration tests in appdata/authchallenge/whatsapp, static analysis and the API build passed.
+Coverage includes multiple providers without account configuration, anonymous rejection, global
+disable, verified linking, revocation and tenant isolation. No live accounts or delivery workers
+were changed. The broader WhatsApp package still has the unrelated `STOP now` classification
+test failure noted above.
 
 ## Automated gates
 
@@ -185,7 +197,7 @@ includes planning and synthesis and uses the running API's model, sampling, inpu
 timeout, and total-turn settings. It fails above a 45-second p95. Set
 `TESSA_LOCAL_CAPACITY_CONCURRENCY` to `TESSA_AI_WORKER_CONCURRENCY`; increase the turn count for a
 longer soak. Record the model, hardware, turn count, concurrency, turn throughput, p50, p95, and
-failures before changing the provider allowlist. Tool reads are covered separately by the database
+failures before increasing traffic or worker concurrency. Tool reads are covered separately by the database
 plans and PostgreSQL integration suite.
 
 Latest local baseline (2026-08-31): `gemma-4-E4B-it-UD-Q5_K_XL.gguf`, 6/6 complete turns,
@@ -193,8 +205,8 @@ concurrency 2, 69.816 seconds elapsed, 0.09 turns/second, p50 25.383 seconds, p9
 Re-run this gate on deployment hardware; this development result is not a substitute for that
 environment's own measurement.
 
-When an external fallback is selected, its credentials, approved-processing flag, notice revision,
-and allowlist must match the intended deployment configuration. Run both suites below against every
+When an external fallback is selected, its credentials, approved-processing flag and notice revision
+must match the intended deployment configuration. Run both suites below against every
 model/version selected for fallback:
 
 ```sh
@@ -208,7 +220,7 @@ ignore `OPENAI_RESPONSE_LOG_FILE`, so full assistant output is not written to th
 
 ## Rollout decision
 
-Do not expand the allowlist when any conformance request fails, the configured concurrency exceeds
+Do not enable Tessa when any conformance request fails, the configured concurrency exceeds
 measured full-turn capacity, database or SSE reset tests fail, or external-processing
 approval/notice data is not current. Tessa requires an explicitly configured notice revision, a
 self-hosted primary, and explicit approval before an external fallback can be enabled. A local-model
