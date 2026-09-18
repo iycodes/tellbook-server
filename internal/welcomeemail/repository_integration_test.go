@@ -48,7 +48,12 @@ func TestProviderAssignmentAndDeliveryLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assignment := Assignment{Audience: AudienceProvider, AccountID: providerID, Email: email, Name: `Sam & Sons`}
+	var expectedVersion int
+	if err := tx.QueryRow(ctx, `SELECT version FROM welcome_email_templates WHERE audience='provider' AND status='active'`).Scan(&expectedVersion); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	assignment := Assignment{Audience: AudienceProvider, AccountID: providerID, Email: email, Name: `Sam & Sons`, ActionURL: "https://example.com/"}
 	if err := AssignTx(ctx, tx, assignment); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
@@ -69,7 +74,7 @@ func TestProviderAssignmentAndDeliveryLifecycle(t *testing.T) {
 	`, providerID).Scan(&count, &version, &htmlBody); err != nil {
 		t.Fatal(err)
 	}
-	if count != 1 || version != 1 {
+	if count != 1 || version != expectedVersion {
 		t.Fatalf("assigned jobs = %d at version %d", count, version)
 	}
 	if !strings.Contains(htmlBody, "Sam &amp; Sons") {

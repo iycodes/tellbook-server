@@ -2,6 +2,7 @@ package payments
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -146,18 +147,11 @@ func (s *PayoutService) RetryCreated(ctx context.Context, payout FinancialPayout
 	if payout.Status != PayoutStatusCreated {
 		return payout, nil
 	}
-	destination, err := s.repository.getPayoutDestination(ctx, payout.PayoutDestinationID)
-	if err != nil {
-		return FinancialPayout{}, err
-	}
-	if destination.ClientID != payout.ClientID {
-		return FinancialPayout{}, ErrLedgerRecordNotFound
-	}
 	capability, provider, err := s.providerFor(payout.Provider, payout.CountryCode, payout.CurrencyCode, payout.Rail)
 	if err != nil {
 		return FinancialPayout{}, err
 	}
-	recipient, err := s.providerRecipient(ctx, destination)
+	recipient, err := s.recipientForPayout(ctx, payout, false)
 	if err != nil {
 		return FinancialPayout{}, err
 	}
@@ -171,6 +165,21 @@ func (s *PayoutService) initializeCreatedPayout(
 	provider PayoutProvider,
 	recipient ProviderRecipient,
 ) (FinancialPayout, error) {
+	// Even a replay through the provider-facing initiation path must retain
+	// the reviewed recipient rather than the caller's live destination lookup.
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payout.DestinationSnapshot, &fields); err != nil {
+		return FinancialPayout{}, err
+	}
+	_, reviewed := fields["reviewed_fingerprint"]
+	_, pinned := fields["reviewed_destination"]
+	if reviewed || pinned {
+		var err error
+		recipient, err = s.recipientForPayout(ctx, payout, false)
+		if err != nil {
+			return FinancialPayout{}, err
+		}
+	}
 	if liquidity, ok := provider.(PayoutLiquidityProvider); ok {
 		available, err := liquidity.AvailablePayoutBalance(ctx, payout.CurrencyCode)
 		if err != nil {
@@ -286,14 +295,7 @@ func (s *PayoutService) Reconcile(ctx context.Context, payout FinancialPayout) (
 	if err != nil {
 		return FinancialPayout{}, err
 	}
-	destination, err := s.repository.getPayoutDestination(ctx, payout.PayoutDestinationID)
-	if err != nil {
-		return FinancialPayout{}, err
-	}
-	if destination.ClientID != payout.ClientID {
-		return FinancialPayout{}, ErrLedgerRecordNotFound
-	}
-	recipient, err := s.reconciliationRecipient(ctx, destination)
+	recipient, err := s.recipientForPayout(ctx, payout, true)
 	if err != nil {
 		return FinancialPayout{}, err
 	}
@@ -641,4 +643,41 @@ func (r *LedgerRepository) GetPayoutSummary(
 		return PayoutSummary{}, fmt.Errorf("get payout summary: %w", err)
 	}
 	return result, nil
+}
+
+// Reviewed payouts dispatch the committed recipient snapshot. Legacy payouts keep
+// their current recipient resolution. A malformed reviewed snapshot never falls
+// back to live destination data.
+func (s *PayoutService) recipientForPayout(ctx context.Context, payout FinancialPayout, reconciliation bool) (ProviderRecipient, error) {
+	var snapshot struct {
+		Fingerprint *string            `json:"reviewed_fingerprint"`
+		Destination *PayoutDestination `json:"reviewed_destination"`
+	}
+	if err := json.Unmarshal(payout.DestinationSnapshot, &snapshot); err != nil {
+		return ProviderRecipient{}, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payout.DestinationSnapshot, &fields); err != nil {
+		return ProviderRecipient{}, err
+	}
+	_, hasFingerprint := fields["reviewed_fingerprint"]
+	_, hasDestination := fields["reviewed_destination"]
+	if hasFingerprint || hasDestination {
+		d := snapshot.Destination
+		if snapshot.Fingerprint == nil || len(*snapshot.Fingerprint) != 64 || d == nil || d.ID != payout.PayoutDestinationID || d.ClientID != payout.ClientID || d.Provider != payout.Provider || d.CurrencyCode != payout.CurrencyCode || d.CountryCode != payout.CountryCode || d.Rail != payout.Rail {
+			return ProviderRecipient{}, errors.New("invalid reviewed payout recipient snapshot")
+		}
+		return s.recipientFromDestination(*d, reconciliation)
+	}
+	destination, err := s.repository.getPayoutDestination(ctx, payout.PayoutDestinationID)
+	if err != nil {
+		return ProviderRecipient{}, err
+	}
+	if destination.ClientID != payout.ClientID {
+		return ProviderRecipient{}, ErrLedgerRecordNotFound
+	}
+	if reconciliation {
+		return s.reconciliationRecipient(ctx, destination)
+	}
+	return s.providerRecipient(ctx, destination)
 }

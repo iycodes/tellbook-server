@@ -299,6 +299,9 @@ func (r *Repository) reconcileBookingTx(
 			return fmt.Errorf("cancel ineligible booking lifecycle deliveries: %w", err)
 		}
 	}
+	if !backfill {
+		return r.reconcileAdditionalTx(ctx, tx, state, event, suppressionCache)
+	}
 	return nil
 }
 
@@ -506,8 +509,10 @@ func (r *Repository) insertDeliveryTx(
 			scheduled_for=EXCLUDED.scheduled_for,next_attempt_at=EXCLUDED.next_attempt_at,
 			destination_hmac=EXCLUDED.destination_hmac,
 			preference_revision=EXCLUDED.preference_revision,status='pending',
+            lease_owner='',lease_expires_at=NULL,
 			last_error_code='',completed_at=NULL,updated_at=NOW()
-		WHERE notification_deliveries.status IN ('pending','retry','cancelled','failed')
+		WHERE (notification_deliveries.status IN ('pending','retry','cancelled','failed')
+           OR (notification_deliveries.notification_type='booking_step_reminder' AND notification_deliveries.status='processing'))
 		  AND notification_deliveries.dispatch_authorized_at IS NULL
 	`, uuid.New(), candidate.idempotencyKey, state.ClientID, state.MarketplaceCustomerID,
 		state.ID, eventID, eventSequence, candidate.audience, candidate.channel,

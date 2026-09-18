@@ -33,17 +33,6 @@ func validSecurityEmailPayload(p *securityEmailPayload) bool {
 	return true
 }
 
-func securityEmailText(p securityEmailPayload) string {
-	action := "was connected to"
-	if p.Kind == "replaced" {
-		action = "replaced the previous number connected to"
-	}
-	if p.Kind == "disconnected" {
-		action = "was disconnected from"
-	}
-	return fmt.Sprintf("WhatsApp ending %s %s your Tellbook Tessa assistant at %s.\n\nThis is an assistant connection change, not a change to your login number or booking reminder preferences.\n\nIf you did not make this change, sign in to Tellbook directly, review your Tessa WhatsApp connection and secure your account. This email contains no sign-in or verification code.", p.PhoneSuffix, action, p.OccurredAt.UTC().Format(time.RFC3339))
-}
-
 // Reuses the authentication email queue/transport, not the booking-email flag.
 // queued_at survives delivery-job retention, so old events can never be resent.
 func (s *Service) prepareTessaSecurityEmails(ctx context.Context, limit int) error {

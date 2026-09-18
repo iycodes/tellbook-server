@@ -19,13 +19,14 @@ const (
 type DataMaintenanceWorker struct {
 	db     *pgxpool.Pool
 	logger *slog.Logger
+	tasks  []dataMaintenanceTask
 }
 
 func NewDataMaintenanceWorker(db *pgxpool.Pool, logger *slog.Logger) *DataMaintenanceWorker {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &DataMaintenanceWorker{db: db, logger: logger}
+	return &DataMaintenanceWorker{db: db, logger: logger, tasks: dataMaintenanceTasks}
 }
 
 func (worker *DataMaintenanceWorker) Start(ctx context.Context) {
@@ -46,7 +47,7 @@ func (worker *DataMaintenanceWorker) Start(ctx context.Context) {
 }
 
 func (worker *DataMaintenanceWorker) runOnce(ctx context.Context) {
-	for _, task := range dataMaintenanceTasks {
+	for _, task := range worker.tasks {
 		var total int64
 		for range dataMaintenanceBatchesPerRun {
 			deleted, err := pruneMaintenanceTask(ctx, worker.db, task, time.Now().UTC(), dataMaintenanceBatchSize)
@@ -60,7 +61,7 @@ func (worker *DataMaintenanceWorker) runOnce(ctx context.Context) {
 			}
 		}
 		if total > 0 {
-			worker.logger.Debug("data maintenance task completed", "task", task.name, "deleted", total)
+			worker.logger.Debug("data maintenance task completed", "task", task.name, "affected", total)
 		}
 	}
 }
@@ -230,6 +231,8 @@ var dataMaintenanceTasks = []dataMaintenanceTask{
 			SELECT id FROM notification_deliveries
 			WHERE (status IN ('failed','deleted','cancelled','read','delivered')
 			       OR (channel='email' AND status='accepted'))
+              -- These rows are the booking-level deduplication record, including after rescheduling.
+              AND notification_type NOT IN ('booking_step_reminder','booking_completed')
 			  AND completed_at<$1::timestamptz-INTERVAL '90 days'
 			ORDER BY completed_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
 		)

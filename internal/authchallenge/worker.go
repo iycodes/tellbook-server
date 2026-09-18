@@ -13,6 +13,7 @@ import (
 
 	"booking/go-server/internal/mailer"
 	"booking/go-server/internal/secure"
+	"booking/go-server/internal/transactionemail"
 	"booking/go-server/internal/whatsapp"
 
 	"github.com/google/uuid"
@@ -97,6 +98,9 @@ func (worker *Worker) Start(ctx context.Context) {
 
 func (worker *Worker) drain(ctx context.Context) {
 	for ctx.Err() == nil {
+		if err := worker.service.prepareAccountSecurityEmails(ctx, 100); err != nil {
+			worker.logger.Error("prepare account security emails", "error", err)
+		}
 		if err := worker.service.prepareTessaSecurityEmails(ctx, 100); err != nil {
 			worker.logger.Error("prepare Tessa security email jobs", "error", err)
 		}
@@ -125,6 +129,9 @@ func (worker *Worker) processBatch(ctx context.Context, jobs []DeliveryJob) {
 }
 
 func (worker *Worker) processOne(ctx context.Context, job DeliveryJob) {
+	if job.TemplateKey == "account_security_email" && !worker.service.additionalEmailsEnabled {
+		return
+	}
 	worker.observeClaim(job)
 	payload, err := worker.service.decryptPayload(job)
 	if err != nil {
@@ -154,15 +161,19 @@ func (worker *Worker) processOne(ctx context.Context, job DeliveryJob) {
 		Text:      fmt.Sprintf("Use this code to continue to Tellbook:\n\n%s\n\nThe code expires 10 minutes after delivery. If you did not request it, you can ignore this message.", payload.Code),
 		MessageID: fmt.Sprintf("<auth-code-%s@mail.tellbook.app>", job.ID),
 	}
-	if job.TemplateKey == tessaSecurityEmailTemplate {
-		message.Subject = "Tellbook security: Tessa WhatsApp connection"
-		message.Text = securityEmailText(*payload.Security)
-		message.MessageID = fmt.Sprintf("<tessa-security-%s@mail.tellbook.app>", job.ID)
+	switch job.TemplateKey {
+	case "account_security_email":
+		message, err = transactionemail.RenderSecurity(*payload.AccountSecurity)
+	case tessaSecurityEmailTemplate, tessaLinkEmailTemplate:
+		message, err = renderTessaEmail(job.ID, job.TemplateKey, payload)
+	case "auth_code_email":
+		message, err = renderAuthCodeEmail(job.ID, payload)
 	}
-	if job.TemplateKey == tessaLinkEmailTemplate {
-		message.Subject = "Connect WhatsApp to your Tellbook Tessa assistant"
-		message.Text = fmt.Sprintf("A request was made to connect WhatsApp ending %s to your provider account's Tessa assistant.\n\nYour linking code: %s\n\nIt expires 10 minutes after the request. Enter it only in the Tessa WhatsApp conversation where you requested this connection. This is not a sign-in code. If you did not request this connection, do not share the code and ignore this message.", payload.Link.PhoneSuffix, payload.Code)
-		message.MessageID = fmt.Sprintf("<tessa-link-%s@mail.tellbook.app>", job.ID)
+	if err != nil {
+		finalizeContext, finalizeCancel := context.WithTimeout(context.WithoutCancel(ctx), finalizationTimeout)
+		defer finalizeCancel()
+		worker.finalizeFailure(finalizeContext, job, mailer.DispositionPermanent, "email_render_failed")
+		return
 	}
 	err = worker.sender.Send(deliveryContext, message)
 	cancel()
@@ -243,17 +254,18 @@ func (s *Service) claimDeliveryJobs(ctx context.Context, channel, owner string, 
 			SELECT id FROM auth_code_delivery_jobs
 			WHERE channel=$6 AND status IN ('pending','retry')
 			  AND next_attempt_at<=$1 AND delivery_deadline>$1 AND attempt_count<$4
-			ORDER BY (CASE WHEN template_key='tessa_security_email' THEN 1 ELSE 0 END),next_attempt_at,created_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
+ AND (template_key<>'account_security_email' OR $7)
+			ORDER BY (CASE WHEN template_key IN ('tessa_security_email','account_security_email') THEN 1 ELSE 0 END),next_attempt_at,created_at,id LIMIT $2 FOR UPDATE SKIP LOCKED
 		)
 		UPDATE auth_code_delivery_jobs job
 		SET status='processing',attempt_count=attempt_count+1,lease_owner=$3,
 			lease_expires_at=$1+($5*INTERVAL '1 second'),updated_at=$1
 		FROM due WHERE job.id=due.id
 		RETURNING job.id,job.realm,job.channel,job.template_key,
-			COALESCE(job.provider_challenge_id,job.marketplace_challenge_id,job.tessa_security_event_id,job.tessa_link_challenge_id),
+			COALESCE(job.provider_challenge_id,job.marketplace_challenge_id,job.tessa_security_event_id,job.tessa_link_challenge_id,job.account_security_event_id),
 			job.payload_ciphertext,job.payload_nonce,job.payload_key_version,
 			job.delivery_deadline,job.attempt_count,job.next_attempt_at,job.lease_owner
-	`, now, limit, owner, maxDeliveryAttempts, lease.Seconds(), channel)
+	`, now, limit, owner, maxDeliveryAttempts, lease.Seconds(), channel, s.additionalEmailsEnabled)
 	if err != nil {
 		return nil, fmt.Errorf("claim auth code deliveries: %w", err)
 	}
@@ -287,7 +299,16 @@ func (s *Service) decryptPayload(job DeliveryJob) (deliveryPayload, error) {
 	if _, identifier, channel, err := NormalizeIdentifier(payload.Destination, job.Channel); err != nil || channel != job.Channel || identifier != payload.Destination {
 		return deliveryPayload{}, errors.New("invalid auth delivery payload")
 	}
-	if job.TemplateKey == tessaSecurityEmailTemplate {
+	if job.TemplateKey == "account_security_email" {
+		if payload.AccountSecurity == nil || payload.Code != "" || payload.Security != nil || payload.Link != nil || job.Channel != ChannelEmail || payload.AccountSecurity.DeliveryID != job.ID || payload.AccountSecurity.Recipient != payload.Destination {
+			return deliveryPayload{}, errors.New("invalid account security payload")
+		}
+		if _, err := transactionemail.RenderSecurity(*payload.AccountSecurity); err != nil {
+			return deliveryPayload{}, err
+		}
+	} else if payload.AccountSecurity != nil {
+		return deliveryPayload{}, errors.New("unexpected account security payload")
+	} else if job.TemplateKey == tessaSecurityEmailTemplate {
 		if job.Realm != RealmProvider || job.Channel != ChannelEmail || payload.Code != "" || payload.Link != nil || !validSecurityEmailPayload(payload.Security) {
 			return deliveryPayload{}, errors.New("invalid Tessa security payload")
 		}
@@ -325,6 +346,9 @@ func (s *Service) markDeliveryAccepted(ctx context.Context, job DeliveryJob, pro
 	defer tx.Rollback(ctx)
 	var accepted bool
 	query := fmt.Sprintf(`UPDATE %s challenge SET delivery_accepted_at=$3,verify_expires_at=$3+INTERVAL '10 minutes' FROM auth_code_delivery_jobs job WHERE job.id=$1 AND job.%s=challenge.id AND job.status='processing' AND job.lease_owner=$2 AND job.delivery_deadline>$3 AND challenge.consumed_at IS NULL RETURNING TRUE`, table, challengeColumn)
+	if job.TemplateKey == "account_security_email" {
+		query = `UPDATE account_security_events event SET email_accepted_at=$3 FROM auth_code_delivery_jobs job WHERE job.id=$1 AND job.account_security_event_id=event.id AND job.status='processing' AND job.lease_owner=$2 AND job.delivery_deadline>$3 RETURNING TRUE`
+	}
 	if job.TemplateKey == tessaSecurityEmailTemplate {
 		query = `UPDATE tessa_whatsapp_security_events event SET email_accepted_at=$3 FROM auth_code_delivery_jobs job WHERE job.id=$1 AND job.tessa_security_event_id=event.id AND job.status='processing' AND job.lease_owner=$2 AND job.delivery_deadline>$3 RETURNING TRUE`
 	}

@@ -52,6 +52,34 @@ COMMENT ON EXTENSION postgis IS 'PostGIS geometry and geography spatial types an
 
 
 --
+-- Name: advance_payout_notification_revision(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.advance_payout_notification_revision() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+ IF NEW.status IS DISTINCT FROM OLD.status THEN NEW.notification_revision=NEW.version;
+ ELSE NEW.notification_revision=OLD.notification_revision;
+ END IF;
+ RETURN NEW;
+END $$;
+
+
+--
+-- Name: advance_refund_notification_revision(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.advance_refund_notification_revision() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+ IF NEW.status IS DISTINCT FROM OLD.status THEN NEW.notification_revision=OLD.notification_revision+1; ELSE NEW.notification_revision=OLD.notification_revision; END IF;
+ RETURN NEW;
+END $$;
+
+
+--
 -- Name: append_booking_update_event(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -297,6 +325,68 @@ BEGIN
     RETURN NULL;
 END;
 $$;
+
+
+--
+-- Name: capture_financial_email(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.capture_financial_email() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE audience text; recipient text; owner_id uuid; b bookings%ROWTYPE; revision bigint; delay interval; base jsonb;
+BEGIN
+ IF current_setting('tellbook.financial_emails',true) IS DISTINCT FROM 'true' THEN RETURN NEW; END IF;
+ IF TG_OP='UPDATE' AND NEW.status IS NOT DISTINCT FROM OLD.status THEN RETURN NEW; END IF;
+ delay=CASE WHEN NEW.status IN ('pending','processing','queued') THEN INTERVAL '5 minutes' WHEN NEW.status IN ('unknown','manual_review') THEN INTERVAL '30 minutes' ELSE INTERVAL '0 seconds' END;
+ IF TG_TABLE_NAME='payouts' THEN
+  IF NEW.status='created' THEN RETURN NEW; END IF;
+  SELECT lower(btrim(email)) INTO recipient FROM clients WHERE id=NEW.client_id AND email_verified_at IS NOT NULL;
+  IF COALESCE(recipient,'')='' THEN RETURN NEW; END IF;
+  revision=NEW.version;
+  base=jsonb_build_object('family','payout','audience','provider','recipient',recipient,'client_id',NEW.client_id,'status',NEW.status,'revision',revision,'occurred_at',NOW(),'amount_minor',NEW.amount_minor,'currency_code',NEW.currency_code,'country_code',NEW.country_code,'reference',NEW.reference,'institution_name',NEW.destination_snapshot->>'institution_name','account_last_four',right(NEW.destination_snapshot->>'masked_identifier',4));
+  INSERT INTO financial_jobs(id,kind,aggregate_type,aggregate_id,deduplication_key,payload,available_at)
+  VALUES(gen_random_uuid(),'financial_email','payout',NEW.id,'financial_email:payout:'||NEW.id||':'||revision||':provider',base,NOW()+delay) ON CONFLICT(deduplication_key) DO NOTHING;
+ ELSE
+  IF NEW.status NOT IN ('queued','processing','failed','manual_review') THEN RETURN NEW; END IF;
+  SELECT * INTO b FROM bookings WHERE id=NEW.booking_id;
+  revision=NEW.notification_revision;
+  FOREACH audience IN ARRAY ARRAY['provider','customer'] LOOP
+   IF audience='provider' THEN
+    SELECT lower(btrim(c.email)) INTO recipient FROM clients c LEFT JOIN provider_notification_preferences p ON p.client_id=c.id WHERE c.id=b.client_id AND c.email_verified_at IS NOT NULL AND COALESCE(p.booking_email,true);
+   ELSE
+    SELECT b.customer_email_snapshot INTO recipient WHERE b.notification_consent_policy_revision=1 AND COALESCE((SELECT booking_email FROM marketplace_notification_preferences WHERE marketplace_customer_id=b.marketplace_customer_id),true);
+   END IF;
+   IF COALESCE(recipient,'')='' THEN CONTINUE; END IF;
+   base=jsonb_build_object('family','refund','audience',audience,'recipient',recipient,'client_id',b.client_id,'booking_id',b.id,'status',NEW.status,'revision',revision,'occurred_at',NOW(),'amount_minor',NEW.amount_minor,'currency_code',NEW.currency_code,'country_code',b.country_code,'reference',NEW.id::text);
+   INSERT INTO financial_jobs(id,kind,aggregate_type,aggregate_id,deduplication_key,payload,available_at)
+   VALUES(gen_random_uuid(),'financial_email','booking_refund',NEW.id,'financial_email:refund:'||NEW.id||':'||revision||':'||audience,base,NOW()+delay) ON CONFLICT(deduplication_key) DO NOTHING;
+  END LOOP;
+ END IF;
+ RETURN NEW;
+END $$;
+
+
+--
+-- Name: capture_payout_account_email(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.capture_payout_account_email() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE event_kind text; recipient text;
+BEGIN
+ IF current_setting('tellbook.security_emails',true) IS DISTINCT FROM 'true' THEN RETURN NEW; END IF;
+ IF TG_OP='INSERT' THEN event_kind='payout_account_added';
+ ELSIF OLD.status IS DISTINCT FROM NEW.status AND NEW.status='disabled' THEN event_kind='payout_account_removed';
+ ELSIF NOT OLD.is_default AND NEW.is_default THEN event_kind='payout_account_default_changed';
+ ELSE RETURN NEW; END IF;
+ SELECT email INTO recipient FROM clients WHERE id=NEW.client_id AND email_verified_at IS NOT NULL;
+ IF COALESCE(recipient,'')='' THEN RETURN NEW; END IF;
+ INSERT INTO account_security_events(id,realm,provider_client_id,recipient_email,kind,details)
+ VALUES(gen_random_uuid(),'provider',NEW.client_id,lower(btrim(recipient)),event_kind,jsonb_build_object('institution_name',NEW.institution_name,'account_last_four',right(NEW.masked_identifier,4)));
+ RETURN NEW;
+END $$;
 
 
 --
@@ -749,6 +839,26 @@ $$;
 
 
 --
+-- Name: mark_booking_additional_email(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.mark_booking_additional_email() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN NEW.additional_email_reminder_enabled=COALESCE(current_setting('tellbook.financial_emails',true)='true',false); RETURN NEW; END $$;
+
+
+--
+-- Name: mark_booking_event_additional_email(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.mark_booking_event_additional_email() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN NEW.additional_email_enabled=COALESCE(current_setting('tellbook.financial_emails',true)='true',false); RETURN NEW; END $$;
+
+
+--
 -- Name: notify_ai_worker_queue(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -893,6 +1003,264 @@ END $$;
 SET default_tablespace = '';
 
 SET default_table_access_method = heap;
+
+--
+-- Name: account_security_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.account_security_events (
+    id uuid NOT NULL,
+    realm text NOT NULL,
+    provider_client_id uuid,
+    marketplace_customer_id uuid,
+    recipient_email text NOT NULL,
+    kind text NOT NULL,
+    details jsonb DEFAULT '{}'::jsonb NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    email_deadline timestamp with time zone DEFAULT (now() + '24:00:00'::interval) NOT NULL,
+    email_queued_at timestamp with time zone,
+    email_accepted_at timestamp with time zone,
+    skip_reason text DEFAULT ''::text NOT NULL,
+    CONSTRAINT account_security_events_check CHECK ((((realm = 'provider'::text) AND (provider_client_id IS NOT NULL) AND (marketplace_customer_id IS NULL)) OR ((realm = 'marketplace_customer'::text) AND (marketplace_customer_id IS NOT NULL) AND (provider_client_id IS NULL)))),
+    CONSTRAINT account_security_events_kind_check CHECK ((kind = ANY (ARRAY['password_changed'::text, 'password_reset'::text, 'password_set'::text, 'email_linked'::text, 'phone_linked'::text, 'payout_account_added'::text, 'payout_account_default_changed'::text, 'payout_account_removed'::text]))),
+    CONSTRAINT account_security_events_realm_check CHECK ((realm = ANY (ARRAY['provider'::text, 'marketplace_customer'::text])))
+);
+
+
+--
+-- Name: admin_audit_events; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_audit_events (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    actor_id uuid,
+    action text NOT NULL,
+    entity_type text NOT NULL,
+    entity_id uuid,
+    reason text DEFAULT ''::text NOT NULL,
+    details jsonb DEFAULT '{}'::jsonb NOT NULL,
+    request_id text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: admin_auth_limits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_auth_limits (
+    key_hash bytea NOT NULL,
+    attempts integer NOT NULL,
+    window_end timestamp with time zone NOT NULL
+);
+
+
+--
+-- Name: admin_business_decisions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_business_decisions (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    business_id uuid NOT NULL,
+    actor_id uuid NOT NULL,
+    request_key uuid NOT NULL,
+    action text NOT NULL,
+    reason text NOT NULL,
+    evidence text DEFAULT ''::text NOT NULL,
+    expected_updated_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT admin_business_decisions_action_check CHECK ((action = ANY (ARRAY['verify'::text, 'reject'::text, 'restrict'::text, 'restore'::text]))),
+    CONSTRAINT admin_business_decisions_evidence_check CHECK ((length(evidence) <= 2000)),
+    CONSTRAINT admin_business_decisions_reason_check CHECK (((length(reason) >= 1) AND (length(reason) <= 1000)))
+);
+
+
+--
+-- Name: admin_business_notes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_business_notes (
+    id uuid NOT NULL,
+    business_id uuid,
+    author_id uuid NOT NULL,
+    body text NOT NULL,
+    request_key uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    booking_id uuid,
+    contact_id uuid,
+    account_id uuid,
+    case_id uuid,
+    CONSTRAINT admin_business_notes_body_check CHECK (((length(btrim(body)) >= 1) AND (length(btrim(body)) <= 4000))),
+    CONSTRAINT admin_notes_one_target CHECK ((num_nonnulls(business_id, booking_id, contact_id, account_id, case_id) = 1))
+);
+
+
+--
+-- Name: admin_financial_requests; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_financial_requests (
+    id uuid NOT NULL,
+    kind text NOT NULL,
+    requester_id uuid NOT NULL,
+    request_key uuid NOT NULL,
+    business_id uuid NOT NULL,
+    allocation_id uuid NOT NULL,
+    destination_id uuid NOT NULL,
+    terms jsonb NOT NULL,
+    terms_fingerprint text NOT NULL,
+    reason text NOT NULL,
+    status text DEFAULT 'pending'::text NOT NULL,
+    revision integer DEFAULT 1 NOT NULL,
+    reviewer_id uuid,
+    decision_reason text DEFAULT ''::text NOT NULL,
+    decision_key uuid,
+    decided_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT admin_financial_requests_check CHECK ((((status = 'pending'::text) AND (reviewer_id IS NULL) AND (decided_at IS NULL) AND (decision_key IS NULL) AND (decision_reason = ''::text)) OR ((status <> 'pending'::text) AND (reviewer_id IS NOT NULL) AND (decided_at IS NOT NULL) AND (decision_key IS NOT NULL) AND ((char_length(decision_reason) >= 1) AND (char_length(decision_reason) <= 1000))))),
+    CONSTRAINT admin_financial_requests_check1 CHECK (((status <> ALL (ARRAY['approved'::text, 'rejected'::text])) OR (reviewer_id <> requester_id))),
+    CONSTRAINT admin_financial_requests_kind_check CHECK ((kind = 'payout'::text)),
+    CONSTRAINT admin_financial_requests_reason_check CHECK (((char_length(reason) >= 1) AND (char_length(reason) <= 1000))),
+    CONSTRAINT admin_financial_requests_revision_check CHECK ((revision > 0)),
+    CONSTRAINT admin_financial_requests_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'rejected'::text, 'withdrawn'::text]))),
+    CONSTRAINT admin_financial_requests_terms_check CHECK ((jsonb_typeof(terms) = 'object'::text)),
+    CONSTRAINT admin_financial_requests_terms_fingerprint_check CHECK ((terms_fingerprint ~ '^[a-f0-9]{64}$'::text))
+);
+
+
+--
+-- Name: admin_invitations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_invitations (
+    id uuid NOT NULL,
+    staff_id uuid NOT NULL,
+    token_hash bytea NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    consumed_at timestamp with time zone,
+    revoked_at timestamp with time zone,
+    delivery_state text DEFAULT 'not_sent'::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT admin_invitations_delivery_state_check CHECK ((delivery_state = ANY (ARRAY['not_sent'::text, 'sent'::text, 'failed'::text, 'unknown'::text])))
+);
+
+
+--
+-- Name: admin_password_resets; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_password_resets (
+    token_hash bytea NOT NULL,
+    staff_id uuid NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    consumed_at timestamp with time zone,
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    staff_revision bigint,
+    created_at timestamp with time zone DEFAULT now(),
+    delivery_state text DEFAULT 'not_sent'::text NOT NULL,
+    delivery_updated_at timestamp with time zone,
+    CONSTRAINT admin_password_resets_delivery_state_check CHECK ((delivery_state = ANY (ARRAY['not_sent'::text, 'sending'::text, 'sent'::text, 'failed'::text, 'unknown'::text])))
+);
+
+
+--
+-- Name: admin_recovery_codes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_recovery_codes (
+    staff_id uuid NOT NULL,
+    code_hash bytea NOT NULL
+);
+
+
+--
+-- Name: admin_sessions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_sessions (
+    id uuid NOT NULL,
+    staff_id uuid NOT NULL,
+    token_hash bytea NOT NULL,
+    stage text NOT NULL,
+    staff_revision bigint NOT NULL,
+    failed_attempts integer DEFAULT 0 NOT NULL,
+    user_agent text DEFAULT ''::text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_seen_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    CONSTRAINT admin_sessions_stage_check CHECK ((stage = ANY (ARRAY['login'::text, 'enroll'::text, 'full'::text])))
+);
+
+
+--
+-- Name: admin_staff; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_staff (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    email text NOT NULL,
+    full_name text NOT NULL,
+    role text NOT NULL,
+    status text DEFAULT 'invited'::text NOT NULL,
+    password_hash text DEFAULT ''::text NOT NULL,
+    mfa_cipher jsonb,
+    last_totp_step bigint DEFAULT '-1'::integer NOT NULL,
+    revision bigint DEFAULT 1 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT admin_staff_email_check CHECK ((email = lower(btrim(email)))),
+    CONSTRAINT admin_staff_role_check CHECK ((role = ANY (ARRAY['super_admin'::text, 'operations'::text, 'support'::text, 'finance'::text, 'analyst'::text]))),
+    CONSTRAINT admin_staff_status_check CHECK ((status = ANY (ARRAY['invited'::text, 'enrolling'::text, 'active'::text, 'suspended'::text])))
+);
+
+
+--
+-- Name: admin_support_cases; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_support_cases (
+    id uuid NOT NULL,
+    title text NOT NULL,
+    description text NOT NULL,
+    status text NOT NULL,
+    priority text NOT NULL,
+    assignee_id uuid,
+    follow_up date,
+    resolution text DEFAULT ''::text NOT NULL,
+    revision integer DEFAULT 1 NOT NULL,
+    business_id uuid,
+    booking_id uuid,
+    contact_id uuid,
+    account_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT admin_support_cases_check CHECK ((num_nonnulls(business_id, booking_id, contact_id, account_id) <= 1)),
+    CONSTRAINT admin_support_cases_check1 CHECK (((status = 'resolved'::text) = (resolution <> ''::text))),
+    CONSTRAINT admin_support_cases_description_check CHECK (((char_length(description) >= 1) AND (char_length(description) <= 4000))),
+    CONSTRAINT admin_support_cases_priority_check CHECK ((priority = ANY (ARRAY['low'::text, 'normal'::text, 'high'::text, 'urgent'::text]))),
+    CONSTRAINT admin_support_cases_revision_check CHECK ((revision > 0)),
+    CONSTRAINT admin_support_cases_status_check CHECK ((status = ANY (ARRAY['open'::text, 'waiting'::text, 'resolved'::text]))),
+    CONSTRAINT admin_support_cases_title_check CHECK (((char_length(title) >= 1) AND (char_length(title) <= 160)))
+);
+
+
+--
+-- Name: admin_support_changes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.admin_support_changes (
+    actor_id uuid NOT NULL,
+    request_key uuid NOT NULL,
+    case_id uuid NOT NULL,
+    fingerprint bytea NOT NULL,
+    revision integer NOT NULL,
+    action text NOT NULL,
+    reason text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT admin_support_changes_action_check CHECK ((action = ANY (ARRAY['created'::text, 'updated'::text, 'resolved'::text, 'reopened'::text])))
+);
+
 
 --
 -- Name: administrative_regions; Type: TABLE; Schema: public; Owner: -
@@ -1171,16 +1539,17 @@ CREATE TABLE public.auth_code_delivery_jobs (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     tessa_security_event_id uuid,
     tessa_link_challenge_id uuid,
+    account_security_event_id uuid,
     CONSTRAINT auth_code_delivery_jobs_attempt_count_check CHECK ((attempt_count >= 0)),
     CONSTRAINT auth_code_delivery_jobs_attempt_limit_check CHECK (((attempt_count >= 0) AND (attempt_count <= 8))),
-    CONSTRAINT auth_code_delivery_jobs_challenge_check CHECK ((((realm = 'provider'::text) AND (provider_challenge_id IS NOT NULL) AND (marketplace_challenge_id IS NULL) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NULL)) OR ((realm = 'marketplace_customer'::text) AND (provider_challenge_id IS NULL) AND (marketplace_challenge_id IS NOT NULL) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NULL)) OR ((realm = 'provider'::text) AND (provider_challenge_id IS NULL) AND (marketplace_challenge_id IS NULL) AND (tessa_security_event_id IS NOT NULL) AND (tessa_link_challenge_id IS NULL)) OR ((realm = 'provider'::text) AND (provider_challenge_id IS NULL) AND (marketplace_challenge_id IS NULL) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NOT NULL)))),
+    CONSTRAINT auth_code_delivery_jobs_challenge_check CHECK ((((account_security_event_id IS NULL) AND (((realm = 'provider'::text) AND (provider_challenge_id IS NOT NULL) AND (marketplace_challenge_id IS NULL) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NULL)) OR ((realm = 'marketplace_customer'::text) AND (provider_challenge_id IS NULL) AND (marketplace_challenge_id IS NOT NULL) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NULL)) OR ((realm = 'provider'::text) AND (provider_challenge_id IS NULL) AND (marketplace_challenge_id IS NULL) AND (num_nonnulls(tessa_security_event_id, tessa_link_challenge_id) = 1)))) OR ((account_security_event_id IS NOT NULL) AND (num_nonnulls(provider_challenge_id, marketplace_challenge_id, tessa_security_event_id, tessa_link_challenge_id) = 0)))),
     CONSTRAINT auth_code_delivery_jobs_channel_check CHECK ((channel = ANY (ARRAY['email'::text, 'whatsapp'::text]))),
     CONSTRAINT auth_code_delivery_jobs_error_code_check CHECK ((char_length(error_code) <= 100)),
     CONSTRAINT auth_code_delivery_jobs_lease_check CHECK (((status <> 'processing'::text) OR ((btrim(lease_owner) <> ''::text) AND (lease_expires_at IS NOT NULL)))),
     CONSTRAINT auth_code_delivery_jobs_payload_check CHECK (((octet_length(destination_fingerprint) = 32) AND (((status = ANY (ARRAY['pending'::text, 'processing'::text, 'retry'::text])) AND (payload_ciphertext IS NOT NULL) AND (octet_length(payload_ciphertext) > 0) AND (payload_nonce IS NOT NULL) AND (octet_length(payload_nonce) = 12) AND (payload_key_version IS NOT NULL) AND (btrim(payload_key_version) <> ''::text)) OR ((status = ANY (ARRAY['accepted'::text, 'sent'::text, 'delivered'::text, 'unknown'::text, 'failed'::text, 'expired'::text])) AND (payload_ciphertext IS NULL) AND (payload_nonce IS NULL) AND (payload_key_version IS NULL))))),
     CONSTRAINT auth_code_delivery_jobs_realm_check CHECK ((realm = ANY (ARRAY['provider'::text, 'marketplace_customer'::text]))),
     CONSTRAINT auth_code_delivery_jobs_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'retry'::text, 'accepted'::text, 'sent'::text, 'delivered'::text, 'unknown'::text, 'failed'::text, 'expired'::text]))),
-    CONSTRAINT auth_code_delivery_jobs_template_contract_check CHECK ((((channel = 'email'::text) AND (template_key = 'auth_code_email'::text) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NULL)) OR ((channel = 'whatsapp'::text) AND (template_key = 'v_c_x'::text) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NULL)) OR ((channel = 'email'::text) AND (template_key = 'tessa_security_email'::text) AND (tessa_security_event_id IS NOT NULL) AND (tessa_link_challenge_id IS NULL)) OR ((channel = 'email'::text) AND (template_key = 'tessa_link_email'::text) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NOT NULL))))
+    CONSTRAINT auth_code_delivery_jobs_template_contract_check CHECK ((((account_security_event_id IS NOT NULL) AND (channel = 'email'::text) AND (template_key = 'account_security_email'::text)) OR ((account_security_event_id IS NULL) AND (((channel = 'email'::text) AND (template_key = 'auth_code_email'::text) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NULL)) OR ((channel = 'whatsapp'::text) AND (template_key = 'v_c_x'::text) AND (tessa_security_event_id IS NULL) AND (tessa_link_challenge_id IS NULL)) OR ((channel = 'email'::text) AND (template_key = 'tessa_security_email'::text) AND (tessa_security_event_id IS NOT NULL)) OR ((channel = 'email'::text) AND (template_key = 'tessa_link_email'::text) AND (tessa_link_challenge_id IS NOT NULL))))))
 );
 
 
@@ -1257,7 +1626,7 @@ CREATE TABLE public.booking_change_commands (
     response_snapshot jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     request_fingerprint text NOT NULL,
-    CONSTRAINT booking_change_commands_actor_check CHECK ((actor_type = ANY (ARRAY['customer'::text, 'provider'::text]))),
+    CONSTRAINT booking_change_commands_actor_check CHECK ((actor_type = ANY (ARRAY['customer'::text, 'provider'::text, 'staff'::text]))),
     CONSTRAINT booking_change_commands_command_check CHECK ((command = ANY (ARRAY['cancel'::text, 'reschedule'::text, 'confirm'::text, 'decline'::text, 'complete'::text, 'mark_no_show'::text]))),
     CONSTRAINT booking_change_commands_fingerprint_check CHECK ((request_fingerprint ~ '^[a-f0-9]{64}$'::text)),
     CONSTRAINT booking_change_commands_response_check CHECK ((jsonb_typeof(response_snapshot) = 'object'::text))
@@ -1313,6 +1682,7 @@ CREATE TABLE public.booking_domain_events (
     dedupe_key text NOT NULL,
     payload jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    additional_email_enabled boolean DEFAULT false NOT NULL,
     CONSTRAINT booking_domain_events_dedupe_key_check CHECK ((btrim(dedupe_key) <> ''::text)),
     CONSTRAINT booking_domain_events_event_type_check CHECK ((btrim(event_type) <> ''::text)),
     CONSTRAINT booking_domain_events_payload_object_check CHECK ((jsonb_typeof(payload) = 'object'::text))
@@ -1488,6 +1858,7 @@ CREATE TABLE public.booking_refund_requests (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     completed_at timestamp with time zone,
+    notification_revision bigint DEFAULT 1 NOT NULL,
     CONSTRAINT booking_refund_requests_amount_check CHECK ((amount_minor > 0)),
     CONSTRAINT booking_refund_requests_currency_check CHECK ((currency_code ~ '^[A-Z]{3}$'::text)),
     CONSTRAINT booking_refund_requests_status_check CHECK ((status = ANY (ARRAY['queued'::text, 'processing'::text, 'successful'::text, 'failed'::text, 'cancelled'::text, 'manual_review'::text])))
@@ -1609,6 +1980,7 @@ CREATE TABLE public.bookings (
     whatsapp_consent_at timestamp with time zone,
     whatsapp_consent_source text DEFAULT ''::text NOT NULL,
     notification_consent_policy_revision integer DEFAULT 0 NOT NULL,
+    additional_email_reminder_enabled boolean DEFAULT false NOT NULL,
     CONSTRAINT bookings_change_policy_snapshot_check CHECK (((cancellation_notice_minutes_snapshot >= 0) AND ((cancellation_refund_bps_snapshot >= 0) AND (cancellation_refund_bps_snapshot <= 10000)) AND (reschedule_notice_minutes_snapshot >= 0) AND (reschedule_fee_minor_snapshot >= 0))),
     CONSTRAINT bookings_country_code_check CHECK ((country_code ~ '^[A-Z]{2}$'::text)),
     CONSTRAINT bookings_currency_code_check CHECK ((currency_code ~ '^[A-Z]{3}$'::text)),
@@ -1751,6 +2123,7 @@ CASE
     WHEN (allow_booking_contact AND (customer_contact_verified_at IS NOT NULL)) THEN customer_contact_phone
     ELSE NULL::text
 END) STORED,
+    platform_restricted boolean DEFAULT false NOT NULL,
     CONSTRAINT client_profiles_concurrent_booking_capacity_check CHECK (((concurrent_booking_capacity >= 1) AND (concurrent_booking_capacity <= 50))),
     CONSTRAINT client_profiles_market_tuple_check CHECK ((((country_code IS NULL) AND (currency_code IS NULL) AND (timezone IS NULL) AND (locale IS NULL) AND (market_configured_at IS NULL)) OR ((country_code ~ '^[A-Z]{2}$'::text) AND (currency_code ~ '^[A-Z]{3}$'::text) AND (NULLIF(btrim(timezone), ''::text) IS NOT NULL) AND (locale ~ '^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})+$'::text) AND (market_configured_at IS NOT NULL)))),
     CONSTRAINT client_profiles_marketplace_location_visibility_check CHECK ((marketplace_location_visibility = ANY (ARRAY['approximate'::text, 'exact'::text]))),
@@ -1826,7 +2199,7 @@ CREATE TABLE public.financial_jobs (
     CONSTRAINT financial_jobs_attempts_check CHECK ((attempts >= 0)),
     CONSTRAINT financial_jobs_lease_check CHECK (((status <> 'processing'::text) OR ((NULLIF(btrim(lease_owner), ''::text) IS NOT NULL) AND (lease_expires_at IS NOT NULL)))),
     CONSTRAINT financial_jobs_required_text_check CHECK (((NULLIF(btrim(kind), ''::text) IS NOT NULL) AND (NULLIF(btrim(aggregate_type), ''::text) IS NOT NULL) AND (NULLIF(btrim(deduplication_key), ''::text) IS NOT NULL))),
-    CONSTRAINT financial_jobs_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'processing'::text, 'completed'::text, 'failed'::text, 'cancelled'::text, 'dead_letter'::text])))
+    CONSTRAINT financial_jobs_status_check CHECK (((status = ANY (ARRAY['pending'::text, 'processing'::text, 'completed'::text, 'failed'::text, 'cancelled'::text, 'dead_letter'::text])) OR ((kind = 'financial_email'::text) AND (status = ANY (ARRAY['dispatching'::text, 'unknown'::text])))))
 )
 WITH (autovacuum_vacuum_scale_factor='0.05', autovacuum_analyze_scale_factor='0.02', autovacuum_vacuum_threshold='500', autovacuum_analyze_threshold='500');
 
@@ -3023,6 +3396,7 @@ CREATE TABLE public.payouts (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     reconciliation_lease_owner text DEFAULT ''::text NOT NULL,
     reconciliation_lease_expires_at timestamp with time zone,
+    notification_revision bigint DEFAULT 1 NOT NULL,
     CONSTRAINT payouts_amount_positive_check CHECK ((amount_minor > 0)),
     CONSTRAINT payouts_country_code_check CHECK ((country_code ~ '^[A-Z]{2}$'::text)),
     CONSTRAINT payouts_currency_code_check CHECK ((currency_code ~ '^[A-Z]{3}$'::text)),
@@ -4045,6 +4419,174 @@ CREATE TABLE public.welcome_email_templates (
 
 
 --
+-- Name: account_security_events account_security_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.account_security_events
+    ADD CONSTRAINT account_security_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_audit_events admin_audit_events_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_audit_events
+    ADD CONSTRAINT admin_audit_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_auth_limits admin_auth_limits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_auth_limits
+    ADD CONSTRAINT admin_auth_limits_pkey PRIMARY KEY (key_hash);
+
+
+--
+-- Name: admin_business_decisions admin_business_decisions_actor_id_request_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_business_decisions
+    ADD CONSTRAINT admin_business_decisions_actor_id_request_key_key UNIQUE (actor_id, request_key);
+
+
+--
+-- Name: admin_business_decisions admin_business_decisions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_business_decisions
+    ADD CONSTRAINT admin_business_decisions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_business_notes admin_business_notes_author_id_request_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_business_notes
+    ADD CONSTRAINT admin_business_notes_author_id_request_key_key UNIQUE (author_id, request_key);
+
+
+--
+-- Name: admin_business_notes admin_business_notes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_business_notes
+    ADD CONSTRAINT admin_business_notes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_financial_requests admin_financial_requests_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_financial_requests
+    ADD CONSTRAINT admin_financial_requests_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_financial_requests admin_financial_requests_requester_id_request_key_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_financial_requests
+    ADD CONSTRAINT admin_financial_requests_requester_id_request_key_key UNIQUE (requester_id, request_key);
+
+
+--
+-- Name: admin_invitations admin_invitations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_invitations
+    ADD CONSTRAINT admin_invitations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_invitations admin_invitations_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_invitations
+    ADD CONSTRAINT admin_invitations_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: admin_password_resets admin_password_resets_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_password_resets
+    ADD CONSTRAINT admin_password_resets_id_key UNIQUE (id);
+
+
+--
+-- Name: admin_password_resets admin_password_resets_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_password_resets
+    ADD CONSTRAINT admin_password_resets_pkey PRIMARY KEY (token_hash);
+
+
+--
+-- Name: admin_recovery_codes admin_recovery_codes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_recovery_codes
+    ADD CONSTRAINT admin_recovery_codes_pkey PRIMARY KEY (staff_id, code_hash);
+
+
+--
+-- Name: admin_sessions admin_sessions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_sessions
+    ADD CONSTRAINT admin_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_sessions admin_sessions_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_sessions
+    ADD CONSTRAINT admin_sessions_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: admin_staff admin_staff_email_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_staff
+    ADD CONSTRAINT admin_staff_email_key UNIQUE (email);
+
+
+--
+-- Name: admin_staff admin_staff_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_staff
+    ADD CONSTRAINT admin_staff_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_support_cases admin_support_cases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_support_cases
+    ADD CONSTRAINT admin_support_cases_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: admin_support_changes admin_support_changes_case_id_revision_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_support_changes
+    ADD CONSTRAINT admin_support_changes_case_id_revision_key UNIQUE (case_id, revision);
+
+
+--
+-- Name: admin_support_changes admin_support_changes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_support_changes
+    ADD CONSTRAINT admin_support_changes_pkey PRIMARY KEY (actor_id, request_key);
+
+
+--
 -- Name: administrative_regions administrative_regions_country_code_code_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -4162,6 +4704,14 @@ ALTER TABLE ONLY public.agreement_template_versions
 
 ALTER TABLE ONLY public.agreement_template_versions
     ADD CONSTRAINT agreement_template_versions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: auth_code_delivery_jobs auth_code_delivery_jobs_account_security_event_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_code_delivery_jobs
+    ADD CONSTRAINT auth_code_delivery_jobs_account_security_event_id_key UNIQUE (account_security_event_id);
 
 
 --
@@ -5637,6 +6187,153 @@ ALTER TABLE ONLY public.welcome_email_templates
 
 
 --
+-- Name: account_security_pending_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX account_security_pending_idx ON public.account_security_events USING btree (created_at, id) WHERE ((email_queued_at IS NULL) AND (skip_reason = ''::text));
+
+
+--
+-- Name: admin_audit_entity_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_audit_entity_idx ON public.admin_audit_events USING btree (entity_type, entity_id, created_at DESC);
+
+
+--
+-- Name: admin_audit_time_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_audit_time_idx ON public.admin_audit_events USING btree (created_at DESC, id DESC);
+
+
+--
+-- Name: admin_auth_limits_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_auth_limits_expiry_idx ON public.admin_auth_limits USING btree (window_end);
+
+
+--
+-- Name: admin_business_decisions_business_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_business_decisions_business_idx ON public.admin_business_decisions USING btree (business_id, created_at DESC, id DESC);
+
+
+--
+-- Name: admin_business_notes_business_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_business_notes_business_idx ON public.admin_business_notes USING btree (business_id, created_at DESC, id DESC);
+
+
+--
+-- Name: admin_cases_assignee_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_cases_assignee_idx ON public.admin_support_cases USING btree (assignee_id, status);
+
+
+--
+-- Name: admin_cases_due_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_cases_due_idx ON public.admin_support_cases USING btree (follow_up) WHERE (status <> 'resolved'::text);
+
+
+--
+-- Name: admin_cases_queue_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_cases_queue_idx ON public.admin_support_cases USING btree (created_at DESC, id DESC);
+
+
+--
+-- Name: admin_financial_open_allocation_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX admin_financial_open_allocation_idx ON public.admin_financial_requests USING btree (allocation_id) WHERE (status = ANY (ARRAY['pending'::text, 'approved'::text]));
+
+
+--
+-- Name: admin_financial_request_queue_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_financial_request_queue_idx ON public.admin_financial_requests USING btree (created_at DESC, id DESC);
+
+
+--
+-- Name: admin_invitation_staff_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_invitation_staff_idx ON public.admin_invitations USING btree (staff_id, created_at DESC);
+
+
+--
+-- Name: admin_invitations_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_invitations_expiry_idx ON public.admin_invitations USING btree (expires_at);
+
+
+--
+-- Name: admin_notes_account_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_notes_account_idx ON public.admin_business_notes USING btree (account_id, created_at DESC, id DESC) WHERE (account_id IS NOT NULL);
+
+
+--
+-- Name: admin_notes_booking_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_notes_booking_idx ON public.admin_business_notes USING btree (booking_id, created_at DESC, id DESC) WHERE (booking_id IS NOT NULL);
+
+
+--
+-- Name: admin_notes_case_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_notes_case_idx ON public.admin_business_notes USING btree (case_id, created_at DESC, id DESC) WHERE (case_id IS NOT NULL);
+
+
+--
+-- Name: admin_notes_contact_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_notes_contact_idx ON public.admin_business_notes USING btree (contact_id, created_at DESC, id DESC) WHERE (contact_id IS NOT NULL);
+
+
+--
+-- Name: admin_password_resets_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_password_resets_expiry_idx ON public.admin_password_resets USING btree (expires_at);
+
+
+--
+-- Name: admin_password_resets_staff_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_password_resets_staff_idx ON public.admin_password_resets USING btree (staff_id);
+
+
+--
+-- Name: admin_sessions_expiry_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_sessions_expiry_idx ON public.admin_sessions USING btree (expires_at);
+
+
+--
+-- Name: admin_sessions_staff_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX admin_sessions_staff_idx ON public.admin_sessions USING btree (staff_id);
+
+
+--
 -- Name: administrative_regions_boundary_gist_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5803,7 +6500,7 @@ CREATE INDEX auth_code_delivery_jobs_whatsapp_message_idx ON public.auth_code_de
 
 CREATE INDEX auth_email_delivery_priority_idx ON public.auth_code_delivery_jobs USING btree (channel, (
 CASE
-    WHEN (template_key = 'tessa_security_email'::text) THEN 1
+    WHEN (template_key = ANY (ARRAY['tessa_security_email'::text, 'account_security_email'::text])) THEN 1
     ELSE 0
 END), next_attempt_at, created_at, id) WHERE (status = ANY (ARRAY['pending'::text, 'retry'::text]));
 
@@ -5935,6 +6632,13 @@ CREATE INDEX booking_refund_attempts_webhook_correlation_idx ON public.booking_r
 
 
 --
+-- Name: booking_refund_requests_created_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX booking_refund_requests_created_id_idx ON public.booking_refund_requests USING btree (created_at DESC, id DESC);
+
+
+--
 -- Name: booking_refund_requests_status_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -5953,6 +6657,13 @@ CREATE INDEX bookings_client_id_idx ON public.bookings USING btree (client_id);
 --
 
 CREATE INDEX bookings_client_id_start_at_idx ON public.bookings USING btree (client_id, start_at);
+
+
+--
+-- Name: bookings_contact_window_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX bookings_contact_window_idx ON public.bookings USING btree (customer_id, start_at, id);
 
 
 --
@@ -5981,6 +6692,13 @@ CREATE INDEX bookings_marketplace_customer_idx ON public.bookings USING btree (m
 --
 
 CREATE INDEX bookings_marketplace_customer_start_id_idx ON public.bookings USING btree (marketplace_customer_id, start_at, id) WHERE (marketplace_customer_id IS NOT NULL);
+
+
+--
+-- Name: bookings_platform_window_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX bookings_platform_window_idx ON public.bookings USING btree (start_at, id);
 
 
 --
@@ -6817,6 +7535,13 @@ CREATE INDEX payment_exceptions_open_idx ON public.payment_exceptions USING btre
 
 
 --
+-- Name: payment_exceptions_payment_created_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX payment_exceptions_payment_created_idx ON public.payment_exceptions USING btree (payment_id, created_at DESC, id DESC);
+
+
+--
 -- Name: payments_booking_created_id_idx; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -6842,6 +7567,13 @@ CREATE INDEX payments_checkout_initialization_claim_idx ON public.payments USING
 --
 
 CREATE INDEX payments_client_paid_at_idx ON public.payments USING btree (client_id, paid_at DESC) WHERE (paid_at IS NOT NULL);
+
+
+--
+-- Name: payments_created_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX payments_created_id_idx ON public.payments USING btree (created_at DESC, id DESC);
 
 
 --
@@ -6891,6 +7623,13 @@ CREATE INDEX payout_destinations_client_idx ON public.payout_destinations USING 
 --
 
 CREATE UNIQUE INDEX payout_destinations_one_default_idx ON public.payout_destinations USING btree (client_id, country_code, currency_code, rail) WHERE (is_default AND (status = 'active'::text));
+
+
+--
+-- Name: payouts_created_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX payouts_created_id_idx ON public.payouts USING btree (created_at DESC, id DESC);
 
 
 --
@@ -7615,6 +8354,13 @@ CREATE UNIQUE INDEX welcome_email_templates_one_active_audience_idx ON public.we
 
 
 --
+-- Name: account_security_events account_security_wake; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER account_security_wake AFTER INSERT ON public.account_security_events FOR EACH STATEMENT EXECUTE FUNCTION public.notify_auth_code_delivery_job();
+
+
+--
 -- Name: agreement_jobs agreement_jobs_wake_core; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -7643,6 +8389,13 @@ CREATE TRIGGER auth_code_delivery_jobs_wake AFTER INSERT ON public.auth_code_del
 
 
 --
+-- Name: bookings booking_additional_email_marker; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER booking_additional_email_marker BEFORE INSERT ON public.bookings FOR EACH ROW EXECUTE FUNCTION public.mark_booking_additional_email();
+
+
+--
 -- Name: booking_domain_events booking_domain_events_enqueue_notification; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -7661,6 +8414,13 @@ CREATE TRIGGER booking_domain_events_marketplace_notification AFTER INSERT ON pu
 --
 
 CREATE TRIGGER booking_domain_events_notify AFTER INSERT ON public.booking_domain_events FOR EACH ROW EXECUTE FUNCTION public.notify_booking_domain_event();
+
+
+--
+-- Name: booking_domain_events booking_event_additional_email_marker; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER booking_event_additional_email_marker BEFORE INSERT ON public.booking_domain_events FOR EACH ROW EXECUTE FUNCTION public.mark_booking_event_additional_email();
 
 
 --
@@ -7790,6 +8550,20 @@ CREATE TRIGGER client_profiles_public_resource_update_trigger AFTER UPDATE OF bu
 
 
 --
+-- Name: client_profiles client_profiles_restriction_discovery; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER client_profiles_restriction_discovery AFTER UPDATE OF platform_restricted ON public.client_profiles FOR EACH ROW WHEN ((old.platform_restricted IS DISTINCT FROM new.platform_restricted)) EXECUTE FUNCTION public.enqueue_marketplace_discovery_direct('true', 'true', 'true');
+
+
+--
+-- Name: client_profiles client_profiles_restriction_public_revision; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER client_profiles_restriction_public_revision AFTER UPDATE OF platform_restricted ON public.client_profiles FOR EACH ROW WHEN ((old.platform_restricted IS DISTINCT FROM new.platform_restricted)) EXECUTE FUNCTION public.bump_public_provider_resource_revision_direct();
+
+
+--
 -- Name: financial_jobs financial_jobs_wake_core; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -7860,6 +8634,27 @@ CREATE TRIGGER payments_provider_daily_metric_trigger AFTER INSERT OR DELETE OR 
 
 
 --
+-- Name: payout_destinations payout_account_email; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER payout_account_email AFTER INSERT OR UPDATE ON public.payout_destinations FOR EACH ROW EXECUTE FUNCTION public.capture_payout_account_email();
+
+
+--
+-- Name: payouts payout_email_event; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER payout_email_event AFTER UPDATE OF status ON public.payouts FOR EACH ROW EXECUTE FUNCTION public.capture_financial_email();
+
+
+--
+-- Name: payouts payout_notification_revision; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER payout_notification_revision BEFORE UPDATE ON public.payouts FOR EACH ROW EXECUTE FUNCTION public.advance_payout_notification_revision();
+
+
+--
 -- Name: provider_availability_windows provider_availability_marketplace_discovery_trigger; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -7906,6 +8701,20 @@ CREATE TRIGGER provider_reviews_public_resource_insert_delete_trigger AFTER INSE
 --
 
 CREATE TRIGGER provider_reviews_public_resource_update_trigger AFTER UPDATE OF client_id, customer_id, author_name, rating, review_text, image_url, booking_id, service_id, status, created_at ON public.provider_reviews FOR EACH ROW EXECUTE FUNCTION public.bump_public_provider_resource_revision_for_public_review();
+
+
+--
+-- Name: booking_refund_requests refund_email_event; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER refund_email_event AFTER INSERT OR UPDATE OF status ON public.booking_refund_requests FOR EACH ROW EXECUTE FUNCTION public.capture_financial_email();
+
+
+--
+-- Name: booking_refund_requests refund_notification_revision; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER refund_notification_revision BEFORE UPDATE ON public.booking_refund_requests FOR EACH ROW EXECUTE FUNCTION public.advance_refund_notification_revision();
 
 
 --
@@ -7983,6 +8792,222 @@ CREATE TRIGGER tessa_whatsapp_publish_delivery AFTER UPDATE OF status ON public.
 --
 
 CREATE TRIGGER welcome_email_jobs_wake AFTER INSERT ON public.welcome_email_jobs FOR EACH STATEMENT EXECUTE FUNCTION public.notify_welcome_email_job();
+
+
+--
+-- Name: account_security_events account_security_events_marketplace_customer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.account_security_events
+    ADD CONSTRAINT account_security_events_marketplace_customer_id_fkey FOREIGN KEY (marketplace_customer_id) REFERENCES public.marketplace_customers(id) ON DELETE CASCADE;
+
+
+--
+-- Name: account_security_events account_security_events_provider_client_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.account_security_events
+    ADD CONSTRAINT account_security_events_provider_client_id_fkey FOREIGN KEY (provider_client_id) REFERENCES public.clients(id) ON DELETE CASCADE;
+
+
+--
+-- Name: admin_audit_events admin_audit_events_actor_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_audit_events
+    ADD CONSTRAINT admin_audit_events_actor_id_fkey FOREIGN KEY (actor_id) REFERENCES public.admin_staff(id);
+
+
+--
+-- Name: admin_business_decisions admin_business_decisions_actor_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_business_decisions
+    ADD CONSTRAINT admin_business_decisions_actor_id_fkey FOREIGN KEY (actor_id) REFERENCES public.admin_staff(id);
+
+
+--
+-- Name: admin_business_decisions admin_business_decisions_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_business_decisions
+    ADD CONSTRAINT admin_business_decisions_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.clients(id);
+
+
+--
+-- Name: admin_business_notes admin_business_notes_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_business_notes
+    ADD CONSTRAINT admin_business_notes_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.marketplace_customers(id);
+
+
+--
+-- Name: admin_business_notes admin_business_notes_author_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_business_notes
+    ADD CONSTRAINT admin_business_notes_author_id_fkey FOREIGN KEY (author_id) REFERENCES public.admin_staff(id);
+
+
+--
+-- Name: admin_business_notes admin_business_notes_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_business_notes
+    ADD CONSTRAINT admin_business_notes_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.bookings(id);
+
+
+--
+-- Name: admin_business_notes admin_business_notes_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_business_notes
+    ADD CONSTRAINT admin_business_notes_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.clients(id);
+
+
+--
+-- Name: admin_business_notes admin_business_notes_case_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_business_notes
+    ADD CONSTRAINT admin_business_notes_case_id_fkey FOREIGN KEY (case_id) REFERENCES public.admin_support_cases(id);
+
+
+--
+-- Name: admin_business_notes admin_business_notes_contact_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_business_notes
+    ADD CONSTRAINT admin_business_notes_contact_id_fkey FOREIGN KEY (contact_id) REFERENCES public.customers(id);
+
+
+--
+-- Name: admin_financial_requests admin_financial_requests_allocation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_financial_requests
+    ADD CONSTRAINT admin_financial_requests_allocation_id_fkey FOREIGN KEY (allocation_id) REFERENCES public.payment_allocations(id);
+
+
+--
+-- Name: admin_financial_requests admin_financial_requests_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_financial_requests
+    ADD CONSTRAINT admin_financial_requests_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.clients(id);
+
+
+--
+-- Name: admin_financial_requests admin_financial_requests_destination_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_financial_requests
+    ADD CONSTRAINT admin_financial_requests_destination_id_fkey FOREIGN KEY (destination_id) REFERENCES public.payout_destinations(id);
+
+
+--
+-- Name: admin_financial_requests admin_financial_requests_requester_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_financial_requests
+    ADD CONSTRAINT admin_financial_requests_requester_id_fkey FOREIGN KEY (requester_id) REFERENCES public.admin_staff(id);
+
+
+--
+-- Name: admin_financial_requests admin_financial_requests_reviewer_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_financial_requests
+    ADD CONSTRAINT admin_financial_requests_reviewer_id_fkey FOREIGN KEY (reviewer_id) REFERENCES public.admin_staff(id);
+
+
+--
+-- Name: admin_invitations admin_invitations_staff_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_invitations
+    ADD CONSTRAINT admin_invitations_staff_id_fkey FOREIGN KEY (staff_id) REFERENCES public.admin_staff(id);
+
+
+--
+-- Name: admin_password_resets admin_password_resets_staff_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_password_resets
+    ADD CONSTRAINT admin_password_resets_staff_id_fkey FOREIGN KEY (staff_id) REFERENCES public.admin_staff(id);
+
+
+--
+-- Name: admin_recovery_codes admin_recovery_codes_staff_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_recovery_codes
+    ADD CONSTRAINT admin_recovery_codes_staff_id_fkey FOREIGN KEY (staff_id) REFERENCES public.admin_staff(id);
+
+
+--
+-- Name: admin_sessions admin_sessions_staff_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_sessions
+    ADD CONSTRAINT admin_sessions_staff_id_fkey FOREIGN KEY (staff_id) REFERENCES public.admin_staff(id);
+
+
+--
+-- Name: admin_support_cases admin_support_cases_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_support_cases
+    ADD CONSTRAINT admin_support_cases_account_id_fkey FOREIGN KEY (account_id) REFERENCES public.marketplace_customers(id);
+
+
+--
+-- Name: admin_support_cases admin_support_cases_assignee_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_support_cases
+    ADD CONSTRAINT admin_support_cases_assignee_id_fkey FOREIGN KEY (assignee_id) REFERENCES public.admin_staff(id);
+
+
+--
+-- Name: admin_support_cases admin_support_cases_booking_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_support_cases
+    ADD CONSTRAINT admin_support_cases_booking_id_fkey FOREIGN KEY (booking_id) REFERENCES public.bookings(id);
+
+
+--
+-- Name: admin_support_cases admin_support_cases_business_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_support_cases
+    ADD CONSTRAINT admin_support_cases_business_id_fkey FOREIGN KEY (business_id) REFERENCES public.client_profiles(client_id);
+
+
+--
+-- Name: admin_support_cases admin_support_cases_contact_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_support_cases
+    ADD CONSTRAINT admin_support_cases_contact_id_fkey FOREIGN KEY (contact_id) REFERENCES public.customers(id);
+
+
+--
+-- Name: admin_support_changes admin_support_changes_actor_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_support_changes
+    ADD CONSTRAINT admin_support_changes_actor_id_fkey FOREIGN KEY (actor_id) REFERENCES public.admin_staff(id);
+
+
+--
+-- Name: admin_support_changes admin_support_changes_case_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.admin_support_changes
+    ADD CONSTRAINT admin_support_changes_case_id_fkey FOREIGN KEY (case_id) REFERENCES public.admin_support_cases(id);
 
 
 --
@@ -8135,6 +9160,14 @@ ALTER TABLE ONLY public.agreement_template_versions
 
 ALTER TABLE ONLY public.agreement_template_versions
     ADD CONSTRAINT agreement_template_versions_family_id_fkey FOREIGN KEY (family_id) REFERENCES public.agreement_template_families(id) ON DELETE CASCADE;
+
+
+--
+-- Name: auth_code_delivery_jobs auth_code_delivery_jobs_account_security_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.auth_code_delivery_jobs
+    ADD CONSTRAINT auth_code_delivery_jobs_account_security_event_id_fkey FOREIGN KEY (account_security_event_id) REFERENCES public.account_security_events(id) ON DELETE CASCADE;
 
 
 --
@@ -9916,4 +10949,19 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260906015000'),
     ('20260906016000'),
     ('20260906017000'),
-    ('20260906018000');
+    ('20260906018000'),
+    ('20260913010000'),
+    ('20260914010000'),
+    ('20260914020000'),
+    ('20260914030000'),
+    ('20260914040000'),
+    ('20260915010000'),
+    ('20260915020000'),
+    ('20260915030000'),
+    ('20260915040000'),
+    ('20260915050000'),
+    ('20260915060000'),
+    ('20260915070000'),
+    ('20260916010000'),
+    ('20260916020000'),
+    ('20260916030000');

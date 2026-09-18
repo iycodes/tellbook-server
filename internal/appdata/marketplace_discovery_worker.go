@@ -455,6 +455,7 @@ func projectMarketplaceProvider(
 		) booking_summary ON true
 		WHERE profile.client_id = $1
 		  AND profile.marketplace_enabled
+ AND NOT profile.platform_restricted
 		  AND profile.market_configured_at IS NOT NULL
 		  AND NULLIF(BTRIM(profile.handle_slug), '') IS NOT NULL
 		ON CONFLICT (client_id) DO UPDATE SET

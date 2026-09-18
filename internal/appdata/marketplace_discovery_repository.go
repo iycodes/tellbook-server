@@ -83,6 +83,7 @@ func (r *Repository) SearchMarketplaceProviders(
 				CASE WHEN visitor.geog IS NULL OR service.public_geog IS NULL THEN NULL
 					ELSE ST_Distance(visitor.geog, service.public_geog) END AS public_distance_meters
 			FROM marketplace_provider_documents provider
+ JOIN client_profiles eligibility ON eligibility.client_id=provider.client_id AND NOT eligibility.platform_restricted
 			JOIN marketplace_service_documents service ON service.provider_id = provider.client_id
 			LEFT JOIN visitor ON true
 			LEFT JOIN LATERAL (

@@ -52,7 +52,7 @@ func TestProviderEmailCodeLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := NewService(NewRepository(pool), config.Config{
+	service := NewService(NewRepository(pool).WithAdditionalEmails(true), config.Config{
 		AuthAccessTokenSecret: "provider-code-integration-secret",
 		AuthAccessTokenTTL:    time.Hour, AuthRefreshTokenTTL: 30 * 24 * time.Hour,
 		AuthIssuer: "tellbook-provider-code-test",
@@ -155,6 +155,11 @@ func TestProviderEmailCodeLifecycle(t *testing.T) {
 	if _, err := service.CompletePasswordReset(ctx, resetVerification.ResetGrant,
 		"another secure password", sessionMetadata{}); !errors.Is(err, ErrInvalidResetToken) {
 		t.Fatalf("replayed provider reset grant error = %v", err)
+	}
+
+	var resetNoticeCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM account_security_events WHERE provider_client_id=$1 AND kind='password_reset' AND recipient_email=$2`, verified.User.ID, email).Scan(&resetNoticeCount); err != nil || resetNoticeCount != 1 {
+		t.Fatalf("password reset notices=%d err=%v", resetNoticeCount, err)
 	}
 	if _, _, _, err := service.Refresh(ctx, passwordRefresh, sessionMetadata{}); !errors.Is(err, ErrInvalidRefresh) {
 		t.Fatalf("provider reset did not revoke old refresh session: %v", err)

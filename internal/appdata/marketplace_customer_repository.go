@@ -52,6 +52,7 @@ func (r *Repository) SaveMarketplaceProvider(ctx context.Context, customerID, pr
 		INSERT INTO marketplace_saved_providers (marketplace_customer_id, provider_id)
 		SELECT $1, provider.client_id
 		FROM marketplace_provider_documents provider
+ JOIN client_profiles eligibility ON eligibility.client_id=provider.client_id AND NOT eligibility.platform_restricted
 		WHERE provider.client_id=$2
 		ON CONFLICT (marketplace_customer_id, provider_id) DO NOTHING
 	`, customerID, providerID)
@@ -130,6 +131,7 @@ func (r *Repository) ListMarketplaceSavedProviders(
 			], NULL), saved.created_at
 		FROM marketplace_saved_providers saved
 		JOIN marketplace_provider_documents provider ON provider.client_id=saved.provider_id
+ JOIN client_profiles eligibility ON eligibility.client_id=provider.client_id AND NOT eligibility.platform_restricted
 		CROSS JOIN LATERAL (
 			SELECT candidate.*
 			FROM marketplace_service_documents candidate

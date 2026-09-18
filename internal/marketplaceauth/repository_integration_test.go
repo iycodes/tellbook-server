@@ -99,7 +99,7 @@ func TestPasswordlessCustomerAccountLifecycle(t *testing.T) {
 		_, _ = pool.Exec(ctx, `DELETE FROM marketplace_auth_challenges WHERE identifier=$1`, email)
 		_, _ = pool.Exec(ctx, `DELETE FROM marketplace_customers WHERE email=$1`, email)
 	})
-	repo := NewRepository(pool)
+	repo := NewRepository(pool).WithAdditionalEmails(true)
 	challenges := newTestChallengeService(t, pool)
 	sender := startTestAuthWorker(t, challenges)
 	service := NewService(repo, config.Config{AuthRefreshTokenTTL: 30 * 24 * time.Hour, AuthBcryptCost: 10}, challenges)
@@ -197,6 +197,11 @@ func TestPasswordlessCustomerAccountLifecycle(t *testing.T) {
 	)
 	if err != nil || resetCustomer.ID != customer.ID || resetToken == "" {
 		t.Fatalf("complete password reset customer=%+v token_empty=%t err=%v", resetCustomer, resetToken == "", err)
+	}
+
+	var resetNoticeCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM account_security_events WHERE marketplace_customer_id=$1 AND kind='password_reset'`, customer.ID).Scan(&resetNoticeCount); err != nil || resetNoticeCount != 1 {
+		t.Fatalf("password reset notices=%d err=%v", resetNoticeCount, err)
 	}
 	if _, _, err := service.CompletePasswordReset(ctx, verification.ResetGrant, "another secure password", "integration-test", "127.0.0.1"); !errors.Is(err, ErrInvalidChallenge) {
 		t.Fatalf("replayed reset grant error = %v", err)

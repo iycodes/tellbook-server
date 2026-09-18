@@ -46,7 +46,8 @@ func TestClassifyInboundControlIsExactAndBounded(t *testing.T) {
 		t.Fatalf("VERIFY control = %#v", got)
 	}
 	for _, body := range []string{"STOP now", "START please", "VERIFY short", "hello"} {
-		if got := classifyInboundControl("2348012345678", "text", body); got.kind != "" {
+		// Ordinary text goes to gated Tessa onboarding, never an exact control command.
+		if got := classifyInboundControl("2348012345678", "text", body); got.kind != "tessa_onboarding" || got.text != body || got.sender != "2348012345678" {
 			t.Fatalf("%q classified as %#v", body, got)
 		}
 	}

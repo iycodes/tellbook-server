@@ -13,6 +13,7 @@ import (
 	"booking/go-server/internal/bookingdomain"
 	"booking/go-server/internal/money"
 	"booking/go-server/internal/publictoken"
+	"booking/go-server/internal/securityemail"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -270,6 +271,9 @@ func (r *Repository) ApplyMarketplaceBookingChange(
 		return BookingCommandResponse{}, fmt.Errorf("begin booking change: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := securityemail.EnableTx(ctx, tx, false, r.additionalEmails); err != nil {
+		return BookingCommandResponse{}, err
+	}
 	commandFingerprint := bookingCommandFingerprint(bookingID, command, quoteToken, reason)
 	if err := lockBookingChangeIdempotency(ctx, tx, "command:customer", customerID, idempotencyKey); err != nil {
 		return BookingCommandResponse{}, err
@@ -359,7 +363,7 @@ func (r *Repository) ApplyMarketplaceBookingChange(
 		return BookingCommandResponse{}, err
 	}
 	if quote.RefundAmountMinor > 0 {
-		if err := insertBookingRefundRequest(ctx, tx, booking.ID, commandID, quote.RefundAmountMinor, booking.CurrencyCode, reason); err != nil {
+		if err := r.insertBookingRefundRequest(ctx, tx, booking.ID, commandID, quote.RefundAmountMinor, booking.CurrencyCode, reason); err != nil {
 			return BookingCommandResponse{}, err
 		}
 	}
@@ -372,43 +376,101 @@ func (r *Repository) ApplyMarketplaceBookingChange(
 	return response, nil
 }
 
-func (r *Repository) ApplyProviderBookingCommand(
-	ctx context.Context,
-	clientID, bookingID uuid.UUID,
-	command, reason string,
-	idempotencyKey uuid.UUID,
-) (BookingCommandResponse, error) {
+func (r *Repository) ApplyProviderBookingCommand(ctx context.Context, clientID, bookingID uuid.UUID, command, reason string, idempotencyKey uuid.UUID) (BookingCommandResponse, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return BookingCommandResponse{}, fmt.Errorf("begin provider booking command: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	commandFingerprint := bookingCommandFingerprint(bookingID, command, "", reason)
-	if err := lockBookingChangeIdempotency(ctx, tx, "command:provider", clientID, idempotencyKey); err != nil {
-		return BookingCommandResponse{}, err
-	}
-	if response, found, err := loadIdempotentBookingCommand(ctx, tx, "provider", clientID, bookingID, command, commandFingerprint, idempotencyKey); err != nil {
-		return BookingCommandResponse{}, err
-	} else if found {
-		return response, tx.Commit(ctx)
-	}
-	booking, err := loadProviderBookingChangeRecord(ctx, tx, clientID, bookingID)
+	response, _, err := r.applyOperationalBookingCommand(ctx, tx, "provider", clientID, bookingID, command, reason, idempotencyKey, nil)
 	if err != nil {
 		return BookingCommandResponse{}, err
 	}
-	permissions := bookingdomain.Permissions(booking.Status, booking.StartsAt, booking.EndsAt, time.Now().UTC(), booking.policy())
-	allowed := map[string]bool{
-		"confirm": permissions.ProviderConfirm && providerConfirmationObligationsSatisfied(booking), "decline": permissions.ProviderDecline,
-		"complete": permissions.ProviderComplete, "mark_no_show": permissions.ProviderNoShow,
-	}[command]
+	if err = tx.Commit(ctx); err != nil {
+		return BookingCommandResponse{}, fmt.Errorf("commit provider booking command: %w", err)
+	}
+	return response, nil
+}
+
+// ApplyStaffBookingCommandTx joins the caller's authorized staff/audit transaction.
+// Staff actor identity is independent of the provider that owns the booking.
+// Only commands that cannot enqueue refunds are supported by this entry point.
+func (r *Repository) ApplyStaffBookingCommandTx(ctx context.Context, tx pgx.Tx, staffID, bookingID uuid.UUID, command, reason string, key uuid.UUID, expected time.Time) (BookingCommandResponse, bool, error) {
+	if staffID == uuid.Nil || key == uuid.Nil || expected.IsZero() || (command != "confirm" && command != "complete" && command != "mark_no_show") {
+		return BookingCommandResponse{}, false, ErrBookingActionNotAllowed
+	}
+	return r.applyOperationalBookingCommand(ctx, tx, "staff", staffID, bookingID, command, reason, key, &expected)
+}
+
+func operationalBookingActions(booking bookingChangeRecord, now time.Time) map[string]bool {
+	permissions := bookingdomain.Permissions(booking.Status, booking.StartsAt, booking.EndsAt, now, booking.policy())
+	return map[string]bool{
+		"confirm":      permissions.ProviderConfirm && providerConfirmationObligationsSatisfied(booking),
+		"decline":      permissions.ProviderDecline,
+		"complete":     permissions.ProviderComplete,
+		"mark_no_show": permissions.ProviderNoShow,
+	}
+}
+
+type StaffBookingCommandState struct {
+	UpdatedAt time.Time
+	Actions   []string
+}
+
+func (r *Repository) StaffBookingCommands(ctx context.Context, id uuid.UUID) (StaffBookingCommandState, error) {
+	booking, err := scanBookingChangeRecord(r.db.QueryRow(ctx, bookingChangeRecordQuery+` WHERE b.id=$1`, id))
+	if err != nil {
+		return StaffBookingCommandState{}, err
+	}
+	out := StaffBookingCommandState{UpdatedAt: booking.UpdatedAt, Actions: []string{}}
+	allowed := operationalBookingActions(booking, time.Now().UTC())
+	for _, command := range []string{"confirm", "complete", "mark_no_show"} {
+		if allowed[command] {
+			out.Actions = append(out.Actions, command)
+		}
+	}
+	return out, nil
+}
+
+func (r *Repository) applyOperationalBookingCommand(ctx context.Context, tx pgx.Tx, actorType string, actorID, bookingID uuid.UUID, command, reason string, idempotencyKey uuid.UUID, expected *time.Time) (BookingCommandResponse, bool, error) {
+	if err := securityemail.EnableTx(ctx, tx, false, r.additionalEmails); err != nil {
+		return BookingCommandResponse{}, false, err
+	}
+	version := ""
+	if expected != nil {
+		version = expected.UTC().Format(time.RFC3339Nano)
+	}
+	commandFingerprint := bookingCommandFingerprint(bookingID, command, version, reason)
+	if err := lockBookingChangeIdempotency(ctx, tx, "command:"+actorType, actorID, idempotencyKey); err != nil {
+		return BookingCommandResponse{}, false, err
+	}
+	if response, found, err := loadIdempotentBookingCommand(ctx, tx, actorType, actorID, bookingID, command, commandFingerprint, idempotencyKey); err != nil {
+		return BookingCommandResponse{}, false, err
+	} else if found {
+		return response, true, nil
+	}
+	var booking bookingChangeRecord
+	var err error
+	if actorType == "staff" {
+		booking, err = scanBookingChangeRecord(tx.QueryRow(ctx, bookingChangeRecordQuery+` WHERE b.id=$1 FOR UPDATE OF b`, bookingID))
+	} else {
+		booking, err = loadProviderBookingChangeRecord(ctx, tx, actorID, bookingID)
+	}
+	if err != nil {
+		return BookingCommandResponse{}, false, err
+	}
+	if expected != nil && !booking.UpdatedAt.Equal(*expected) {
+		return BookingCommandResponse{}, false, ErrBookingChangeStale
+	}
+	allowed := operationalBookingActions(booking, time.Now().UTC())[command]
 	if !allowed {
-		return BookingCommandResponse{}, ErrBookingActionNotAllowed
+		return BookingCommandResponse{}, false, ErrBookingActionNotAllowed
 	}
 	status := map[string]string{
 		"confirm": "confirmed", "decline": "declined", "complete": "completed", "mark_no_show": "no_show",
 	}[command]
 	if _, err := tx.Exec(ctx, `UPDATE bookings SET status=$2, updated_at=NOW() WHERE id=$1`, booking.ID, status); err != nil {
-		return BookingCommandResponse{}, fmt.Errorf("apply provider booking command: %w", err)
+		return BookingCommandResponse{}, false, fmt.Errorf("apply provider booking command: %w", err)
 	}
 	refundAmount := int64(0)
 	if command == "decline" {
@@ -422,18 +484,15 @@ func (r *Repository) ApplyProviderBookingCommand(
 		response.RefundStatus = "queued"
 	}
 	commandID := uuid.New()
-	if err := insertBookingCommand(ctx, tx, commandID, booking.ID, "provider", clientID, command, commandFingerprint, idempotencyKey, nil, reason, response); err != nil {
-		return BookingCommandResponse{}, err
+	if err := insertBookingCommand(ctx, tx, commandID, booking.ID, actorType, actorID, command, commandFingerprint, idempotencyKey, nil, reason, response); err != nil {
+		return BookingCommandResponse{}, false, err
 	}
 	if refundAmount > 0 {
-		if err := insertBookingRefundRequest(ctx, tx, booking.ID, commandID, refundAmount, booking.CurrencyCode, reason); err != nil {
-			return BookingCommandResponse{}, err
+		if err := r.insertBookingRefundRequest(ctx, tx, booking.ID, commandID, refundAmount, booking.CurrencyCode, reason); err != nil {
+			return BookingCommandResponse{}, false, err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return BookingCommandResponse{}, fmt.Errorf("commit provider booking command: %w", err)
-	}
-	return response, nil
+	return response, false, nil
 }
 
 func loadMarketplaceBookingChangeRecord(ctx context.Context, q publicBookingQuerier, customerID, bookingID uuid.UUID, forUpdate bool) (bookingChangeRecord, error) {
@@ -633,7 +692,11 @@ func insertBookingCommand(ctx context.Context, tx pgx.Tx, id, bookingID uuid.UUI
 	return nil
 }
 
-func insertBookingRefundRequest(ctx context.Context, tx pgx.Tx, bookingID, commandID uuid.UUID, amount int64, currency, reason string) error {
+func (r *Repository) insertBookingRefundRequest(ctx context.Context, tx pgx.Tx, bookingID, commandID uuid.UUID, amount int64, currency, reason string) error {
+	if err := securityemail.EnableTx(ctx, tx, false, r.additionalEmails); err != nil {
+		return err
+	}
+
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO booking_refund_requests (
 			id, booking_id, command_id, amount_minor, currency_code, reason

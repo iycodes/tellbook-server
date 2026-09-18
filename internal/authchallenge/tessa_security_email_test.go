@@ -92,6 +92,9 @@ func TestTessaSecurityEmailLifecycleIntegration(t *testing.T) {
 	if len(sender.messages) != 1 || sender.messages[0].ToEmail != clientID.String()+"@example.invalid" || !strings.Contains(sender.messages[0].Text, "ending 1683") || strings.Contains(sender.messages[0].Text, "+2348142751683") {
 		t.Fatal("incorrect security email recipient or content")
 	}
+	if !strings.Contains(sender.messages[0].HTML, "WHATSAPP CONNECTED") {
+		t.Fatal("worker did not render the Tessa HTML email")
+	}
 	var accepted bool
 	if err = s.db.QueryRow(ctx, `SELECT email_accepted_at IS NOT NULL FROM tessa_whatsapp_security_events WHERE id=$1`, eventID).Scan(&accepted); err != nil || !accepted {
 		t.Fatalf("acceptance=%v err=%v", accepted, err)

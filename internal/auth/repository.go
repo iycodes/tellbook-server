@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"booking/go-server/internal/authchallenge"
+	"booking/go-server/internal/securityemail"
 	"booking/go-server/internal/welcomeemail"
 
 	"github.com/google/uuid"
@@ -18,11 +19,23 @@ import (
 var ErrNotFound = errors.New("not found")
 
 type Repository struct {
-	db *pgxpool.Pool
+	additionalEmails bool
+	db               *pgxpool.Pool
+	welcomeURL       string
+}
+
+func (r *Repository) WithAdditionalEmails(enabled bool) *Repository {
+	r.additionalEmails = enabled
+	return r
 }
 
 func NewRepository(db *pgxpool.Pool) *Repository {
 	return &Repository{db: db}
+}
+
+func (r *Repository) WithWelcomeURL(actionURL string) *Repository {
+	r.welcomeURL = actionURL
+	return r
 }
 
 func (r *Repository) CompleteCodeChallenge(
@@ -97,7 +110,7 @@ func (r *Repository) CompleteCodeChallenge(
 	}
 	if newAccount && challenge.IdentifierType == "email" {
 		if _, err := welcomeemail.AssignOptionalTx(ctx, tx, welcomeemail.Assignment{
-			Audience: welcomeemail.AudienceProvider, AccountID: clientID, Email: challenge.Identifier,
+			Audience: welcomeemail.AudienceProvider, AccountID: clientID, Email: challenge.Identifier, ActionURL: r.welcomeURL,
 		}); err != nil {
 			return User{}, false, false, fmt.Errorf("assign provider welcome email: %w", err)
 		}
@@ -163,6 +176,13 @@ func (r *Repository) CompleteIdentityLink(ctx context.Context, challenge authcha
 		return User{}, fmt.Errorf("begin provider identity link: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	var securityBefore securityemail.Account
+	if r.additionalEmails {
+		securityBefore, err = securityemail.CaptureTx(ctx, tx, "provider", *challenge.TargetAccountID)
+		if err != nil {
+			return User{}, err
+		}
+	}
 	var consumedID uuid.UUID
 	err = tx.QueryRow(ctx, `
 		UPDATE provider_auth_challenges SET consumed_at=NOW()
@@ -203,7 +223,7 @@ func (r *Repository) CompleteIdentityLink(ctx context.Context, challenge authcha
 			return User{}, fmt.Errorf("update provider email identity: %w", err)
 		}
 		if _, err := welcomeemail.AssignOptionalTx(ctx, tx, welcomeemail.Assignment{
-			Audience: welcomeemail.AudienceProvider, AccountID: *challenge.TargetAccountID, Email: challenge.Identifier,
+			Audience: welcomeemail.AudienceProvider, AccountID: *challenge.TargetAccountID, Email: challenge.Identifier, ActionURL: r.welcomeURL,
 		}); err != nil {
 			return User{}, fmt.Errorf("assign linked provider welcome email: %w", err)
 		}
@@ -224,6 +244,19 @@ func (r *Repository) CompleteIdentityLink(ctx context.Context, challenge authcha
 	`, *challenge.TargetAccountID))
 	if err != nil {
 		return User{}, err
+	}
+	if r.additionalEmails && result.RowsAffected() > 0 {
+		recipient := securityBefore.Email
+		if recipient == "" && challenge.IdentifierType == "email" {
+			recipient = challenge.Identifier
+		}
+		details := map[string]string{}
+		if challenge.IdentifierType == "phone" && len(challenge.Identifier) >= 4 {
+			details["phone_last_four"] = challenge.Identifier[len(challenge.Identifier)-4:]
+		}
+		if err := securityemail.RecordTx(ctx, tx, "provider", *challenge.TargetAccountID, recipient, challenge.IdentifierType+"_linked", details); err != nil {
+			return User{}, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return User{}, fmt.Errorf("commit provider identity link: %w", err)
@@ -345,6 +378,13 @@ func (r *Repository) CompletePasswordReset(ctx context.Context, grantHash []byte
 	if err != nil {
 		return User{}, fmt.Errorf("consume provider password reset grant: %w", err)
 	}
+	var securityBefore securityemail.Account
+	if r.additionalEmails {
+		securityBefore, err = securityemail.CaptureTx(ctx, tx, "provider", userID)
+		if err != nil {
+			return User{}, err
+		}
+	}
 	if _, err = tx.Exec(ctx, `
 		UPDATE clients SET password_hash=$2,security_revision=security_revision+1,updated_at=NOW()
 		WHERE id=$1
@@ -371,6 +411,12 @@ func (r *Repository) CompletePasswordReset(ctx context.Context, grantHash []byte
 	if err != nil {
 		return User{}, err
 	}
+	if r.additionalEmails {
+		kind := "password_reset"
+		if err := securityemail.RecordTx(ctx, tx, "provider", userID, securityBefore.Email, kind, nil); err != nil {
+			return User{}, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return User{}, fmt.Errorf("commit provider password reset: %w", err)
 	}
@@ -395,6 +441,13 @@ func (r *Repository) ChangePassword(ctx context.Context, userID uuid.UUID, passw
 		return User{}, fmt.Errorf("begin provider password change: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	var securityBefore securityemail.Account
+	if r.additionalEmails {
+		securityBefore, err = securityemail.CaptureTx(ctx, tx, "provider", userID)
+		if err != nil {
+			return User{}, err
+		}
+	}
 	result, err := tx.Exec(ctx, `
 		UPDATE clients SET password_hash=$2,security_revision=security_revision+1,updated_at=NOW()
 		WHERE id=$1
@@ -415,6 +468,15 @@ func (r *Repository) ChangePassword(ctx context.Context, userID uuid.UUID, passw
 	`, userID))
 	if err != nil {
 		return User{}, err
+	}
+	if r.additionalEmails {
+		kind := "password_changed"
+		if !securityBefore.HasPassword {
+			kind = "password_set"
+		}
+		if err := securityemail.RecordTx(ctx, tx, "provider", userID, securityBefore.Email, kind, nil); err != nil {
+			return User{}, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return User{}, fmt.Errorf("commit provider password change: %w", err)

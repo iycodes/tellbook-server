@@ -127,6 +127,11 @@ type Config struct {
 	AuthCookieSecure                      bool
 	AuthRefreshTokenTTL                   time.Duration
 	AuthBcryptCost                        int
+	AdminEnabled                          bool
+	AdminPublicURL                        string
+	AdminMFAEncryptionKeys                string
+	AdminMFAActiveKey                     string
+	AdditionalEmailsEnabled               bool
 	AuthEmailEnabled                      bool
 	AuthWhatsAppEnabled                   bool
 	AuthDeliveryEncryptionKeys            string
@@ -457,6 +462,11 @@ func Load() (Config, error) {
 		AuthCookieSecure:                      getEnvBool("AUTH_COOKIE_SECURE", false),
 		AuthRefreshTokenTTL:                   getEnvDuration("AUTH_REFRESH_TOKEN_TTL", 24*30*time.Hour),
 		AuthBcryptCost:                        getEnvInt("AUTH_BCRYPT_COST", 12),
+		AdminEnabled:                          getEnvBool("ADMIN_ENABLED", false),
+		AdminPublicURL:                        getEnv("ADMIN_PUBLIC_URL", ""),
+		AdminMFAEncryptionKeys:                getEnv("ADMIN_MFA_ENCRYPTION_KEYS", ""),
+		AdminMFAActiveKey:                     getEnv("ADMIN_MFA_ACTIVE_KEY", ""),
+		AdditionalEmailsEnabled:               getEnvBool("ADDITIONAL_EMAILS_ENABLED", false),
 		AuthEmailEnabled:                      getEnvBool("AUTH_EMAIL_ENABLED", false),
 		AuthWhatsAppEnabled:                   getEnvBool("AUTH_WHATSAPP_ENABLED", false),
 		AuthDeliveryEncryptionKeys:            strings.TrimSpace(os.Getenv("AUTH_DELIVERY_ENCRYPTION_KEYS")),

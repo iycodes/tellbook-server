@@ -29,6 +29,7 @@ type Repository struct {
 	db               *pgxpool.Pool
 	destinationKey   []byte
 	enabledTemplates map[whatsapp.TemplateKey]struct{}
+	additionalEmails bool
 	emailEnabled     bool
 	whatsAppEnabled  bool
 	now              func() time.Time
@@ -60,6 +61,11 @@ func NewRepository(
 		emailEnabled: emailEnabled, whatsAppEnabled: whatsAppEnabled,
 		now: func() time.Time { return time.Now().UTC() },
 	}, nil
+}
+
+func (r *Repository) WithAdditionalEmails(enabled bool) *Repository {
+	r.additionalEmails = enabled && r.emailEnabled
+	return r
 }
 
 type EventJob struct {

@@ -67,7 +67,7 @@ func TestInboxAIAutopilotConfirmationCreatesOneExactReservationConcurrently(t *t
 	if err := pool.QueryRow(ctx, `
 		SELECT profile.client_id, profile.handle_slug
 		FROM client_profiles profile
-		WHERE profile.marketplace_enabled AND profile.market_configured_at IS NOT NULL
+		WHERE profile.marketplace_enabled AND NOT profile.platform_restricted AND profile.market_configured_at IS NOT NULL
 		  AND btrim(profile.handle_slug) <> ''
 		ORDER BY profile.client_id
 		LIMIT 1
@@ -204,6 +204,8 @@ func TestInboxAIAutopilotConfirmationCreatesOneExactReservationConcurrently(t *t
 	conversationID := uuid.MustParse(conversationResult.Detail.Conversation.ID)
 	t.Cleanup(func() {
 		_, _ = pool.Exec(ctx, `DELETE FROM inbox_conversations WHERE id=$1`, conversationID)
+		_, _ = pool.Exec(ctx, `UPDATE booking_quotes SET booking_id=NULL,consumed_at=NULL WHERE booking_id IN (SELECT id FROM bookings WHERE marketplace_customer_id=$1)`, marketplaceCustomerID)
+		_, _ = pool.Exec(ctx, `DELETE FROM payments WHERE booking_id IN (SELECT id FROM bookings WHERE marketplace_customer_id=$1)`, marketplaceCustomerID)
 		_, _ = pool.Exec(ctx, `DELETE FROM bookings WHERE marketplace_customer_id=$1`, marketplaceCustomerID)
 		_, _ = pool.Exec(ctx, `DELETE FROM booking_quotes WHERE service_id=$1 AND booking_id IS NULL`, serviceID)
 		_, _ = pool.Exec(ctx, `DELETE FROM service_availability_windows WHERE service_id=$1`, serviceID)
@@ -675,6 +677,22 @@ func TestInboxAIAutopilotConfirmationCreatesOneExactReservationConcurrently(t *t
 	if paidProposal == nil || paidProposal.TotalAmountMinor != 250000 || paidProposal.Agreement.Required {
 		t.Fatalf("paid proposal = %#v", paidProposal)
 	}
+	// A proposal/quote issued before restriction must not reserve a booking.
+	if _, err = pool.Exec(ctx, `UPDATE client_profiles SET platform_restricted=true WHERE client_id=$1`, clientID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `UPDATE client_profiles SET platform_restricted=false WHERE client_id=$1`, clientID)
+	})
+	_, restrictedErr := repo.ConfirmMarketplaceInboxAIBookingProposal(ctx, marketplaceCustomerID, conversationID, uuid.MustParse(paidProposal.ID), ConfirmInboxAIBookingProposalInput{
+		IdempotencyKey: uuid.NewString(), ProposalRevision: paidProposal.Revision, ProposalHash: paidProposal.Hash, ContactDetailsConfirmed: true,
+	})
+	if !errors.Is(restrictedErr, ErrBusinessRestricted) {
+		t.Fatalf("restricted autopilot reservation: %v", restrictedErr)
+	}
+	if _, err = pool.Exec(ctx, `UPDATE client_profiles SET platform_restricted=false WHERE client_id=$1`, clientID); err != nil {
+		t.Fatal(err)
+	}
 	paidReservation, err := repo.ConfirmMarketplaceInboxAIBookingProposal(
 		ctx, marketplaceCustomerID, conversationID, uuid.MustParse(paidProposal.ID),
 		ConfirmInboxAIBookingProposalInput{
@@ -848,7 +866,8 @@ func TestInboxAIAutopilotConfirmationCreatesOneExactReservationConcurrently(t *t
 			(SELECT COUNT(*) FROM inbox_messages message
 			 WHERE message.booking_id=$1 AND message.presentation->>'kind'='reservation_expired'),
 			(SELECT COUNT(*) FROM booking_domain_events event
-			 WHERE event.booking_id=$1 AND event.event_type='booking_expired')
+			 WHERE event.booking_id=$1 AND event.event_type='booking_updated'
+ AND event.payload->>'status'='expired' AND event.payload->>'previous_status'<>'expired')
 		FROM bookings booking
 		INNER JOIN inbox_ai_booking_sessions session ON session.booking_id=booking.id
 		WHERE booking.id=$1

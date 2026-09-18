@@ -170,6 +170,7 @@ func (r *Repository) listMarketplaceProviders(ctx context.Context, token string,
 			provider.document_revision,
 			service.document_revision
 		FROM marketplace_provider_documents provider
+ JOIN client_profiles eligibility ON eligibility.client_id=provider.client_id AND NOT eligibility.platform_restricted
 		LEFT JOIN visitor ON TRUE
 		CROSS JOIN LATERAL (
 			SELECT candidate.*,

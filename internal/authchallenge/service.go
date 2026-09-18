@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"booking/go-server/internal/secure"
+	"booking/go-server/internal/transactionemail"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -45,20 +46,22 @@ var (
 )
 
 type Config struct {
-	EmailEnabled    bool
-	WhatsAppEnabled bool
-	EncryptionKeys  string
-	ActiveKey       string
-	DestinationKey  string
+	AdditionalEmailsEnabled bool
+	EmailEnabled            bool
+	WhatsAppEnabled         bool
+	EncryptionKeys          string
+	ActiveKey               string
+	DestinationKey          string
 }
 
 type Service struct {
-	db              *pgxpool.Pool
-	keyring         *secure.Keyring
-	destinationKey  []byte
-	emailEnabled    bool
-	whatsAppEnabled bool
-	now             func() time.Time
+	additionalEmailsEnabled bool
+	db                      *pgxpool.Pool
+	keyring                 *secure.Keyring
+	destinationKey          []byte
+	emailEnabled            bool
+	whatsAppEnabled         bool
+	now                     func() time.Time
 }
 
 type Challenge struct {
@@ -117,10 +120,12 @@ type StartRequest struct {
 }
 
 type deliveryPayload struct {
-	Destination string                `json:"destination"`
-	Code        string                `json:"code,omitempty"`
-	Security    *securityEmailPayload `json:"security,omitempty"`
-	Link        *linkEmailPayload     `json:"link,omitempty"`
+	AccountSecurity *transactionemail.SecurityInput `json:"account_security,omitempty"`
+	Destination     string                          `json:"destination"`
+	Code            string                          `json:"code,omitempty"`
+	Purpose         string                          `json:"purpose,omitempty"`
+	Security        *securityEmailPayload           `json:"security,omitempty"`
+	Link            *linkEmailPayload               `json:"link,omitempty"`
 }
 
 func NewService(db *pgxpool.Pool, cfg Config) (*Service, error) {
@@ -139,7 +144,7 @@ func NewService(db *pgxpool.Pool, cfg Config) (*Service, error) {
 	}
 	return &Service{
 		db: db, keyring: keyring, destinationKey: []byte(cfg.DestinationKey),
-		emailEnabled: cfg.EmailEnabled, whatsAppEnabled: cfg.WhatsAppEnabled,
+		additionalEmailsEnabled: cfg.AdditionalEmailsEnabled, emailEnabled: cfg.EmailEnabled, whatsAppEnabled: cfg.WhatsAppEnabled,
 		now: func() time.Time { return time.Now().UTC() },
 	}, nil
 }
@@ -203,7 +208,7 @@ func (s *Service) Start(ctx context.Context, request StartRequest) (Response, er
 		CodeHash: hashCode(code), DeliveryDeadline: now.Add(deliveryDeadline), CreatedAt: now,
 	}
 	jobID := uuid.New()
-	payload, err := json.Marshal(deliveryPayload{Destination: identifier, Code: code})
+	payload, err := json.Marshal(deliveryPayload{Destination: identifier, Code: code, Purpose: request.Purpose})
 	if err != nil {
 		return Response{}, err
 	}

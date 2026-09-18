@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"booking/go-server/internal/admin"
 	agreementrepo "booking/go-server/internal/agreements/repository"
 	agreementservice "booking/go-server/internal/agreements/service"
 	agreementworker "booking/go-server/internal/agreements/worker"
@@ -136,7 +137,7 @@ func main() {
 		go aiWorkerWake.Start(ctx)
 	}
 
-	authRepo := auth.NewRepository(dbPool)
+	authRepo := auth.NewRepository(dbPool).WithAdditionalEmails(cfg.AdditionalEmailsEnabled && cfg.AuthEmailEnabled).WithWelcomeURL(cfg.ClientPublicBaseURL + "/")
 	r2Service, err := storage.NewR2Service(cfg)
 	if err != nil {
 		logger.Error("configure R2 storage", "error", err)
@@ -184,8 +185,10 @@ func main() {
 		os.Exit(1)
 	}
 	authChallenges, err := authchallenge.NewService(dbPool, authchallenge.Config{
-		EmailEnabled: cfg.AuthEmailEnabled, WhatsAppEnabled: cfg.AuthWhatsAppEnabled,
-		EncryptionKeys: cfg.AuthDeliveryEncryptionKeys, ActiveKey: cfg.AuthDeliveryActiveKey,
+		AdditionalEmailsEnabled: cfg.AdditionalEmailsEnabled,
+		EmailEnabled:            cfg.AuthEmailEnabled,
+		WhatsAppEnabled:         cfg.AuthWhatsAppEnabled,
+		EncryptionKeys:          cfg.AuthDeliveryEncryptionKeys, ActiveKey: cfg.AuthDeliveryActiveKey,
 		DestinationKey: cfg.AuthDestinationHMACKey,
 	})
 	if err != nil {
@@ -195,13 +198,13 @@ func main() {
 
 	authService := auth.NewService(authRepo, cfg, r2Service, authChallenges)
 	authHandler := auth.NewHandler(authService, cfg)
-	marketplaceAuthRepo := marketplaceauth.NewRepository(dbPool)
+	marketplaceAuthRepo := marketplaceauth.NewRepository(dbPool).WithAdditionalEmails(cfg.AdditionalEmailsEnabled && cfg.AuthEmailEnabled).WithWelcomeURL(cfg.MarketplacePublicBaseURL + "/search")
 	marketplaceAuthService := marketplaceauth.NewService(marketplaceAuthRepo, cfg, authChallenges)
 	if redisClient != nil {
 		marketplaceAuthService.ConfigureSessionCache(redisClient, cfg.RedisFallbackMaxConcurrency, metrics)
 	}
 	marketplaceAuthHandler := marketplaceauth.NewHandler(marketplaceAuthService, marketplaceAuthRepo, cfg)
-	appdataRepo := appdata.NewRepository(dbPool)
+	appdataRepo := appdata.NewRepository(dbPool).WithAdditionalEmails(cfg.AdditionalEmailsEnabled && cfg.NotificationEmailEnabled)
 	appdataRepo.ConfigureGoogleMaps(cfg.GoogleMapsServerAPIKey)
 	appdataRepo.ConfigureOperationalMetrics(metrics)
 	appdataRepo.ConfigureInboxAIAutopilotPaymentWindow(cfg.InboxAIAutopilotPaymentWindow)
@@ -299,7 +302,7 @@ func main() {
 		}
 	}
 
-	ledgerRepository := payments.NewLedgerRepository(dbPool)
+	ledgerRepository := payments.NewLedgerRepository(dbPool).WithAdditionalEmails(cfg.AdditionalEmailsEnabled && cfg.AuthEmailEnabled, cfg.AdditionalEmailsEnabled && cfg.NotificationEmailEnabled)
 	var financialKeyring *secure.Keyring
 	var financialFingerprinter *secure.Fingerprinter
 	if cfg.FinancialEncryptionKeys != "" {
@@ -576,6 +579,7 @@ func main() {
 				logger.Error("configure notification planner", "error", notificationErr)
 				os.Exit(1)
 			}
+			notificationRepository.WithAdditionalEmails(cfg.AdditionalEmailsEnabled)
 			notificationWake, unsubscribeNotificationWake := coreWorkerWake.Subscribe()
 			defer unsubscribeNotificationWake()
 			go notificationworker.NewPlannerWorker(
@@ -628,6 +632,11 @@ func main() {
 		bookingRefundWake, unsubscribeBookingRefundWake := coreWorkerWake.Subscribe()
 		defer unsubscribeBookingRefundWake()
 		go bookingRefundWorker.Start(ctx, bookingRefundWake)
+		if cfg.AdditionalEmailsEnabled && cfg.NotificationEmailEnabled {
+			financialEmailWake, unsubscribeFinancialEmail := coreWorkerWake.Subscribe()
+			defer unsubscribeFinancialEmail()
+			go payments.NewFinancialEmailWorker(ledgerRepository, notificationSMTPMailer, cfg.NotificationDestinationHMACKey, cfg.ClientPublicBaseURL, cfg.MarketplacePublicBaseURL, logger).Start(ctx, financialEmailWake)
+		}
 	}
 
 	appdataHandler := appdata.NewHandler(appdataRepo, authHandler, destinationService, r2Service, smtpMailer, aiClient, checkoutService, payoutService, paymentEvents, paymentReconciliations, cfg.ClientPublicBaseURL, cfg.MarketplacePublicBaseURL)
@@ -822,7 +831,7 @@ func main() {
 	if runsMaintenance {
 		providerDailyMetrics := appdata.NewProviderDailyMetricsWorker(appdataRepo, logger)
 		go providerDailyMetrics.Start(ctx)
-		dataMaintenance := appdata.NewDataMaintenanceWorker(dbPool, logger)
+		dataMaintenance := appdata.NewDataMaintenanceWorker(dbPool, logger).WithAdminRetention(cfg.AdminEnabled)
 		go dataMaintenance.Start(ctx)
 		inboxEventRetention := appdata.NewInboxEventRetentionWorker(dbPool, logger)
 		go inboxEventRetention.Start(ctx)
@@ -863,6 +872,14 @@ func main() {
 		ConfigurationReady: true, WorkersReady: true,
 		MaintenanceOwnership: maintenanceOwnership,
 		MetaWhatsAppWebhook:  metaWhatsAppWebhook,
+	}
+	if runsAPI && cfg.AdminEnabled {
+		adminService, adminErr := admin.New(dbPool, admin.Config{PublicURL: cfg.AdminPublicURL, EncryptionKeys: cfg.AdminMFAEncryptionKeys, ActiveKey: cfg.AdminMFAActiveKey, BcryptCost: cfg.AuthBcryptCost}, authSMTPMailer)
+		if adminErr != nil {
+			logger.Error("configure admin", "error", adminErr)
+			os.Exit(1)
+		}
+		operational.AdminHandler = adminService.WithBookingRepository(appdataRepo).Handler(logger)
 	}
 	if redisClient != nil {
 		operational.RedisReadiness = redisClient

@@ -24,6 +24,7 @@ import (
 )
 
 type Repository struct {
+	additionalEmails              bool
 	db                            *pgxpool.Pool
 	httpClient                    *http.Client
 	googleMapsAPIKey              string
@@ -33,6 +34,11 @@ type Repository struct {
 	inboxAIAutomationAllowlist    map[uuid.UUID]struct{}
 	inboxAISemiPilotReplyDelay    time.Duration
 	inboxAIAutopilotPaymentWindow time.Duration
+}
+
+func (r *Repository) WithAdditionalEmails(enabled bool) *Repository {
+	r.additionalEmails = enabled
+	return r
 }
 
 func NewRepository(db *pgxpool.Pool) *Repository {

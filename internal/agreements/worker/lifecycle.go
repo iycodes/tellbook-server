@@ -326,17 +326,11 @@ func (w *LifecycleWorker) sendAgreementEmail(ctx context.Context, agreementID uu
 		return fmt.Errorf("recover agreement email link: %w", err)
 	}
 	link := w.publicBaseURL + "/agreement/" + token
-	subject := "Review your " + agreement.Title
-	message := "Please review and complete your agreement.\n\nOpen agreement: " + link
-	if completed {
-		subject = agreement.Title + " completed"
-		message = "Your agreement has been completed and recorded.\n\nView agreement: " + link
+	message, err := renderAgreementEmail(agreement, jobDedupeKey, link, completed)
+	if err != nil {
+		return err
 	}
-	if err := w.mailer.Send(ctx, mailer.Message{
-		ToEmail: agreement.SentToEmail, ToName: agreement.CustomerName,
-		Subject: subject, Text: message,
-		MessageID: agreementEmailMessageID(agreement.ID, jobDedupeKey),
-	}); err != nil {
+	if err := w.mailer.Send(ctx, message); err != nil {
 		return fmt.Errorf("send agreement email: %w", err)
 	}
 	eventType := "sent"

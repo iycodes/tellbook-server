@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="x-apple-disable-message-reformatting"><meta name="color-scheme" content="light"><meta name="supported-color-schemes" content="light">
+<title>{{.Subject}}</title>
+<style>
+:root{color-scheme:light only;supported-color-schemes:light}
+body{margin:0;padding:0}table{border-collapse:collapse;mso-table-lspace:0pt;mso-table-rspace:0pt}
+a[x-apple-data-detectors]{color:inherit!important;text-decoration:none!important}
+@media screen and (max-width:480px){.outer{padding:20px 10px!important}.inset{padding-left:24px!important;padding-right:24px!important}.headline{font-size:32px!important;line-height:38px!important}}
+</style>
+{{outlookHead}}
+</head>
+<body bgcolor="#faf9f4" style="margin:0;padding:0;width:100%;background-color:#faf9f4;color:#2d2426;font-family:Arial,Helvetica,sans-serif;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
+<div aria-hidden="true" style="display:none;font-size:1px;line-height:1px;color:#faf9f4;max-height:0;max-width:0;opacity:0;overflow:hidden;mso-hide:all;">{{.Preheader}}&#847; &zwnj; &nbsp; &zwnj; &nbsp; &zwnj; &nbsp; &zwnj; &nbsp; &zwnj; &nbsp; &zwnj; &nbsp;</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#faf9f4" style="width:100%;background-color:#faf9f4;">
+<tr><td class="outer" align="center" style="padding:36px 16px;">
+{{outlookStart}}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;table-layout:fixed;">
+        <tr><td style="padding:0 4px 22px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+            <tr>
+              <td valign="middle">
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td width="40" valign="middle" style="width:40px;"><img src="https://bookly-public.iycodes.com/bookings.png" width="40" height="40" alt="" style="display:block;width:40px;height:40px;border:0;outline:none;text-decoration:none;"></td>
+                    <td valign="middle" style="padding-left:8px;font-family:Arial,Helvetica,sans-serif;font-size:24px;line-height:30px;font-weight:700;letter-spacing:-0.8px;white-space:nowrap;"><span style="color:#af1f4a;">Tell</span><span style="color:#2d2426;">Book</span></td>
+                  </tr>
+                </table>
+              </td>
+              <td align="right" style="font-family:Arial,Helvetica,sans-serif;font-size:11px;line-height:16px;letter-spacing:1.5px;color:#584144;">A LITTLE MORE<br>TAKEN CARE OF.</td>
+            </tr>
+          </table>
+        </td></tr>
+
+<tr><td bgcolor="#ffffff" style="background-color:#ffffff;border:1px solid #e2d8d2;border-top:4px solid #af1f4a;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;table-layout:fixed;">
+<tr><td class="inset" align="center" style="padding:34px 40px 0;font-family:Arial,Helvetica,sans-serif;font-size:10px;line-height:16px;font-weight:700;letter-spacing:1.7px;color:#af1f4a;">TESSA · YOUR WHATSAPP ASSISTANT</td></tr>
+<tr><td class="inset" align="center" style="padding:18px 40px 0;"><h1 class="headline" style="margin:0;font-family:Georgia,'Times New Roman',serif;font-size:38px;line-height:44px;font-weight:400;letter-spacing:-0.7px;color:#2d2426;">{{.Headline}}</h1></td></tr>
+<tr><td class="inset" align="center" style="padding:16px 40px 26px;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:24px;color:#584144;">{{.Intro}}</td></tr>
+<tr><td class="inset" style="padding:0 40px 26px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#faf9f4" style="width:100%;background-color:#faf9f4;border:1px solid #e2d8d2;table-layout:fixed;">
+<tr><td style="padding:20px 20px 12px;font-size:10px;line-height:16px;font-weight:700;letter-spacing:1.4px;color:#af1f4a;">{{.Status}}</td></tr>
+<tr><td style="padding:0 20px 6px;font-family:Georgia,'Times New Roman',serif;font-size:26px;line-height:32px;color:#2d2426;">WhatsApp<br><span style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:24px;color:#584144;">ending</span> <span dir="ltr">{{.PhoneSuffix}}</span></td></tr>
+<tr><td style="padding:0 20px 20px;font-size:12px;line-height:19px;color:#584144;">TellBook Tessa assistant</td></tr>
+{{if .OccurredAt}}<tr><td style="padding:16px 20px;border-top:1px solid #e2d8d2;font-size:12px;line-height:20px;color:#584144;"><span style="font-size:10px;letter-spacing:1.2px;font-weight:700;">RECORDED ON</span><br>{{.OccurredAt}}</td></tr>{{end}}
+{{if .Code}}<tr><td align="center" bgcolor="#f7e9ee" style="padding:20px 12px;background-color:#f7e9ee;border-top:1px solid #e2d8d2;"><p style="margin:0 0 12px;font-size:10px;line-height:16px;letter-spacing:1.5px;font-weight:700;color:#584144;">YOUR LINKING CODE</p><p dir="ltr" style="margin:0;font-family:'Courier New',Courier,monospace;font-size:36px;line-height:44px;font-weight:700;letter-spacing:4px;white-space:nowrap;color:#af1f4a;">{{.Code}}</p></td></tr>{{end}}
+</table>
+{{if .Code}}<p style="margin:14px 0 0;text-align:center;font-size:12px;line-height:19px;color:#584144;">Expires 10 minutes after the request.</p>{{end}}
+</td></tr>
+<tr><td class="inset" style="padding:0 40px 28px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;table-layout:fixed;">
+<tr><td style="padding:22px 0 0;border-top:1px solid #e2d8d2;font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:21px;color:#584144;"><p style="margin:0 0 6px;font-weight:700;color:#2d2426;">{{.NoteTitle}}</p><p style="margin:0;">{{.NoteBody}}</p></td></tr>
+</table>
+</td></tr>
+<tr><td class="inset" bgcolor="#faf9f4" style="padding:18px 40px;background-color:#faf9f4;border-top:1px solid #e2d8d2;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:19px;color:#584144;">{{.Footer}}</td></tr>
+</table>
+</td></tr>
+<tr><td align="center" style="padding:22px 20px 0;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:19px;color:#7c6a6e;"><p style="margin:0 0 5px;font-weight:700;color:#584144;">A little care for your account.</p><p style="margin:0;">Sent to <span style="word-break:break-all;overflow-wrap:break-word;">{{.Email}}</span><br>A Tessa connection email from TellBook.</p></td></tr>
+</table>
+{{outlookEnd}}
+</td></tr></table>
+</body></html>

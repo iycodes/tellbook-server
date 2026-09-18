@@ -1113,3 +1113,23 @@ func TestPaystackCredentialsSelectActiveEnvironment(t *testing.T) {
 		t.Fatal("live Paystack credentials were not selected")
 	}
 }
+
+func TestAdditionalEmailsDefaultOff(t *testing.T) {
+	setRequiredConfig(t)
+	t.Setenv("ADDITIONAL_EMAILS_ENABLED", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AdditionalEmailsEnabled {
+		t.Fatal("additional emails enabled by default")
+	}
+	t.Setenv("ADDITIONAL_EMAILS_ENABLED", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.AdditionalEmailsEnabled {
+		t.Fatal("additional email switch ignored")
+	}
+}

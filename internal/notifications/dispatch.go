@@ -35,6 +35,7 @@ func (r *Repository) ClaimDeliveries(
 		WITH claimable AS (
 			SELECT id FROM notification_deliveries
 			WHERE channel=$1 AND scheduled_for<=NOW()
+ AND ($5 OR notification_type NOT IN ('booking_step_reminder','booking_completed'))
 			  AND status IN ('pending','retry','processing')
 			  AND (CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END)<=NOW()
 			ORDER BY (CASE WHEN status='processing' THEN lease_expires_at ELSE next_attempt_at END),
@@ -50,7 +51,7 @@ func (r *Repository) ClaimDeliveries(
 			delivery.notification_type,delivery.template_key,delivery.reminder_occurrence_at,
 			delivery.scheduled_for,delivery.destination_hmac,delivery.preference_revision,
 			delivery.attempt_count,delivery.lease_owner
-	`, channel, batch, owner, lease.Milliseconds())
+	`, channel, batch, owner, lease.Milliseconds(), r.additionalEmails)
 	if err != nil {
 		return nil, fmt.Errorf("claim notification deliveries: %w", err)
 	}
@@ -172,7 +173,7 @@ func (r *Repository) deliveryAuthorizedTx(
 	case "customer:email":
 		destination = state.CustomerEmail
 		preferenceEnabled = state.ConsentPolicyRevision == 1 && state.MarketplaceBookingEmail
-		if delivery.NotificationType == "appointment_reminder" {
+		if delivery.NotificationType == "appointment_reminder" || delivery.NotificationType == "booking_step_reminder" {
 			preferenceEnabled = state.ConsentPolicyRevision == 1 && state.MarketplaceReminderEmail &&
 				state.EmailReminderConsent
 		}
@@ -202,6 +203,8 @@ func (r *Repository) deliveryAuthorizedTx(
 		return false, "destination_suppressed", nil
 	}
 	switch delivery.NotificationType {
+	case "booking_step_reminder", "booking_completed":
+		return r.additionalAuthorizedTx(ctx, tx, delivery, state)
 	case "provider_new_booking":
 		if !providerBookingStatusEligible(state.Status) || !bookingSecured(state) {
 			return false, "booking_not_secured", nil
@@ -299,6 +302,11 @@ func (r *Repository) cancelUnauthorizedTx(
 		WHERE id=$1 AND status='processing' AND lease_owner=$2
 	`, delivery.ID, delivery.LeaseOwner, boundedCode(code)); err != nil {
 		return fmt.Errorf("cancel unauthorized notification delivery: %w", err)
+	}
+	if delivery.NotificationType == "booking_step_reminder" && delivery.Channel == "email" {
+		if err := r.replanUnsentStepTx(ctx, tx, delivery.BookingID); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit cancelled notification delivery: %w", err)

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"booking/go-server/internal/money"
+	"booking/go-server/internal/securityemail"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -126,6 +127,9 @@ func (worker *BookingRefundWorker) prepareNext(ctx context.Context) (bookingRefu
 		return bookingRefundRequest{}, false, err
 	}
 	defer tx.Rollback(ctx)
+	if err := securityemail.EnableTx(ctx, tx, false, worker.repository.financialEmails); err != nil {
+		return bookingRefundRequest{}, false, err
+	}
 	var request bookingRefundRequest
 	err = tx.QueryRow(ctx, `
 		SELECT id, booking_id, amount_minor, currency_code, reason
@@ -373,7 +377,17 @@ func (worker *BookingRefundWorker) failAttempt(ctx context.Context, attempt book
 	if ambiguous {
 		attemptStatus, requestStatus = "unknown", "manual_review"
 	}
-	_, err := worker.repository.db.Exec(ctx, `
+	tx, err := worker.repository.db.Begin(ctx)
+	if err != nil {
+		worker.logger.Error("begin refund failure", "error", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+	if err = securityemail.EnableTx(ctx, tx, false, worker.repository.financialEmails); err != nil {
+		worker.logger.Error("enable refund capture", "error", err)
+		return
+	}
+	_, err = tx.Exec(ctx, `
 		WITH changed AS (
 			UPDATE booking_refund_attempts SET status=$2, failure_message=$3, updated_at=NOW()
 			WHERE id=$1 RETURNING request_id
@@ -382,13 +396,24 @@ func (worker *BookingRefundWorker) failAttempt(ctx context.Context, attempt book
 		SET status=$4, failure_message=$3, updated_at=NOW()
 		FROM changed WHERE request.id=changed.request_id
 	`, attempt.ID, attemptStatus, message, requestStatus)
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
 	if err != nil {
 		worker.logger.Error("fail booking refund attempt", "attempt_id", attempt.ID.String(), "error", err)
 	}
 }
 
 func (worker *BookingRefundWorker) reconcile(ctx context.Context) error {
-	_, err := worker.repository.db.Exec(ctx, `
+	tx, err := worker.repository.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := securityemail.EnableTx(ctx, tx, false, worker.repository.financialEmails); err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
 		UPDATE booking_refund_attempts attempt
 		SET status=adjustment.status, updated_at=NOW()
 		FROM payment_adjustments adjustment
@@ -418,5 +443,8 @@ func (worker *BookingRefundWorker) reconcile(ctx context.Context) error {
 		WHERE request.status IN ('processing','manual_review')
 		  AND EXISTS (SELECT 1 FROM booking_refund_attempts a WHERE a.request_id=request.id);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"booking/go-server/internal/secure"
+	"booking/go-server/internal/securityemail"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -111,6 +112,13 @@ func (s *LedgerService) RevealPayoutDestinationIdentifier(
 	if err != nil {
 		return "", err
 	}
+	return s.revealPayoutDestination(destination)
+}
+
+func (s *LedgerService) revealPayoutDestination(destination PayoutDestination) (string, error) {
+	if s == nil || s.keyring == nil {
+		return "", errors.New("secure payout destination storage is not configured")
+	}
 	if len(destination.IdentifierCiphertext) == 0 {
 		return "", errors.New("payout destination identifier was not retained")
 	}
@@ -154,6 +162,9 @@ func (r *LedgerRepository) savePayoutDestination(
 		return PayoutDestination{}, false, fmt.Errorf("begin payout destination save: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := securityemail.EnableTx(ctx, tx, r.securityEmails, r.financialEmails); err != nil {
+		return PayoutDestination{}, false, err
+	}
 
 	existing, err := getPayoutDestinationByFingerprintTx(ctx, tx, params)
 	if err == nil {
@@ -336,7 +347,15 @@ func (r *LedgerRepository) ListPayoutDestinations(ctx context.Context, clientID 
 }
 
 func (r *LedgerRepository) RevokePayoutDestination(ctx context.Context, clientID, destinationID uuid.UUID) error {
-	tag, err := r.db.Exec(ctx, `
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := securityemail.EnableTx(ctx, tx, r.securityEmails, r.financialEmails); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `
 		UPDATE payout_destinations
 		SET status = 'disabled', is_default = FALSE, updated_at = NOW()
 		WHERE id = $1 AND client_id = $2 AND status = 'active'
@@ -347,7 +366,7 @@ func (r *LedgerRepository) RevokePayoutDestination(ctx context.Context, clientID
 	if tag.RowsAffected() == 0 {
 		return ErrLedgerRecordNotFound
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func scanPayoutDestination(row rowScanner) (PayoutDestination, error) {
@@ -583,10 +602,30 @@ func (r *LedgerRepository) createPayoutAttempt(
 	}
 	defer tx.Rollback(ctx)
 
+	payout, err := r.createPayoutAttemptTx(ctx, tx, input, reference, "")
+	if err != nil {
+		return FinancialPayout{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return FinancialPayout{}, fmt.Errorf("commit payout attempt: %w", err)
+	}
+	return payout, nil
+}
+
+// Caller owns commit/rollback so a reviewed command and staff audit can be atomic.
+func (r *LedgerRepository) createPayoutAttemptTx(ctx context.Context, tx pgx.Tx, input CreateFinancialPayoutInput, reference, reviewedFingerprint string) (FinancialPayout, error) {
 	existing, err := getFinancialPayoutByIdempotencyTx(ctx, tx, input.ClientID, strings.TrimSpace(input.IdempotencyKey))
 	if err == nil {
 		if existing.PaymentAllocationID != input.PaymentAllocationID || existing.PayoutDestinationID != input.PayoutDestinationID {
 			return FinancialPayout{}, ErrIdempotencyConflict
+		}
+		if reviewedFingerprint != "" {
+			var saved struct {
+				ReviewedFingerprint string `json:"reviewed_fingerprint"`
+			}
+			if err := json.Unmarshal(existing.DestinationSnapshot, &saved); err != nil || saved.ReviewedFingerprint != reviewedFingerprint {
+				return FinancialPayout{}, ErrIdempotencyConflict
+			}
 		}
 		return existing, nil
 	}
@@ -594,58 +633,28 @@ func (r *LedgerRepository) createPayoutAttempt(
 		return FinancialPayout{}, err
 	}
 
-	const allocationQuery = `
-		SELECT
-			id, payment_id, client_id, currency_code, gross_amount_minor,
-			provider_collection_fee_minor, platform_fee_minor, tax_amount_minor,
-			adjustment_amount_minor, business_net_amount_minor, policy_version,
-			calculation_snapshot, settlement_status, settlement_reference,
-			available_for_payout_at, status, created_at, updated_at
-		FROM payment_allocations
-		WHERE id = $1
-		FOR UPDATE
-	`
-	allocation, err := scanPaymentAllocation(tx.QueryRow(ctx, allocationQuery, input.PaymentAllocationID))
+	allocation, destination, err := r.lockPayoutInputs(ctx, tx, input)
 	if err != nil {
-		return FinancialPayout{}, fmt.Errorf("lock payment allocation: %w", err)
-	}
-	if allocation.ClientID != input.ClientID || allocation.Status != "eligible" ||
-		allocation.SettlementStatus != "available" || allocation.AvailableForPayoutAt == nil ||
-		allocation.AvailableForPayoutAt.After(time.Now()) || allocation.Amounts.BusinessNetAmountMinor <= 0 {
-		active, activeErr := getActivePayoutByAllocationTx(ctx, tx, input.PaymentAllocationID)
-		if activeErr == nil {
-			return FinancialPayout{}, &ActivePayoutError{Payout: active}
-		}
-		return FinancialPayout{}, errors.New("payment allocation is not eligible for payout")
+		return FinancialPayout{}, err
 	}
 
-	const destinationQuery = `
-		SELECT
-			id, client_id, provider, country_code, currency_code, rail,
-			institution_code, institution_name, masked_identifier,
-			COALESCE(identifier_ciphertext, ''::bytea), COALESCE(identifier_nonce, ''::bytea),
-			COALESCE(encryption_key_version, ''),
-			resolved_account_name, provider_recipient_id, verification_fingerprint,
-			verified_at, is_default, status, created_at, updated_at
-		FROM payout_destinations
-		WHERE id = $1
-		FOR UPDATE
-	`
-	destination, err := scanPayoutDestination(tx.QueryRow(ctx, destinationQuery, input.PayoutDestinationID))
-	if err != nil {
-		return FinancialPayout{}, fmt.Errorf("lock payout destination: %w", err)
+	snapshot := map[string]any{
+		"provider": destination.Provider, "rail": destination.Rail, "country_code": destination.CountryCode, "currency_code": destination.CurrencyCode,
+		"institution_code": destination.InstitutionCode, "institution_name": destination.InstitutionName, "masked_identifier": destination.MaskedIdentifier,
+		"account_name": destination.ResolvedAccountName, "provider_recipient_id": destination.ProviderRecipientID,
 	}
-	if destination.ClientID != input.ClientID || destination.Status != "active" ||
-		destination.CurrencyCode != allocation.CurrencyCode {
-		return FinancialPayout{}, errors.New("payout destination does not match allocation")
+	if reviewedFingerprint != "" {
+		review, err := payoutReview(allocation, destination)
+		if err != nil {
+			return FinancialPayout{}, err
+		}
+		if review.Fingerprint != reviewedFingerprint {
+			return FinancialPayout{}, ErrReviewedPayoutChanged
+		}
+		snapshot["reviewed_fingerprint"] = reviewedFingerprint
+		snapshot["reviewed_destination"] = destination
 	}
-	destinationSnapshot, err := json.Marshal(map[string]string{
-		"provider": destination.Provider, "rail": destination.Rail,
-		"country_code": destination.CountryCode, "currency_code": destination.CurrencyCode,
-		"institution_code": destination.InstitutionCode, "institution_name": destination.InstitutionName,
-		"masked_identifier": destination.MaskedIdentifier, "account_name": destination.ResolvedAccountName,
-		"provider_recipient_id": destination.ProviderRecipientID,
-	})
+	destinationSnapshot, err := json.Marshal(snapshot)
 	if err != nil {
 		return FinancialPayout{}, fmt.Errorf("encode payout destination snapshot: %w", err)
 	}
@@ -702,9 +711,6 @@ func (r *LedgerRepository) createPayoutAttempt(
 			return FinancialPayout{}, ErrConcurrentUpdate
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return FinancialPayout{}, fmt.Errorf("commit payout attempt: %w", err)
-	}
 	return payout, nil
 }
 
@@ -739,6 +745,9 @@ func (r *LedgerRepository) TransitionPayout(
 		return FinancialPayout{}, fmt.Errorf("begin payout transition: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := securityemail.EnableTx(ctx, tx, r.securityEmails, r.financialEmails); err != nil {
+		return FinancialPayout{}, err
+	}
 
 	const lockQuery = `
 		SELECT
@@ -919,4 +928,54 @@ func getActivePayoutByAllocationTx(
 		return FinancialPayout{}, fmt.Errorf("get active payout by allocation: %w", err)
 	}
 	return payout, nil
+}
+
+// Shared by existing payout creation and staff review; callers own the transaction.
+func (r *LedgerRepository) lockPayoutInputs(ctx context.Context, tx pgx.Tx, input CreateFinancialPayoutInput) (PaymentAllocation, PayoutDestination, error) {
+	const allocationQuery = `
+		SELECT
+			id, payment_id, client_id, currency_code, gross_amount_minor,
+			provider_collection_fee_minor, platform_fee_minor, tax_amount_minor,
+			adjustment_amount_minor, business_net_amount_minor, policy_version,
+			calculation_snapshot, settlement_status, settlement_reference,
+			available_for_payout_at, status, created_at, updated_at
+		FROM payment_allocations
+		WHERE id = $1
+		FOR UPDATE
+	`
+	allocation, err := scanPaymentAllocation(tx.QueryRow(ctx, allocationQuery, input.PaymentAllocationID))
+	if err != nil {
+		return PaymentAllocation{}, PayoutDestination{}, fmt.Errorf("lock payment allocation: %w", err)
+	}
+	if allocation.ClientID != input.ClientID || allocation.Status != "eligible" ||
+		allocation.SettlementStatus != "available" || allocation.AvailableForPayoutAt == nil ||
+		allocation.AvailableForPayoutAt.After(time.Now()) || allocation.Amounts.BusinessNetAmountMinor <= 0 {
+		active, activeErr := getActivePayoutByAllocationTx(ctx, tx, input.PaymentAllocationID)
+		if activeErr == nil {
+			return PaymentAllocation{}, PayoutDestination{}, &ActivePayoutError{Payout: active}
+		}
+		return PaymentAllocation{}, PayoutDestination{}, ErrPayoutAllocationIneligible
+	}
+
+	const destinationQuery = `
+		SELECT
+			id, client_id, provider, country_code, currency_code, rail,
+			institution_code, institution_name, masked_identifier,
+			COALESCE(identifier_ciphertext, ''::bytea), COALESCE(identifier_nonce, ''::bytea),
+			COALESCE(encryption_key_version, ''),
+			resolved_account_name, provider_recipient_id, verification_fingerprint,
+			verified_at, is_default, status, created_at, updated_at
+		FROM payout_destinations
+		WHERE id = $1
+		FOR UPDATE
+	`
+	destination, err := scanPayoutDestination(tx.QueryRow(ctx, destinationQuery, input.PayoutDestinationID))
+	if err != nil {
+		return PaymentAllocation{}, PayoutDestination{}, fmt.Errorf("lock payout destination: %w", err)
+	}
+	if destination.ClientID != input.ClientID || destination.Status != "active" ||
+		destination.CurrencyCode != allocation.CurrencyCode {
+		return PaymentAllocation{}, PayoutDestination{}, ErrPayoutDestinationMismatch
+	}
+	return allocation, destination, nil
 }

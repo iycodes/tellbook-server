@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"html"
 	"net/url"
 	"strings"
 	"time"
@@ -43,8 +42,9 @@ type emailCopy struct {
 }
 
 var (
-	ErrEmailNotDispatchable  = errors.New("email delivery is no longer dispatchable")
-	ErrEmailDestinationMoved = errors.New("email destination changed after authorization")
+	ErrEmailEligibilityChanged = errors.New("email eligibility changed before SMTP")
+	ErrEmailNotDispatchable    = errors.New("email delivery is no longer dispatchable")
+	ErrEmailDestinationMoved   = errors.New("email destination changed after authorization")
 )
 
 type emailContentError struct{ cause error }
@@ -57,23 +57,23 @@ func invalidEmailContent(err error) error { return &emailContentError{cause: err
 var emailTemplateRegistry = map[string]emailCopy{
 	"customer:customer_booking_received": {
 		Subject: "We received your booking", Headline: "Your booking is in",
-		Body: "Your booking has been received. We’ll keep this page updated as payment, agreement, and confirmation steps are completed.", Action: "View booking",
+		Body: "We have your booking. You can follow any remaining payment, agreement, and confirmation steps on your booking page.", Action: "View booking",
 	},
 	"provider:provider_new_booking": {
 		Subject: "You have a new secured booking", Headline: "A new booking is ready",
-		Body: "The customer’s required payment and agreement steps are satisfied. Review the appointment details and take any required next action.", Action: "Review booking",
+		Body: "The customer has completed the required payment and agreement steps. Review the details and confirm the appointment if needed.", Action: "Review booking",
 	},
 	"customer:customer_booking_secured": {
 		Subject: "Your booking is secured", Headline: "Your booking steps are complete",
-		Body: "The required payment and agreement steps are complete. Open your booking to see its current provider-confirmation status and next step.", Action: "View booking",
+		Body: "Your required payment and agreement steps are complete. Check your booking page for the provider’s confirmation and anything else you need to do.", Action: "View booking",
 	},
 	"provider:appointment_reminder": {
 		Subject: "Upcoming appointment reminder", Headline: "An appointment is coming up",
-		Body: "Here are the current appointment details. Open TellBook before the appointment if you need the latest booking state.", Action: "View booking",
+		Body: "A little preparation goes a long way. Here are the details for your upcoming appointment; your booking page has the latest updates.", Action: "View booking",
 	},
 	"customer:appointment_reminder": {
 		Subject: "Your appointment is coming up", Headline: "A quick appointment reminder",
-		Body: "Here are the current details for your appointment. Open TellBook if you need the latest information.", Action: "View booking",
+		Body: "Your appointment is getting closer. Here’s a handy reminder of when, where, and who you’re booked with.", Action: "View booking",
 	},
 	"provider:booking_rescheduled": {
 		Subject: "A booking was rescheduled", Headline: "The appointment time changed",
@@ -85,11 +85,11 @@ var emailTemplateRegistry = map[string]emailCopy{
 	},
 	"provider:booking_cancelled": {
 		Subject: "A booking was cancelled", Headline: "Booking cancelled",
-		Body: "This booking is no longer active. Open TellBook to review its final state.", Action: "Review booking",
+		Body: "This booking is no longer active. You can review the cancellation and any payment updates on the booking page.", Action: "Review booking",
 	},
 	"customer:booking_cancelled": {
 		Subject: "Your booking was cancelled", Headline: "Booking cancelled",
-		Body: "This booking is no longer active. Open TellBook to review its final state and any applicable payment update.", Action: "View booking",
+		Body: "This booking is no longer active. Your booking page has the cancellation details and any applicable payment updates.", Action: "View booking",
 	},
 	"provider:booking_expired": {
 		Subject: "A booking reservation expired", Headline: "Reservation expired",
@@ -100,12 +100,12 @@ var emailTemplateRegistry = map[string]emailCopy{
 		Body: "The reservation window ended before the required booking steps were completed.", Action: "View booking",
 	},
 	"provider:payment_satisfied": {
-		Subject: "Booking payment requirement satisfied", Headline: "Payment requirement satisfied",
-		Body: "The required payment for this booking is now satisfied.", Action: "Review booking",
+		Subject: "Booking payment requirement satisfied", Headline: "Payment confirmed",
+		Body: "The required payment for this booking is complete. The current booking balance is below; any remaining balance is shown separately.", Action: "Review booking",
 	},
 	"customer:payment_satisfied": {
 		Subject: "Your booking payment is confirmed", Headline: "Payment confirmed",
-		Body: "The required payment for this booking is now satisfied.", Action: "View booking",
+		Body: "Your required payment is complete. You’ll find the current booking balance below, including any amount still remaining.", Action: "View booking",
 	},
 	"provider:payment_failed": {
 		Subject: "Booking payment needs attention", Headline: "Payment needs attention",
@@ -117,15 +117,15 @@ var emailTemplateRegistry = map[string]emailCopy{
 	},
 	"provider:payment_refunded": {
 		Subject: "A booking payment was refunded", Headline: "Payment refunded",
-		Body: "A refund has changed the paid balance for this booking.", Action: "Review booking",
+		Body: "A refund has been recorded for this booking. The balance below reflects the current net payment; open the booking for refund details.", Action: "Review booking",
 	},
 	"customer:payment_refunded": {
 		Subject: "Your booking payment was refunded", Headline: "Payment refunded",
-		Body: "A refund has changed the paid balance for this booking.", Action: "View booking",
+		Body: "A refund has been recorded for your booking. The balance below reflects the current net payment; open your booking for refund details.", Action: "View booking",
 	},
 	"provider:payment_action_required": {
 		Subject: "Booking payment action is required", Headline: "Payment action required",
-		Body: "The booking’s payment state requires review in TellBook.", Action: "Review booking",
+		Body: "There’s a payment update that needs your attention. Open the booking to review the details and the next step.", Action: "Review booking",
 	},
 	"customer:payment_action_required": {
 		Subject: "Your booking payment requires attention", Headline: "Payment action required",
@@ -139,13 +139,25 @@ func (r *Repository) BuildEmailMessage(
 	clientBaseURL string,
 	marketplaceBaseURL string,
 ) (mailer.Message, error) {
+	// Read new notice content and eligibility from one coherent snapshot.
+	var query bookingEmailQuerier = r.db
+	var tx pgx.Tx
+	if delivery.NotificationType == "booking_step_reminder" || delivery.NotificationType == "booking_completed" {
+		var err error
+		tx, err = r.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+		if err != nil {
+			return mailer.Message{}, err
+		}
+		defer tx.Rollback(ctx)
+		query = tx
+	}
 	var data emailTemplateData
 	var bookingID uuid.UUID
 	var publicToken, timezone, countryCode, currencyCode string
 	var startsAt time.Time
 	var totalMinor, paidMinor int64
 	var owned bool
-	err := r.db.QueryRow(ctx, `
+	err := query.QueryRow(ctx, `
 			SELECT delivery.audience_type,delivery.notification_type,booking.id,booking.public_token,booking.status,
 			CASE WHEN delivery.audience_type='provider' THEN COALESCE(lower(btrim(client.email)), '')
 			     ELSE COALESCE(booking.customer_email_snapshot,'') END,
@@ -211,6 +223,9 @@ func (r *Repository) BuildEmailMessage(
 	data.ActionURL = emailBookingActionURL(
 		data.Audience, owned, bookingID, publicToken, clientBaseURL, marketplaceBaseURL,
 	)
+	if data.Type == "booking_step_reminder" || data.Type == "booking_completed" {
+		return r.buildAdditionalEmail(ctx, tx, delivery, data, startsAt, timezone, countryCode, currencyCode)
+	}
 	return renderEmailTemplate(delivery.ID, data)
 }
 
@@ -247,22 +262,19 @@ func renderEmailTemplate(deliveryID uuid.UUID, data emailTemplateData) (mailer.M
 	if strings.TrimSpace(greetingName) == "" {
 		greetingName = "there"
 	}
-	contactText, contactHTML := "", ""
+	contactText := ""
 	if data.Audience == "customer" && data.ProviderContactPhone != "" {
 		contactText = "\nProvider contact: " + data.ProviderContactPhone
-		contactHTML = "<br>Provider contact: " + html.EscapeString(data.ProviderContactPhone)
 	}
 	textBody := fmt.Sprintf(
-		"Hi %s,\n\n%s\n\nService: %s\nCustomer: %s\nProvider: %s\nWhen: %s\nLocation: %s\nTotal: %s\nPaid: %s\nDue: %s\n\n%s: %s\n\n— TellBook",
+		"Hi %s,\n\n%s\n\nService: %s\nCustomer: %s\nProvider: %s\nWhen: %s\nLocation: %s\nBooking total: %s\nNet paid: %s\nRemaining balance: %s\n\n%s: %s\n\n— TellBook",
 		greetingName, copy.Body, data.ServiceTitle, data.CustomerName, data.ProviderName,
 		data.When, data.Location+contactText, data.Total, data.Paid, data.Due, copy.Action, data.ActionURL,
 	)
-	escape := html.EscapeString
-	htmlBody := fmt.Sprintf(`<!doctype html><html><body style="margin:0;background:#f5f3ef;color:#211f1b;font-family:Arial,sans-serif"><div style="max-width:620px;margin:0 auto;padding:32px 18px"><div style="font-size:20px;font-weight:700;margin-bottom:24px">TellBook</div><div style="background:#fff;border:1px solid #e8e3dc;border-radius:20px;padding:30px"><p style="margin:0 0 12px">Hi %s,</p><h1 style="font-size:26px;line-height:1.2;margin:0 0 12px">%s</h1><p style="color:#625d55;line-height:1.6;margin:0 0 24px">%s</p><div style="background:#faf8f5;border-radius:14px;padding:18px;line-height:1.7"><strong>%s</strong><br>%s<br>%s<br>%s<br>Total: %s · Paid: %s · Due: %s</div><p style="margin:26px 0 0"><a href="%s" style="display:inline-block;background:#1f1d19;color:#fff;text-decoration:none;padding:13px 20px;border-radius:999px;font-weight:700">%s</a></p></div><p style="color:#817a70;font-size:12px;line-height:1.5;margin:18px 8px">Booking notifications from TellBook. This email contains no marketing content.</p></div></body></html>`,
-		escape(greetingName), escape(copy.Headline), escape(copy.Body), escape(data.ServiceTitle),
-		escape(data.When), escape(data.Location)+contactHTML, escape("Customer: "+data.CustomerName+" · Provider: "+data.ProviderName),
-		escape(data.Total), escape(data.Paid), escape(data.Due), escape(data.ActionURL), escape(copy.Action),
-	)
+	htmlBody, err := renderNotificationHTML(data, copy, greetingName)
+	if err != nil {
+		return mailer.Message{}, invalidEmailContent(fmt.Errorf("render notification email: %w", err))
+	}
 	return mailer.Message{
 		ToEmail: data.RecipientEmail, ToName: data.RecipientName, Subject: copy.Subject,
 		Text: textBody, HTML: htmlBody,

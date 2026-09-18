@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="x-apple-disable-message-reformatting">
+  <meta name="color-scheme" content="light">
+  <meta name="supported-color-schemes" content="light">
+  <title>{{.Copy.Subject}}</title>
+  <style>
+    :root { color-scheme: light only; supported-color-schemes: light; }
+    body { margin: 0; padding: 0; }
+    table { border-collapse: collapse; mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
+    a[x-apple-data-detectors] { color: inherit !important; text-decoration: none !important; }
+    @media screen and (max-width: 480px) {
+      .outer { padding: 20px 10px !important; }
+      .inset { padding-left: 24px !important; padding-right: 24px !important; }
+      .headline { font-size: 32px !important; line-height: 38px !important; }
+    }
+  </style>
+  {{outlookHead}}
+</head>
+<body bgcolor="#faf9f4" style="margin:0;padding:0;width:100%;background-color:#faf9f4;color:#2d2426;font-family:Arial,Helvetica,sans-serif;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
+  <div aria-hidden="true" style="display:none;font-size:1px;line-height:1px;color:#faf9f4;max-height:0;max-width:0;opacity:0;overflow:hidden;mso-hide:all;">{{.Preheader}}&#847; &zwnj; &nbsp; &zwnj; &nbsp; &zwnj; &nbsp; &zwnj; &nbsp; &zwnj; &nbsp; &zwnj; &nbsp; &zwnj; &nbsp; &zwnj; &nbsp;</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#faf9f4" style="width:100%;background-color:#faf9f4;">
+    <tr><td class="outer" align="center" style="padding:36px 16px;">
+      {{outlookStart}}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;table-layout:fixed;">
+        <tr><td style="padding:0 4px 22px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+            <tr>
+              <td valign="middle">
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                  <tr>
+                    <td width="40" valign="middle" style="width:40px;"><img src="https://bookly-public.iycodes.com/bookings.png" width="40" height="40" alt="" style="display:block;width:40px;height:40px;border:0;outline:none;text-decoration:none;"></td>
+                    <td valign="middle" style="padding-left:8px;font-family:Arial,Helvetica,sans-serif;font-size:24px;line-height:30px;font-weight:700;letter-spacing:-0.8px;white-space:nowrap;"><span style="color:#af1f4a;">Tell</span><span style="color:#2d2426;">Book</span></td>
+                  </tr>
+                </table>
+              </td>
+              <td align="right" style="font-family:Arial,Helvetica,sans-serif;font-size:11px;line-height:16px;letter-spacing:1.5px;color:#584144;">A LITTLE MORE<br>TAKEN CARE OF.</td>
+            </tr>
+          </table>
+        </td></tr>
+        <tr><td bgcolor="#ffffff" style="background-color:#ffffff;border:1px solid #e2d8d2;border-top:4px solid #af1f4a;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;table-layout:fixed;">
+            <tr><td class="inset" style="padding:36px 40px 0;font-family:Arial,Helvetica,sans-serif;font-size:11px;line-height:16px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:#af1f4a;">{{.Category}}</td></tr>
+            <tr><td class="inset" style="padding:16px 40px 0;">
+              <h1 class="headline" style="margin:0;font-family:Georgia,'Times New Roman',serif;font-size:38px;line-height:44px;font-weight:400;letter-spacing:-0.7px;color:#2d2426;overflow-wrap:break-word;">{{.Copy.Headline}}</h1>
+            </td></tr>
+            <tr><td class="inset" style="padding:22px 40px 28px;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:24px;color:#584144;overflow-wrap:break-word;word-wrap:break-word;">
+              <p style="margin:0 0 8px;color:#2d2426;">Hi {{.Greeting}},</p>
+              <p style="margin:0;">{{.Copy.Body}}</p>
+            </td></tr>
+            {{if .PaymentFirst}}{{template "balance" .}}{{end}}
+            {{template "appointment" .}}
+            {{if not .PaymentFirst}}{{template "balance" .}}{{end}}
+            <tr><td class="inset" style="padding:4px 40px 32px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                <tr><td align="center" bgcolor="#af1f4a" style="background-color:#af1f4a;border:1px solid #af1f4a;mso-padding-alt:15px 26px;">
+                  <a href="{{.ActionURL}}" style="display:inline-block;padding:15px 26px;border:1px solid #af1f4a;font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:20px;font-weight:700;color:#ffffff;text-decoration:none;text-align:center;mso-padding-alt:0;">{{.Copy.Action}} &nbsp; &rarr;</a>
+                </td></tr>
+              </table>
+              <p style="margin:16px 0 0;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:19px;color:#584144;">Button not working? <a href="{{.ActionURL}}" style="color:#af1f4a;text-decoration:underline;">Open booking details</a></p>
+            </td></tr>
+            <tr><td class="inset" bgcolor="#f7e9ee" style="padding:18px 40px;background-color:#f7e9ee;border-top:1px solid #e2d8d2;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:19px;color:#584144;">{{if .PaymentFirst}}This is a payment update. Your booking page has the latest payment details.{{else}}Plans can change. Your booking page always has the latest details.{{end}}</td></tr>
+          </table>
+        </td></tr>
+        <tr><td align="center" style="padding:22px 20px 0;font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:19px;color:#7c6a6e;">
+          <p style="margin:0 0 5px;color:#584144;font-weight:700;">Your time. Well booked.</p>
+          <p style="margin:0;">A service update from TellBook about your booking.<br>Sent to <span style="word-break:break-all;overflow-wrap:break-word;">{{.RecipientEmail}}</span>.</p>
+        </td></tr>
+      </table>
+      {{outlookEnd}}
+    </td></tr>
+  </table>
+</body>
+</html>
+
+{{define "appointment"}}
+<tr><td class="inset" style="padding:0 40px 24px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#faf9f4" style="width:100%;background-color:#faf9f4;border:1px solid #e2d8d2;table-layout:fixed;">
+    <tr><td style="padding:22px 24px 18px;border-bottom:1px solid #e2d8d2;overflow-wrap:break-word;word-wrap:break-word;">
+      <p style="margin:0 0 9px;font-family:Arial,Helvetica,sans-serif;font-size:10px;line-height:15px;font-weight:700;letter-spacing:1.7px;color:#584144;">THE APPOINTMENT</p>
+      <h2 style="margin:0;font-family:Georgia,'Times New Roman',serif;font-size:24px;line-height:30px;font-weight:400;color:#2d2426;">{{.ServiceTitle}}</h2>
+    </td></tr>
+    <tr><td style="padding:18px 24px 22px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;table-layout:fixed;font-family:Arial,Helvetica,sans-serif;">
+        <tr><td style="padding:0 0 4px;font-size:10px;line-height:15px;font-weight:700;letter-spacing:1px;color:#7c6a6e;">WHEN</td></tr>
+        <tr><td style="padding:0 0 16px;font-size:14px;line-height:22px;color:#2d2426;overflow-wrap:break-word;word-wrap:break-word;">{{.When}}</td></tr>
+        <tr><td style="padding:0 0 4px;font-size:10px;line-height:15px;font-weight:700;letter-spacing:1px;color:#7c6a6e;">WHERE</td></tr>
+        <tr><td style="padding:0 0 16px;font-size:14px;line-height:22px;color:#2d2426;overflow-wrap:break-word;word-wrap:break-word;">{{.Location}}</td></tr>
+        <tr><td style="padding:0 0 4px;font-size:10px;line-height:15px;font-weight:700;letter-spacing:1px;color:#7c6a6e;">{{if eq .Audience "provider"}}CUSTOMER{{else}}PROVIDER{{end}}</td></tr>
+        <tr><td style="font-size:14px;line-height:22px;color:#2d2426;overflow-wrap:break-word;word-wrap:break-word;">{{if eq .Audience "provider"}}{{.CustomerName}}{{else}}{{.ProviderName}}{{end}}</td></tr>
+        {{if .ShowContact}}<tr><td style="padding:8px 0 0;font-size:12px;line-height:20px;color:#584144;overflow-wrap:break-word;word-wrap:break-word;">Provider contact: {{.ProviderContactPhone}}</td></tr>{{end}}
+      </table>
+    </td></tr>
+  </table>
+</td></tr>
+{{end}}
+
+{{define "balance"}}
+<tr><td class="inset" style="padding:0 40px 28px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;table-layout:fixed;font-family:Arial,Helvetica,sans-serif;">
+    <tr><td colspan="2" style="padding:0 0 12px;font-size:10px;line-height:15px;font-weight:700;letter-spacing:1.7px;color:#584144;">BOOKING BALANCE</td></tr>
+    <tr>
+      <td width="48%" style="padding:9px 10px 9px 0;border-top:1px solid #e2d8d2;font-size:13px;line-height:21px;color:#584144;">Booking total</td>
+      <td width="52%" align="right" style="padding:9px 0;border-top:1px solid #e2d8d2;font-size:14px;line-height:21px;color:#2d2426;overflow-wrap:break-word;word-wrap:break-word;">{{.Total}}</td>
+    </tr>
+    <tr>
+      <td style="padding:0 10px 12px 0;font-size:13px;line-height:21px;color:#584144;">Net paid</td>
+      <td align="right" style="padding:0 0 12px;font-size:14px;line-height:21px;color:#2d2426;overflow-wrap:break-word;word-wrap:break-word;">{{.Paid}}</td>
+    </tr>
+    <tr>
+      <td colspan="2" style="padding:13px 0 0;border-top:1px solid #e2d8d2;overflow-wrap:break-word;word-wrap:break-word;">
+        <p style="margin:0 0 4px;font-size:13px;line-height:22px;font-weight:700;color:#2d2426;">Remaining balance</p>
+        <p style="margin:0;font-size:24px;line-height:30px;font-weight:700;color:#af1f4a;">{{.Due}}</p>
+      </td>
+    </tr>
+  </table>
+</td></tr>
+{{end}}

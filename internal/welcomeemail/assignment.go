@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html"
 	"net/mail"
+	"net/url"
 	"strings"
 
 	"github.com/google/uuid"
@@ -21,6 +22,7 @@ type Assignment struct {
 	AccountID uuid.UUID
 	Email     string
 	Name      string
+	ActionURL string
 }
 
 type template struct {
@@ -78,18 +80,18 @@ func AssignOptionalTx(ctx context.Context, tx pgx.Tx, assignment Assignment) (bo
 	if name == "" {
 		name = "there"
 	}
-	subject, err := renderTemplate(selected.Subject, name, email, false)
+	subject, err := renderTemplate(selected.Subject, name, email, assignment.ActionURL, false)
 	if err != nil {
 		return false, fmt.Errorf("render welcome email subject: %w", err)
 	}
 	if strings.ContainsAny(subject, "\r\n") {
 		return false, fmt.Errorf("render welcome email subject: line breaks are not allowed")
 	}
-	htmlBody, err := renderTemplate(selected.HTML, name, email, true)
+	htmlBody, err := renderTemplate(selected.HTML, name, email, assignment.ActionURL, true)
 	if err != nil {
 		return false, fmt.Errorf("render welcome email html: %w", err)
 	}
-	textBody, err := renderTemplate(selected.Text, name, email, false)
+	textBody, err := renderTemplate(selected.Text, name, email, assignment.ActionURL, false)
 	if err != nil {
 		return false, fmt.Errorf("render welcome email text: %w", err)
 	}
@@ -125,9 +127,15 @@ func normalizeEmail(value string) (string, error) {
 	return value, nil
 }
 
-func renderTemplate(source, name, email string, escapeHTML bool) (string, error) {
+func renderTemplate(source, name, email, actionURL string, escapeHTML bool) (string, error) {
+	if strings.Contains(source, "{{action_url}}") {
+		parsed, err := url.Parse(actionURL)
+		if err != nil || parsed.Hostname() == "" || parsed.User != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+			return "", fmt.Errorf("template requires a valid HTTP(S) action URL")
+		}
+	}
 	if strings.Contains(source, "{{") {
-		remaining := strings.NewReplacer("{{name}}", "", "{{email}}", "").Replace(source)
+		remaining := strings.NewReplacer("{{name}}", "", "{{email}}", "", "{{action_url}}", "").Replace(source)
 		if strings.Contains(remaining, "{{") {
 			return "", fmt.Errorf("template contains an unsupported placeholder")
 		}
@@ -135,8 +143,9 @@ func renderTemplate(source, name, email string, escapeHTML bool) (string, error)
 	if escapeHTML {
 		name = html.EscapeString(name)
 		email = html.EscapeString(email)
+		actionURL = html.EscapeString(actionURL)
 	}
-	rendered := strings.NewReplacer("{{name}}", name, "{{email}}", email).Replace(source)
+	rendered := strings.NewReplacer("{{name}}", name, "{{email}}", email, "{{action_url}}", actionURL).Replace(source)
 	if strings.TrimSpace(rendered) == "" {
 		return "", fmt.Errorf("template rendered empty content")
 	}

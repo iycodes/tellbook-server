@@ -11,6 +11,7 @@ import (
 	"booking/go-server/internal/bookingdomain"
 	"booking/go-server/internal/money"
 	"booking/go-server/internal/publictoken"
+	"booking/go-server/internal/securityemail"
 	"booking/go-server/internal/whatsapp"
 
 	"github.com/google/uuid"
@@ -93,6 +94,9 @@ func (r *Repository) createPublicBooking(
 		return PublicBookingSummaryResponse{}, fmt.Errorf("begin booking transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := securityemail.EnableTx(ctx, tx, false, r.additionalEmails); err != nil {
+		return PublicBookingSummaryResponse{}, err
+	}
 
 	var authorizedQuoteID uuid.UUID
 	if authority == BookingReservationAuthorityAutopilot &&
@@ -153,6 +157,12 @@ func (r *Repository) createPublicBooking(
 			return PublicBookingSummaryResponse{}, fmt.Errorf("commit idempotent booking lookup: %w", err)
 		}
 		return r.GetPublicBookingSummary(ctx, bookingToken)
+	}
+	// Pin platform eligibility until the reservation commits. A concurrent staff
+	// restriction waits for this transaction; old quotes cannot bypass a committed
+	// restriction. Completed idempotent replays above remain available.
+	if err := ensureBusinessAcceptsNewBookings(ctx, tx, quote.ClientID); err != nil {
+		return PublicBookingSummaryResponse{}, err
 	}
 	if !quote.ExpiresAt.After(time.Now().UTC()) {
 		return PublicBookingSummaryResponse{}, ErrQuoteExpired

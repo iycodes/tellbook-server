@@ -12,8 +12,8 @@ import (
 const (
 	publicProviderCacheControl      = "public, max-age=15, stale-while-revalidate=60"
 	publicProviderCDNCacheControl   = "public, max-age=30, stale-while-revalidate=60"
-	publicDiscoveryCacheControl     = "public, max-age=5, stale-while-revalidate=30"
-	publicDiscoveryCDNCacheControl  = "public, max-age=15, stale-while-revalidate=30"
+	publicDiscoveryCacheControl     = "public, no-cache, must-revalidate"
+	publicDiscoveryCDNCacheControl  = "public, no-cache, must-revalidate"
 	privateNoStoreCacheControl      = "private, no-store"
 	publicRepresentationETagVersion = "v2"
 )

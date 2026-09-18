@@ -42,6 +42,7 @@ type OperationalDependencies struct {
 	WorkersReady         bool
 	MaintenanceOwnership string
 	MetaWhatsAppWebhook  http.Handler
+	AdminHandler         http.Handler
 }
 
 func New(
@@ -86,6 +87,9 @@ func New(
 		r.Get("/readyz", readinessHandler(operational))
 		r.Get("/meta/markets", markets.Handler(markets.DefaultCatalog()))
 
+		if operational.AdminHandler != nil {
+			r.Mount("/admin", operational.AdminHandler)
+		}
 		if authHandler != nil {
 			r.Route("/auth", authHandler.Routes)
 		}

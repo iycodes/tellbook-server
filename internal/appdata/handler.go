@@ -1090,6 +1090,10 @@ func (h *Handler) createPublicBooking(w http.ResponseWriter, r *http.Request) {
 
 	response, err := h.repo.CreatePublicBooking(r.Context(), slug, input)
 	if err != nil {
+		if errors.Is(err, ErrBusinessRestricted) {
+			writeError(w, http.StatusConflict, "business_restricted", "This business is not accepting new bookings.")
+			return
+		}
 		if errors.Is(err, ErrMarketNotConfigured) {
 			writeError(w, http.StatusConflict, "market_not_configured", "This business is not ready to accept bookings.")
 			return

@@ -10,6 +10,7 @@ import (
 
 	"booking/go-server/internal/authchallenge"
 	"booking/go-server/internal/publictoken"
+	"booking/go-server/internal/securityemail"
 	"booking/go-server/internal/welcomeemail"
 
 	"github.com/google/uuid"
@@ -24,9 +25,23 @@ var (
 	ErrInvalidLocation  = errors.New("invalid or expired location")
 )
 
-type Repository struct{ db *pgxpool.Pool }
+type Repository struct {
+	additionalEmails bool
+	db               *pgxpool.Pool
+	welcomeURL       string
+}
+
+func (r *Repository) WithAdditionalEmails(enabled bool) *Repository {
+	r.additionalEmails = enabled
+	return r
+}
 
 func NewRepository(db *pgxpool.Pool) *Repository { return &Repository{db: db} }
+
+func (r *Repository) WithWelcomeURL(actionURL string) *Repository {
+	r.welcomeURL = actionURL
+	return r
+}
 
 func (r *Repository) CompleteChallenge(ctx context.Context, challenge authchallenge.Challenge, session Session) (Customer, bool, error) {
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
@@ -106,6 +121,7 @@ func (r *Repository) CompleteChallenge(ctx context.Context, challenge authchalle
 			Audience:  welcomeemail.AudienceMarketplaceCustomer,
 			AccountID: customerID,
 			Email:     challenge.Identifier,
+			ActionURL: r.welcomeURL,
 		}); err != nil {
 			return Customer{}, false, fmt.Errorf("assign marketplace welcome email: %w", err)
 		}
@@ -203,6 +219,13 @@ func (r *Repository) CompleteIdentityLink(ctx context.Context, challenge authcha
 		return Customer{}, nil, fmt.Errorf("begin marketplace identity link: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	var securityBefore securityemail.Account
+	if r.additionalEmails {
+		securityBefore, err = securityemail.CaptureTx(ctx, tx, "marketplace_customer", *challenge.TargetAccountID)
+		if err != nil {
+			return Customer{}, nil, err
+		}
+	}
 
 	var lockedID uuid.UUID
 	err = tx.QueryRow(ctx, `
@@ -245,7 +268,7 @@ func (r *Repository) CompleteIdentityLink(ctx context.Context, challenge authcha
 	}
 	if challenge.IdentifierType == "email" {
 		if _, err := welcomeemail.AssignOptionalTx(ctx, tx, welcomeemail.Assignment{
-			Audience: welcomeemail.AudienceMarketplaceCustomer, AccountID: *challenge.TargetAccountID,
+			Audience: welcomeemail.AudienceMarketplaceCustomer, AccountID: *challenge.TargetAccountID, ActionURL: r.welcomeURL,
 			Email: challenge.Identifier,
 		}); err != nil {
 			return Customer{}, nil, fmt.Errorf("assign linked marketplace welcome email: %w", err)
@@ -261,6 +284,19 @@ func (r *Repository) CompleteIdentityLink(ctx context.Context, challenge authcha
 	customer, err := scanCustomer(tx.QueryRow(ctx, customerSelect+` WHERE c.id=$1`, *challenge.TargetAccountID))
 	if err != nil {
 		return Customer{}, nil, err
+	}
+	if r.additionalEmails && result.RowsAffected() > 0 {
+		recipient := securityBefore.Email
+		if recipient == "" && challenge.IdentifierType == "email" {
+			recipient = challenge.Identifier
+		}
+		details := map[string]string{}
+		if challenge.IdentifierType == "phone" && len(challenge.Identifier) >= 4 {
+			details["phone_last_four"] = challenge.Identifier[len(challenge.Identifier)-4:]
+		}
+		if err := securityemail.RecordTx(ctx, tx, "marketplace_customer", *challenge.TargetAccountID, recipient, challenge.IdentifierType+"_linked", details); err != nil {
+			return Customer{}, nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Customer{}, nil, fmt.Errorf("commit marketplace identity link: %w", err)
@@ -394,6 +430,13 @@ func (r *Repository) CompletePasswordReset(ctx context.Context, grantHash []byte
 	if err != nil {
 		return Customer{}, nil, fmt.Errorf("consume marketplace password reset grant: %w", err)
 	}
+	var securityBefore securityemail.Account
+	if r.additionalEmails {
+		securityBefore, err = securityemail.CaptureTx(ctx, tx, "marketplace_customer", customerID)
+		if err != nil {
+			return Customer{}, nil, err
+		}
+	}
 	if _, err = tx.Exec(ctx, `
 		UPDATE marketplace_customers
 		SET password_hash=$2,security_revision=security_revision+1,updated_at=NOW()
@@ -422,6 +465,12 @@ func (r *Repository) CompletePasswordReset(ctx context.Context, grantHash []byte
 	customer, err := scanCustomer(tx.QueryRow(ctx, customerSelect+` WHERE c.id=$1`, customerID))
 	if err != nil {
 		return Customer{}, nil, err
+	}
+	if r.additionalEmails {
+		kind := "password_reset"
+		if err := securityemail.RecordTx(ctx, tx, "marketplace_customer", customerID, securityBefore.Email, kind, nil); err != nil {
+			return Customer{}, nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Customer{}, nil, fmt.Errorf("commit marketplace password reset: %w", err)
@@ -565,6 +614,13 @@ func (r *Repository) SetPassword(ctx context.Context, customerID uuid.UUID, pass
 		return Customer{}, nil, fmt.Errorf("begin marketplace password change: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	var securityBefore securityemail.Account
+	if r.additionalEmails {
+		securityBefore, err = securityemail.CaptureTx(ctx, tx, "marketplace_customer", customerID)
+		if err != nil {
+			return Customer{}, nil, err
+		}
+	}
 	result, err := tx.Exec(ctx, `
 		UPDATE marketplace_customers
 		SET password_hash=$2, security_revision=security_revision+1, updated_at=NOW()
@@ -586,6 +642,15 @@ func (r *Repository) SetPassword(ctx context.Context, customerID uuid.UUID, pass
 	customer, err := scanCustomer(tx.QueryRow(ctx, customerSelect+` WHERE c.id=$1`, customerID))
 	if err != nil {
 		return Customer{}, nil, err
+	}
+	if r.additionalEmails {
+		kind := "password_changed"
+		if !securityBefore.HasPassword {
+			kind = "password_set"
+		}
+		if err := securityemail.RecordTx(ctx, tx, "marketplace_customer", customerID, securityBefore.Email, kind, nil); err != nil {
+			return Customer{}, nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Customer{}, nil, fmt.Errorf("commit marketplace password change: %w", err)

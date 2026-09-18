@@ -8,7 +8,7 @@ import (
 )
 
 func TestRenderTemplateEscapesHTMLValues(t *testing.T) {
-	rendered, err := renderTemplate("<p>{{name}} — {{email}}</p>", `<Sam & Co>`, "sam@example.com", true)
+	rendered, err := renderTemplate("<p>{{name}} — {{email}}</p>", `<Sam & Co>`, "sam@example.com", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -18,7 +18,7 @@ func TestRenderTemplateEscapesHTMLValues(t *testing.T) {
 }
 
 func TestRenderTemplateRejectsUnsupportedPlaceholder(t *testing.T) {
-	_, err := renderTemplate("Hello {{business_name}}", "Sam", "sam@example.com", false)
+	_, err := renderTemplate("Hello {{business_name}}", "Sam", "sam@example.com", "", false)
 	if err == nil || !strings.Contains(err.Error(), "unsupported placeholder") {
 		t.Fatalf("renderTemplate() error = %v", err)
 	}
@@ -27,6 +27,23 @@ func TestRenderTemplateRejectsUnsupportedPlaceholder(t *testing.T) {
 func TestNormalizeEmailRejectsDisplayName(t *testing.T) {
 	if _, err := normalizeEmail("Sam <sam@example.com>"); err == nil {
 		t.Fatal("normalizeEmail() accepted a display name")
+	}
+}
+
+func TestWelcomeActionURLValidation(t *testing.T) {
+	for _, action := range []string{"", "/relative", "javascript:alert(1)", "https://user:pass@example.com"} {
+		if _, err := renderTemplate(`<a href="{{action_url}}">Start</a>`, "Sam", "sam@example.com", action, true); err == nil {
+			t.Errorf("accepted invalid action URL %q", action)
+		}
+	}
+	const action = "https://example.com/start?a=1&b=2"
+	rendered, err := renderTemplate(`<a href="{{action_url}}">Start</a>`, "Sam", "sam@example.com", action, true)
+	if err != nil || rendered != `<a href="https://example.com/start?a=1&amp;b=2">Start</a>` {
+		t.Fatalf("action URL escaping = %q, %v", rendered, err)
+	}
+	// Version 1 remains usable without a URL while the new drafts await activation.
+	if _, err := renderTemplate("Hi {{name}}", "Sam", "sam@example.com", "", false); err != nil {
+		t.Fatal(err)
 	}
 }
 

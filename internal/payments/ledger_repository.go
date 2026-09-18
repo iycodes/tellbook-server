@@ -124,7 +124,8 @@ type PaymentExceptionInput struct {
 }
 
 type LedgerRepository struct {
-	db *pgxpool.Pool
+	securityEmails, financialEmails bool
+	db                              *pgxpool.Pool
 }
 
 type BookingPaymentObligation struct {
@@ -141,6 +142,12 @@ type BookingPaymentObligation struct {
 
 type queryRower interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func (r *LedgerRepository) WithAdditionalEmails(security, financial bool) *LedgerRepository {
+	r.securityEmails = security
+	r.financialEmails = financial
+	return r
 }
 
 func NewLedgerRepository(db *pgxpool.Pool) *LedgerRepository {

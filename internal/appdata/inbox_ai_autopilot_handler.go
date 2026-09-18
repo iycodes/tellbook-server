@@ -174,6 +174,8 @@ func writeInboxAIBookingError(w http.ResponseWriter, err error) bool {
 	switch {
 	case errors.Is(err, ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "Conversation or proposal was not found.")
+	case errors.Is(err, ErrBusinessRestricted):
+		writeError(w, http.StatusConflict, "business_restricted", "This business is not accepting new bookings.")
 	case errors.Is(err, ErrInboxConversationDisabled):
 		writeError(w, http.StatusConflict, "conversation_disabled", "This conversation can no longer accept booking actions.")
 	case errors.Is(err, ErrInboxAIProposalStale), errors.Is(err, ErrQuoteExpired),

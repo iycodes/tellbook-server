@@ -145,10 +145,14 @@ func (worker *EmailWorker) processOne(ctx context.Context, claimed Delivery) {
 		if errors.Is(err, ErrEmailNotDispatchable) {
 			return
 		}
-		if errors.Is(err, ErrEmailDestinationMoved) {
+		if errors.Is(err, ErrEmailDestinationMoved) || errors.Is(err, ErrEmailEligibilityChanged) {
 			finalizeContext, finalizeCancel := newEmailFinalizationContext(ctx)
 			defer finalizeCancel()
-			if cancelErr := worker.repository.CancelAuthorizedDelivery(finalizeContext, delivery.ID, "destination_changed"); cancelErr != nil {
+			code := "destination_changed"
+			if errors.Is(err, ErrEmailEligibilityChanged) {
+				code = "eligibility_changed_before_smtp"
+			}
+			if cancelErr := worker.repository.CancelAuthorizedDelivery(finalizeContext, delivery.ID, code); cancelErr != nil {
 				worker.logger.Error("cancel redirected email delivery", "delivery_id", delivery.ID, "error", cancelErr)
 			} else {
 				worker.observeOutcome(template, "cancelled")
@@ -217,6 +221,9 @@ func (worker *EmailWorker) observeOutcome(template, outcome string) {
 
 func emailMetricTemplate(delivery Delivery) string {
 	key := delivery.AudienceType + ":" + delivery.NotificationType
+	if key == "customer:booking_step_reminder" || key == "customer:booking_completed" {
+		return key
+	}
 	if _, ok := emailTemplateRegistry[key]; !ok {
 		return "other"
 	}
@@ -240,19 +247,31 @@ func emailDispositionOutcome(disposition mailer.TransportDisposition, attempt in
 }
 
 func (r *Repository) CancelAuthorizedDelivery(ctx context.Context, deliveryID uuid.UUID, code string) error {
-	tag, err := r.db.Exec(ctx, `
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var bookingID uuid.UUID
+	var kind, channel string
+	err = tx.QueryRow(ctx, `
 		UPDATE notification_deliveries
 		SET status='cancelled',reconcile_after=NULL,last_error_code=$2,
+            dispatch_authorized_at=CASE WHEN notification_type IN ('booking_step_reminder','booking_completed') AND channel='email' THEN NULL ELSE dispatch_authorized_at END,
+            authorized_booking_event_sequence=CASE WHEN notification_type IN ('booking_step_reminder','booking_completed') AND channel='email' THEN NULL ELSE authorized_booking_event_sequence END,
+            authorized_preference_revision=CASE WHEN notification_type IN ('booking_step_reminder','booking_completed') AND channel='email' THEN NULL ELSE authorized_preference_revision END,
 			provider_status='cancelled',provider_status_at=NOW(),completed_at=NOW(),updated_at=NOW()
-		WHERE id=$1 AND status='dispatching'
-	`, deliveryID, boundedCode(code))
+		WHERE id=$1 AND status='dispatching' RETURNING booking_id,notification_type,channel
+	`, deliveryID, boundedCode(code)).Scan(&bookingID, &kind, &channel)
 	if err != nil {
 		return fmt.Errorf("cancel authorized notification delivery: %w", err)
 	}
-	if tag.RowsAffected() != 1 {
-		return errors.New("notification delivery is no longer dispatching")
+	if kind == "booking_step_reminder" && channel == "email" {
+		if err = r.replanUnsentStepTx(ctx, tx, bookingID); err != nil {
+			return err
+		}
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (r *Repository) MarkEmailAccepted(ctx context.Context, deliveryID uuid.UUID) error {
@@ -354,13 +373,5 @@ func (r *Repository) RecordEmailFailure(
 }
 
 func deliveryRetryAt(now time.Time, deliveryID uuid.UUID, attempt int) time.Time {
-	shift := min(max(attempt-1, 0), 7)
-	delay := 15 * time.Second * time.Duration(1<<shift)
-	if delay > 15*time.Minute {
-		delay = 15 * time.Minute
-	}
-	// Stable per-delivery jitter avoids synchronized retries without shared RNG contention.
-	jitterRange := max(delay/5, time.Millisecond)
-	jitter := time.Duration(int64(deliveryID[0])<<8|int64(deliveryID[1])) % jitterRange
-	return now.Add(delay + jitter)
+	return mailer.RetryAt(now, deliveryID, attempt)
 }
