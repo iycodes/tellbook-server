@@ -23,6 +23,11 @@ explicit selections; when the switch is false, neither selection enables automat
 Provider policies, enabled services, pauses, and conversation controls continue
 to determine whether a particular conversation uses an automated mode.
 
+`INTEGRATIONS_PROVIDER_ALLOWLIST` likewise accepts `all` or a comma-separated
+list of provider account UUIDs. It requires an explicit selection when
+`INTEGRATIONS_ENABLED=true`. The integration write gate, OAuth consent, approved
+scopes, and account ownership checks still govern access.
+
 The anonymous support form has its own `SUPPORT_EMAIL` destination and sends on
 the API role using the existing SMTP settings. A blank destination leaves the
 page readable and the form unavailable. See [public support configuration](public-support.md)

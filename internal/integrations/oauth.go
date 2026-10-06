@@ -74,7 +74,9 @@ func New(db *pgxpool.Pool, catalog *appdata.Handler, authHandler *auth.Handler, 
 	return s
 }
 func (s *Service) resource(platform string) string { return s.cfg.PublicURL + "/mcp/" + platform }
-func (s *Service) allowed(id uuid.UUID) bool       { return s.cfg.Enabled && s.cfg.Providers[id] }
+func (s *Service) allowed(id uuid.UUID) bool {
+	return s.cfg.Enabled && id != uuid.Nil && (s.cfg.AllProviders || s.cfg.Providers[id])
+}
 func (s *Service) Routes(r chi.Router) {
 	r.Get("/.well-known/oauth-authorization-server", s.discovery)
 	for _, platform := range []string{"chatgpt", "claude"} {
@@ -231,7 +233,7 @@ func (s *Service) authorize(w http.ResponseWriter, r *http.Request) {
 func (s *Service) consent(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	if !s.allowed(user.ID) {
-		oauthError(w, 403, "access_denied", "This account is not enabled for the private beta.")
+		oauthError(w, 403, "access_denied", "Integrations are not enabled for this account.")
 		return
 	}
 	id, e := uuid.Parse(chi.URLParam(r, "id"))
@@ -257,7 +259,7 @@ func (s *Service) consent(w http.ResponseWriter, r *http.Request) {
 func (s *Service) approve(w http.ResponseWriter, r *http.Request) {
 	user, _ := auth.UserFromContext(r.Context())
 	if !s.allowed(user.ID) {
-		oauthError(w, 403, "access_denied", "Beta access is unavailable.")
+		oauthError(w, 403, "access_denied", "Integration access is unavailable.")
 		return
 	}
 	id, e := uuid.Parse(chi.URLParam(r, "id"))

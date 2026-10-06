@@ -18,6 +18,7 @@ type Config struct {
 	WritesEnabled bool
 	PublicURL     string
 	ClientURL     string
+	AllProviders  bool
 	Providers     map[uuid.UUID]bool
 	Clients       map[string]Client
 }
@@ -32,15 +33,24 @@ func LoadConfig(clientURL string) (Config, error) {
 		return Config{}, err
 	}
 	cfg := Config{Enabled: enabled, WritesEnabled: writes, PublicURL: strings.TrimRight(os.Getenv("INTEGRATIONS_PUBLIC_BASE_URL"), "/"), ClientURL: strings.TrimRight(clientURL, "/"), Providers: map[uuid.UUID]bool{}, Clients: map[string]Client{}}
-	for _, raw := range strings.Split(os.Getenv("INTEGRATIONS_PROVIDER_ALLOWLIST"), ",") {
-		if strings.TrimSpace(raw) == "" {
-			continue
+	selection := strings.TrimSpace(os.Getenv("INTEGRATIONS_PROVIDER_ALLOWLIST"))
+	if strings.EqualFold(selection, "all") {
+		cfg.AllProviders = true
+	} else {
+		for _, raw := range strings.Split(selection, ",") {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
+			}
+			if strings.EqualFold(raw, "all") {
+				return cfg, fmt.Errorf("INTEGRATIONS_PROVIDER_ALLOWLIST must use all by itself or a comma-separated list of provider UUIDs")
+			}
+			id, e := uuid.Parse(raw)
+			if e != nil {
+				return cfg, fmt.Errorf("INTEGRATIONS_PROVIDER_ALLOWLIST contains an invalid provider ID")
+			}
+			cfg.Providers[id] = true
 		}
-		id, e := uuid.Parse(strings.TrimSpace(raw))
-		if e != nil {
-			return cfg, fmt.Errorf("INTEGRATIONS_PROVIDER_ALLOWLIST contains an invalid provider ID")
-		}
-		cfg.Providers[id] = true
 	}
 	cfg.Clients["chatgpt"] = Client{envDefault("INTEGRATIONS_CHATGPT_CLIENT_METADATA_URL", "https://chatgpt.com/oauth/client.json"), envDefault("INTEGRATIONS_CHATGPT_REDIRECT_URI", "https://chatgpt.com/connector_platform_oauth_redirect")}
 	cfg.Clients["claude"] = Client{os.Getenv("INTEGRATIONS_CLAUDE_CLIENT_METADATA_URL"), "https://claude.ai/api/mcp/auth_callback"}
@@ -53,8 +63,8 @@ func LoadConfig(clientURL string) (Config, error) {
 			return cfg, fmt.Errorf("%s must be an HTTPS origin", name)
 		}
 	}
-	if len(cfg.Providers) == 0 {
-		return cfg, fmt.Errorf("INTEGRATIONS_PROVIDER_ALLOWLIST is required for the private beta")
+	if !cfg.AllProviders && len(cfg.Providers) == 0 {
+		return cfg, fmt.Errorf("INTEGRATIONS_PROVIDER_ALLOWLIST must be all or a comma-separated list of provider UUIDs when integrations are enabled")
 	}
 	for platform, client := range cfg.Clients {
 		if !officialURL(platform, client.MetadataURL) || !officialURL(platform, client.RedirectURI) {

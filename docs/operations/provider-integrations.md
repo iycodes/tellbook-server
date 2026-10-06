@@ -1,4 +1,4 @@
-# Provider catalog integrations: private beta
+# Provider catalog integrations
 
 The Go API serves both `/mcp/chatgpt` and `/mcp/claude` with the official Go MCP SDK. Both call the shared catalog application boundary used by the provider REST UI. Tessa’s model planner is not involved. OAuth uses opaque SHA-256-hashed tokens in PostgreSQL and public-client S256 PKCE. Exact configured CIMD identities and callbacks are required; client registration is not exposed.
 
@@ -12,10 +12,16 @@ Apply `20261002010000_provider_integrations.sql`, `20261002011000_catalog_revisi
 | INTEGRATIONS_WRITES_ENABLED | false; reads remain available when only this gate is disabled |
 | INTEGRATIONS_PUBLIC_BASE_URL | HTTPS API origin, without a path |
 | CLIENT_PUBLIC_BASE_URL | HTTPS browser app origin |
-| INTEGRATIONS_PROVIDER_ALLOWLIST | Explicit comma-separated provider UUIDs; required when enabled |
+| INTEGRATIONS_PROVIDER_ALLOWLIST | `all` or explicit comma-separated provider UUIDs; required when enabled |
 | INTEGRATIONS_CHATGPT_CLIENT_METADATA_URL | https://chatgpt.com/oauth/client.json |
 | INTEGRATIONS_CHATGPT_REDIRECT_URI | https://chatgpt.com/connector_platform_oauth_redirect |
 | INTEGRATIONS_CLAUDE_CLIENT_METADATA_URL | https://claude.ai/oauth/mcp-oauth-client-metadata, verified from Claude's hosted sign-in flow |
+
+Set `INTEGRATIONS_PROVIDER_ALLOWLIST=all` to make linking available to every
+authenticated provider, or use provider account UUIDs to restrict the rollout.
+`all` is case-insensitive and must be used by itself. The `INTEGRATIONS_ENABLED`
+and `INTEGRATIONS_WRITES_ENABLED` gates still apply. Each provider authorizes their
+own account through OAuth consent, and tokens retain only the approved scopes.
 
 Claude’s callback is `https://claude.ai/api/mcp/auth_callback`. Configure the actual connector metadata identity before production startup. Both metadata and callback must match exactly. CIMD must advertise `none` as a supported token authentication method. The plural supported-methods list takes precedence over the singular preference, which permits ChatGPT’s current `none` / `private_key_jwt` document to negotiate public PKCE with this server. JWT assertions and client secrets are rejected.
 
