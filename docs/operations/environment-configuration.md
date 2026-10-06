@@ -15,6 +15,14 @@ separate: they control different delivery paths. Keep payment capability selecti
 keys explicit and independent.
 Removing duplicated tuning must not change these settings or enable delivery.
 
+`INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST` accepts `all` to make Semi-pilot and
+Autopilot available to every authenticated provider, or a comma-separated list
+of provider account UUIDs to restrict access. `all` is case-insensitive and must
+be used by itself. `INBOX_AI_AUTOMATION_ENABLED=true` still requires one of these
+explicit selections; when the switch is false, neither selection enables automation.
+Provider policies, enabled services, pauses, and conversation controls continue
+to determine whether a particular conversation uses an automated mode.
+
 The anonymous support form has its own `SUPPORT_EMAIL` destination and sends on
 the API role using the existing SMTP settings. A blank destination leaves the
 page readable and the form unavailable. See [public support configuration](public-support.md)

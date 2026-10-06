@@ -528,6 +528,66 @@ func TestLoadReadsAndValidatesInboxAIControls(t *testing.T) {
 	}
 }
 
+func TestLoadInboxAIAutomationAllProviders(t *testing.T) {
+	for _, value := range []string{"all", "ALL", "  All  "} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredConfig(t)
+			t.Setenv("INBOX_AI_AUTOMATION_ENABLED", "true")
+			t.Setenv("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST", value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if !cfg.InboxAIAutomationEnabled || len(cfg.InboxAIAutomationProviderAllowlist) != 1 ||
+				cfg.InboxAIAutomationProviderAllowlist[0] != "all" {
+				t.Fatal("Load() did not normalize the all-provider selection")
+			}
+		})
+	}
+}
+
+func TestLoadInboxAIAutomationAllRequiresStandaloneSelection(t *testing.T) {
+	providerID := "10000000-0000-4000-8000-000000000001"
+	for _, value := range []string{"all," + providerID, providerID + ",ALL", "all,all"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredConfig(t)
+			t.Setenv("INBOX_AI_AUTOMATION_ENABLED", "true")
+			t.Setenv("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST", value)
+			if _, err := Load(); err == nil {
+				t.Fatal("Load() accepted all mixed with other allowlist entries")
+			}
+		})
+	}
+}
+
+func TestLoadInboxAIAutomationProviderListAndDisabledGate(t *testing.T) {
+	setRequiredConfig(t)
+	providerIDs := []string{
+		"10000000-0000-4000-8000-000000000001",
+		"10000000-0000-4000-8000-000000000002",
+	}
+	t.Setenv("INBOX_AI_AUTOMATION_ENABLED", "true")
+	t.Setenv("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST", strings.Join(providerIDs, ","))
+	cfg, err := Load()
+	if err != nil || len(cfg.InboxAIAutomationProviderAllowlist) != 2 {
+		t.Fatalf("Load() rejected a provider UUID list: %v", err)
+	}
+	for index, expected := range providerIDs {
+		if cfg.InboxAIAutomationProviderAllowlist[index] != expected {
+			t.Fatal("Load() changed the provider UUID selection")
+		}
+	}
+	t.Setenv("INBOX_AI_AUTOMATION_ENABLED", "false")
+	t.Setenv("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST", "all")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.InboxAIAutomationEnabled {
+		t.Fatal("The all selection enabled the disabled automation gate")
+	}
+}
+
 func TestLoadReadsAndValidatesTessaAIControls(t *testing.T) {
 	setRequiredConfig(t)
 	t.Setenv("TESSA_AI_ENABLED", "true")

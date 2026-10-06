@@ -649,9 +649,17 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("INBOX_AI_PROVIDER_ALLOWLIST contains invalid UUID %q", rawID)
 		}
 	}
-	for _, rawID := range cfg.InboxAIAutomationProviderAllowlist {
-		if _, err := uuid.Parse(rawID); err != nil {
-			return Config{}, fmt.Errorf("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST contains invalid UUID %q", rawID)
+	if len(cfg.InboxAIAutomationProviderAllowlist) == 1 &&
+		strings.EqualFold(cfg.InboxAIAutomationProviderAllowlist[0], "all") {
+		cfg.InboxAIAutomationProviderAllowlist = []string{"all"}
+	} else {
+		for _, rawID := range cfg.InboxAIAutomationProviderAllowlist {
+			if strings.EqualFold(rawID, "all") {
+				return Config{}, fmt.Errorf("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST must use all by itself or a comma-separated list of provider UUIDs")
+			}
+			if _, err := uuid.Parse(rawID); err != nil {
+				return Config{}, fmt.Errorf("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST contains invalid UUID %q", rawID)
+			}
 		}
 	}
 	if cfg.InboxAIAutomationEnabled && len(cfg.InboxAIAutomationProviderAllowlist) == 0 {

@@ -32,6 +32,7 @@ type Repository struct {
 	locationResolutionFlight      singleflight.Group
 	agreementTokens               *agreementservice.PublicTokenManager
 	inboxAIAutomationEnabled      bool
+	inboxAIAutomationAllProviders bool
 	inboxAIAutomationAllowlist    map[uuid.UUID]struct{}
 	inboxAISemiPilotReplyDelay    time.Duration
 	inboxAIAutopilotPaymentWindow time.Duration
@@ -77,6 +78,8 @@ func (r *Repository) ConfigureInboxAIAutomation(
 	replyDelays ...time.Duration,
 ) {
 	r.inboxAIAutomationEnabled = enabled
+	r.inboxAIAutomationAllProviders = len(providerAllowlist) == 1 &&
+		strings.EqualFold(strings.TrimSpace(providerAllowlist[0]), "all")
 	if len(replyDelays) > 0 && replyDelays[0] >= 0 {
 		r.inboxAISemiPilotReplyDelay = replyDelays[0]
 	}
@@ -91,6 +94,9 @@ func (r *Repository) ConfigureInboxAIAutomation(
 func (r *Repository) inboxAIAutomationAvailable(clientID uuid.UUID) bool {
 	if r == nil || !r.inboxAIAutomationEnabled {
 		return false
+	}
+	if r.inboxAIAutomationAllProviders {
+		return clientID != uuid.Nil
 	}
 	_, allowed := r.inboxAIAutomationAllowlist[clientID]
 	return allowed
