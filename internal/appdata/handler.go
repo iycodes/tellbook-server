@@ -234,6 +234,7 @@ func (h *Handler) Routes(r chi.Router) {
 		}
 
 		r.Get("/dashboard", h.getDashboard)
+		r.Get("/catalog-receipts/{receiptID}", h.getCatalogReceipt)
 		r.Get("/stats", h.getStatsOverview)
 		r.Get("/revenue", h.getRevenueOverview)
 		r.Get("/bookings", h.listBookings)
@@ -317,6 +318,7 @@ func (h *Handler) Routes(r chi.Router) {
 		r.Put("/service-sections/reorder", h.reorderServiceSections)
 		r.Get("/service-sections/{sectionID}", h.getServiceSectionDetails)
 		r.Put("/service-sections/{sectionID}", h.updateServiceSection)
+		r.Patch("/service-sections/{sectionID}", h.patchServiceSection)
 		r.Delete("/service-sections/{sectionID}", h.deleteServiceSection)
 		r.Get("/services", h.listManagedServices)
 		r.Post("/services", h.createManagedService)
@@ -327,6 +329,8 @@ func (h *Handler) Routes(r chi.Router) {
 		r.Delete("/service-wizard-drafts/{draftID}", h.deleteServiceWizardDraft)
 		r.Get("/services/{serviceID}", h.getManagedServiceDetails)
 		r.Put("/services/{serviceID}", h.updateManagedService)
+		r.Patch("/services/{serviceID}", h.patchManagedService)
+		r.Patch("/services/{serviceID}/status", h.patchManagedServiceStatus)
 		r.Patch("/services/{serviceID}/visibility", h.updateManagedServiceVisibility)
 		r.Post("/services/{serviceID}/duplicate", h.duplicateManagedService)
 		r.Delete("/services/{serviceID}", h.deleteManagedService)

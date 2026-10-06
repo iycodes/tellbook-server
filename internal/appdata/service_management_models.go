@@ -3,6 +3,7 @@ package appdata
 import "booking/go-server/internal/money"
 
 type ServiceSectionItem struct {
+	Revision         int64  `json:"revision"`
 	ID               string `json:"id"`
 	Name             string `json:"name"`
 	Description      string `json:"description"`
@@ -13,6 +14,7 @@ type ServiceSectionItem struct {
 }
 
 type ManagedServiceItem struct {
+	Revision                    int64                     `json:"revision"`
 	ID                          string                    `json:"id"`
 	Name                        string                    `json:"name"`
 	Description                 string                    `json:"description"`
@@ -112,7 +114,8 @@ type ServiceSectionDetailsResponse struct {
 }
 
 type ReorderItemsInput struct {
-	OrderedIDs []string `json:"ordered_ids"`
+	OrderedIDs        []string         `json:"ordered_ids"`
+	ExpectedRevisions map[string]int64 `json:"expected_revisions,omitempty"`
 }
 
 type CreateManagedServiceInput struct {

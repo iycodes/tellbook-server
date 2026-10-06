@@ -118,6 +118,9 @@ func rateLimitMiddleware(cfg config.Config, sharedLimiters ...SharedRateLimiter)
 		positiveOr(cfg.LocationRateLimitPerMinute, 20),
 		positiveOr(cfg.LocationRateLimitBurst, 5),
 	)
+	// Support sends email immediately. Keep a small, IP-only bucket so arbitrary
+	// cookies or Authorization values cannot rotate the anonymous caller identity.
+	support := newRequestLimiter(1, 3)
 	authLimiter := newRequestLimiter(
 		positiveOr(cfg.MarketplaceAuthRateLimitPerMinute, 20),
 		positiveOr(cfg.MarketplaceAuthRateLimitBurst, 6),
@@ -143,6 +146,9 @@ func rateLimitMiddleware(cfg config.Config, sharedLimiters ...SharedRateLimiter)
 			} else if r.URL.Path == "/v1/public/locations/resolve" {
 				limiter = location
 				class = "location"
+			} else if r.Method == http.MethodPost && r.URL.Path == "/v1/support/requests" {
+				limiter = support
+				class = "support"
 			} else if isAuthMutationRoute(r.Method, r.URL.Path) {
 				limiter = authLimiter
 				class = "auth"
@@ -150,6 +156,9 @@ func rateLimitMiddleware(cfg config.Config, sharedLimiters ...SharedRateLimiter)
 
 			clientIP := requestClientIP(r)
 			identity := rateLimitIdentity(r, cfg)
+			if class == "support" {
+				identity = "ip:" + clientIP
+			}
 			if identity == "" {
 				identity = "ip:" + clientIP
 			}
@@ -157,6 +166,13 @@ func rateLimitMiddleware(cfg config.Config, sharedLimiters ...SharedRateLimiter)
 				r.Context(), shared, limiter, class, identity, clientIP,
 				limiter.perMinute, limiter.burst, ipMultiplier,
 			)
+			if limitErr != nil && class == "support" {
+				w.Header().Set("Retry-After", "1")
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+					"message": "Support is temporarily unavailable. Please try again shortly.",
+				})
+				return
+			}
 			if limitErr != nil && class == "auth" {
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
 				w.Header().Set("Retry-After", "1")
@@ -348,6 +364,15 @@ func isAICommandRoute(method, path string) bool {
 }
 
 func isAuthMutationRoute(method, path string) bool {
+	if path == "/oauth/authorize" {
+		return method == http.MethodGet
+	}
+	if path == "/oauth/token" || path == "/oauth/revoke" {
+		return method == http.MethodPost
+	}
+	if strings.HasPrefix(path, "/v1/app/integrations/authorization-requests/") {
+		return method == http.MethodPost
+	}
 	if method != http.MethodPost && method != http.MethodPatch {
 		return false
 	}

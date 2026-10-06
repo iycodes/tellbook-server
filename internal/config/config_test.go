@@ -33,7 +33,7 @@ func setRequiredConfig(t *testing.T) {
 		"META_APP_ID", "META_APP_SECRET", "META_VERIFY_TOKEN", "WABA_TOKEN",
 		"WHATSAPP_BUSINESS_ACCOUNT_ID", "WABA_PHONE_NUMBER_ID",
 		"NOTIFICATION_DESTINATION_HMAC_KEY", "WHATSAPP_ENABLED_TEMPLATE_KEYS",
-		"SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM_EMAIL",
+		"SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM_EMAIL", "SUPPORT_EMAIL",
 		"AUTH_DELIVERY_ENCRYPTION_KEYS", "AUTH_DELIVERY_ACTIVE_KEY", "AUTH_DESTINATION_HMAC_KEY",
 	} {
 		t.Setenv(key, "")
@@ -125,8 +125,10 @@ func setRequiredConfig(t *testing.T) {
 		"PAYSTACK_DESTINATION_SANDBOX_VERIFIED", "PAYSTACK_DESTINATION_PRODUCTION_ENABLED",
 		"PAYSTACK_PAYOUT_SANDBOX_VERIFIED", "PAYSTACK_PAYOUT_PRODUCTION_ENABLED",
 	} {
-		t.Setenv(key, "false")
+		t.Setenv(key, "")
 	}
+	t.Setenv("PAYAZA_ENABLED_CAPABILITIES", "")
+	t.Setenv("PAYSTACK_ENABLED_CAPABILITIES", "")
 }
 
 func TestLoadValidatesNotificationPlannerConcurrency(t *testing.T) {
@@ -1076,12 +1078,12 @@ func TestLoadValidatesAgreementTokenEncryptionConfig(t *testing.T) {
 	}
 }
 
-func TestLoadRequiresFinancialSecurityForVerifiedProviders(t *testing.T) {
+func TestLoadRequiresFinancialSecurityForEnabledCapabilities(t *testing.T) {
 	setRequiredConfig(t)
-	t.Setenv("PAYSTACK_CARD_SANDBOX_VERIFIED", "true")
+	t.Setenv("PAYSTACK_ENABLED_CAPABILITIES", "card")
 
 	if _, err := Load(); err == nil {
-		t.Fatal("Load() enabled a verified provider without financial security configuration")
+		t.Fatal("Load() enabled payment capabilities without financial security configuration")
 	}
 }
 

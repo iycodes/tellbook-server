@@ -30,6 +30,9 @@ go run ./cmd/api
 
 The server auto-loads `.env` from either the current working directory or `go-server/.env` before reading config.
 
+Keep deployment values and rollout switches in `.env`; omit tuning that uses code defaults.
+See [environment configuration](docs/operations/environment-configuration.md) for optional overrides and test-only inputs.
+
 ## Seed demo data
 
 After applying migrations, seed a demo provider workspace with:
@@ -155,7 +158,7 @@ The keyring, active version, and fingerprint key must be configured together. Ke
 
 ## Provider-neutral payment adapters
 
-Payaza and Paystack implement the same collection, reconciliation, webhook, destination, and payout contracts. Payaza is preferred only after its specific capability has been marked sandbox-verified or production-enabled; provider selection never retries an ambiguous operation through another provider.
+Payaza and Paystack implement the same collection, reconciliation, webhook, destination, and payout contracts. Payaza is preferred only when its specific capability is enabled and configured; provider selection never retries an ambiguous operation through another provider.
 
 Set `CLIENT_PUBLIC_BASE_URL` to the SvelteKit application's absolute public origin. The server uses this trusted value for hosted-checkout return URLs and customer agreement links; request `Origin` and `Referer` headers are never used to construct those URLs.
 
@@ -165,8 +168,7 @@ Payaza configuration:
 - `PAYAZA_PUBLIC_KEY_TEST` and `PAYAZA_SECRET_KEY_TEST` are the test credential pair
 - `PAYAZA_BASE_URL` defaults to `https://api.payaza.africa/live`
 - Payaza's tenant header is always derived from `PAYMENTS_ENVIRONMENT`
-- `PAYAZA_CARD_SANDBOX_VERIFIED` and `PAYAZA_CARD_PRODUCTION_ENABLED` control Payaza card checkout readiness
-- `PAYAZA_BANK_TRANSFER_SANDBOX_VERIFIED` and `PAYAZA_BANK_TRANSFER_PRODUCTION_ENABLED` control Payaza dynamic virtual-account readiness
+- `PAYAZA_ENABLED_CAPABILITIES` lists the enabled operations: `card`, `bank_transfer`, `destination`, and/or `payout`
 - `PAYAZA_NGN_DVA_BANK_CODE` and `PAYAZA_NGN_DVA_ENQUIRY_BANK_CODE` select the certified NGN DVA bank and its account-enquiry code
 - `PAYAZA_TRANSFER_PIN` and `PAYAZA_SOURCE_ACCOUNTS` are the server-only live payout authorization and currency-to-source-account map
 - `PAYAZA_TRANSFER_PIN_TEST` and `PAYAZA_SOURCE_ACCOUNTS_TEST` are their isolated test-mode equivalents
@@ -174,12 +176,18 @@ Payaza configuration:
 
 `PAYMENTS_ENVIRONMENT` deterministically selects the credential pair for collections, reconciliation, account-name verification, webhooks, and payouts. Payaza's test tenant does not currently expose the NGN bank-list endpoint, so when the active environment is `test`, TellBook uses the separately configured live client only for that read-only institution directory. It never retries or sends a test financial operation through live credentials. Without the live pair, the Payaza destination capability remains unavailable in test mode.
 
-Paystack uses `PAYSTACK_SECRET_KEY` for live mode, `PAYSTACK_SECRET_KEY_TEST` for test mode, and `PAYSTACK_BASE_URL` for both. `PAYSTACK_CARD_*` and `PAYSTACK_BANK_TRANSFER_*` flags independently control the two collection rails. Card checkout is restricted to the card channel, while bank transfer uses Pay with Transfer through the Charge API. Collection amounts are sent as quoted minor units. Paystack payouts remain unavailable unless transfer OTP has been disabled on the Paystack account and `PAYSTACK_PAYOUT_OTP_DISABLED=true`; provider-side third-party payout permission is also required. TellBook does not store, request, or automatically submit a human OTP.
+Paystack uses `PAYSTACK_SECRET_KEY` for live mode, `PAYSTACK_SECRET_KEY_TEST` for test mode, and `PAYSTACK_BASE_URL` for both. The `card` and `bank_transfer` entries in `PAYSTACK_ENABLED_CAPABILITIES` independently control the two collection rails. Card checkout is restricted to the card channel, while bank transfer uses Pay with Transfer through the Charge API. Collection amounts are sent as quoted minor units. Paystack payouts remain unavailable unless transfer OTP has been disabled on the Paystack account and `PAYSTACK_PAYOUT_OTP_DISABLED=true`; provider-side third-party payout permission is also required. TellBook does not store, request, or automatically submit a human OTP.
 
-Paystack settlement evidence is synchronized only after a Paystack collection rail is certified for the active environment. Successful settlement records and their exact transaction membership are persisted before an allocation becomes payout-eligible. Settlement matching requires the provider, TellBook payment reference, amount, and currency to agree; collection success alone never releases funds. Payout initiation also checks the provider balance and is serialized by provider and currency across server instances.
+Paystack settlement evidence is synchronized only when a Paystack collection rail is enabled for the active environment. Successful settlement records and their exact transaction membership are persisted before an allocation becomes payout-eligible. Settlement matching requires the provider, TellBook payment reference, amount, and currency to agree; collection success alone never releases funds. Payout initiation also checks the provider balance and is serialized by provider and currency across server instances.
 
-Each provider has separate sandbox-verification and production-enable flags for card collection, bank-transfer collection, destination lookup, and payouts. A capability is unavailable until its exact flag and required credentials are configured; do not enable a flag before completing that provider flow end to end.
+`PAYAZA_ENABLED_CAPABILITIES` and `PAYSTACK_ENABLED_CAPABILITIES` are comma-separated lists for the selected `PAYMENTS_ENVIRONMENT`. Blank lists disable new operations. Supported entries are `card`, `bank_transfer`, `destination` (bank listing and account lookup), and `payout`. Required credentials and operation prerequisites still apply; enabling collections does not enable payouts. Unknown entries fail startup.
+
+The previous `*_SANDBOX_VERIFIED` and `*_PRODUCTION_ENABLED` flags are retired. Migrate only the flags for the deployment's selected payment environment, then remove all old flags; leaving them configured produces an actionable startup error. See [migration instructions](docs/operations/environment-configuration.md#payment-capabilities).
 
 ## Migrations
 
 Migrations live in `db/migrations` and are intended to be run with `dbmate`.
+
+## Provider catalog integrations
+
+The private ChatGPT/Claude beta uses delegated OAuth and the shared catalog operations. See [setup and verification](docs/operations/provider-integrations.md), [review materials](docs/review/provider-integrations.md), and the separate packages under `plugins/chatgpt` and `plugins/claude`. Integration and write gates default off.

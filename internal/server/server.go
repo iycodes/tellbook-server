@@ -15,9 +15,11 @@ import (
 	"booking/go-server/internal/appdata"
 	"booking/go-server/internal/auth"
 	"booking/go-server/internal/config"
+	"booking/go-server/internal/mailer"
 	"booking/go-server/internal/markets"
 	"booking/go-server/internal/observability"
 	"booking/go-server/internal/payments"
+	"booking/go-server/internal/publicsupport"
 	"booking/go-server/internal/redisstore"
 
 	"github.com/go-chi/chi/v5"
@@ -43,6 +45,8 @@ type OperationalDependencies struct {
 	MaintenanceOwnership string
 	MetaWhatsAppWebhook  http.Handler
 	AdminHandler         http.Handler
+	IntegrationRoutes    func(chi.Router)
+	SupportSender        mailer.Sender
 }
 
 func New(
@@ -80,12 +84,20 @@ func New(
 		)
 	}
 
+	if operational.IntegrationRoutes != nil {
+		operational.IntegrationRoutes(router)
+	}
+
 	router.Route("/v1", func(r chi.Router) {
 		r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		})
 		r.Get("/readyz", readinessHandler(operational))
 		r.Get("/meta/markets", markets.Handler(markets.DefaultCatalog()))
+		r.Route("/support", publicsupport.New(publicsupport.Config{
+			Recipient: cfg.SupportEmail, FromEmail: cfg.SMTPFromAddress(),
+			PublicURL: cfg.ClientPublicBaseURL,
+		}, operational.SupportSender).Routes)
 
 		if operational.AdminHandler != nil {
 			r.Mount("/admin", operational.AdminHandler)
@@ -334,7 +346,7 @@ func corsMiddleware(allowedOrigins []string) func(http.Handler) http.Handler {
 				w.Header().Set("Vary", "Origin")
 			}
 
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With, If-Match, Idempotency-Key, MCP-Protocol-Version, MCP-Session-Id, Mcp-Method, Mcp-Name")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			w.Header().Set("Cache-Control", "no-store")
 			w.Header().Set("X-Content-Type-Options", "nosniff")

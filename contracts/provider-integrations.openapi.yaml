@@ -1,0 +1,2629 @@
+{
+  "components": {
+    "schemas": {
+      "CatalogScope": {
+        "enum": [
+          "catalog.read",
+          "catalog.write",
+          "catalog.publish",
+          "catalog.delete"
+        ],
+        "type": "string"
+      },
+      "Connection": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "platform": {
+            "enum": [
+              "chatgpt",
+              "claude"
+            ],
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogScope"
+            },
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "connected",
+              "disconnected",
+              "expired"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "platform",
+          "scopes",
+          "status",
+          "created_at",
+          "expires_at",
+          "last_used_at"
+        ],
+        "type": "object"
+      },
+      "Connections": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Connection"
+            },
+            "type": "array"
+          },
+          "writes_enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "available",
+          "writes_enabled",
+          "items"
+        ],
+        "type": "object"
+      },
+      "ConsentDecision": {
+        "additionalProperties": false,
+        "properties": {
+          "approve": {
+            "type": "boolean"
+          },
+          "csrf_token": {
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogScope"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "approve",
+          "scopes",
+          "csrf_token"
+        ],
+        "type": "object"
+      },
+      "ConsentRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "business": {
+            "additionalProperties": false,
+            "properties": {
+              "business_name": {
+                "type": "string"
+              },
+              "id": {
+                "format": "uuid",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "business_name"
+            ],
+            "type": "object"
+          },
+          "csrf_token": {
+            "type": "string"
+          },
+          "platform": {
+            "enum": [
+              "chatgpt",
+              "claude"
+            ],
+            "type": "string"
+          },
+          "request_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "$ref": "#/components/schemas/CatalogScope"
+            },
+            "type": "array"
+          },
+          "writes_enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "request_id",
+          "platform",
+          "scopes",
+          "csrf_token",
+          "writes_enabled",
+          "business"
+        ],
+        "type": "object"
+      },
+      "CreateManagedServiceInput": {
+        "additionalProperties": false,
+        "properties": {
+          "agreement_template_family_id": {
+            "type": "string"
+          },
+          "agreement_timing": {
+            "type": "string"
+          },
+          "availability": {
+            "$ref": "#/components/schemas/ServiceAvailabilityConfig"
+          },
+          "badge": {
+            "type": "string"
+          },
+          "cancellation_policy": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "duration_minutes": {
+            "type": "integer"
+          },
+          "fulfillment": {
+            "$ref": "#/components/schemas/ServiceFulfillmentConfig"
+          },
+          "image_url": {
+            "type": "string"
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "lateness_policy": {
+            "type": "string"
+          },
+          "pricing": {
+            "$ref": "#/components/schemas/ServicePricingConfig"
+          },
+          "publish_status": {
+            "type": "string"
+          },
+          "section_id": {
+            "type": "string"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "short_notice_rules": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceShortNoticeRule"
+            },
+            "type": "array"
+          },
+          "standalone_signature_required": {
+            "type": "boolean"
+          },
+          "virtual_delivery": {
+            "$ref": "#/components/schemas/ServiceVirtualDelivery"
+          },
+          "wizard_draft_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "section_id",
+          "service_name",
+          "description",
+          "badge",
+          "duration_minutes",
+          "pricing",
+          "fulfillment",
+          "availability",
+          "short_notice_rules",
+          "virtual_delivery",
+          "cancellation_policy",
+          "lateness_policy",
+          "agreement_template_family_id",
+          "agreement_timing",
+          "standalone_signature_required",
+          "instructions",
+          "publish_status",
+          "image_url",
+          "wizard_draft_id"
+        ],
+        "type": "object"
+      },
+      "CreateServiceSectionInput": {
+        "additionalProperties": false,
+        "properties": {
+          "cover_image_url": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "cover_image_url"
+        ],
+        "type": "object"
+      },
+      "EditableCreateManagedServiceInput": {
+        "additionalProperties": false,
+        "properties": {
+          "agreement_template_family_id": {
+            "type": "string"
+          },
+          "agreement_timing": {
+            "type": "string"
+          },
+          "availability": {
+            "$ref": "#/components/schemas/EditableServiceAvailabilityConfig"
+          },
+          "badge": {
+            "type": "string"
+          },
+          "cancellation_policy": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "duration_minutes": {
+            "type": "integer"
+          },
+          "fulfillment": {
+            "$ref": "#/components/schemas/EditableServiceFulfillmentConfig"
+          },
+          "image_url": {
+            "type": "string"
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "lateness_policy": {
+            "type": "string"
+          },
+          "pricing": {
+            "$ref": "#/components/schemas/EditableServicePricingConfig"
+          },
+          "publish_status": {
+            "type": "string"
+          },
+          "section_id": {
+            "type": "string"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "short_notice_rules": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceShortNoticeRule"
+            },
+            "type": "array"
+          },
+          "standalone_signature_required": {
+            "type": "boolean"
+          },
+          "virtual_delivery": {
+            "$ref": "#/components/schemas/EditableServiceVirtualDelivery"
+          },
+          "wizard_draft_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_name",
+          "duration_minutes",
+          "pricing",
+          "fulfillment",
+          "availability"
+        ],
+        "type": "object"
+      },
+      "EditableCreateServiceSectionInput": {
+        "additionalProperties": false,
+        "properties": {
+          "cover_image_url": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "EditableServiceAvailabilityConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "buffer_time_minutes": {
+            "type": "integer"
+          },
+          "custom_windows": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceAvailabilityWindow"
+            },
+            "type": "array"
+          },
+          "max_bookings_per_day": {
+            "type": "integer"
+          },
+          "minimum_notice_minutes": {
+            "type": "integer"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "prep_time_minutes": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "EditableServiceFulfillmentConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "max_travel_distance_meters": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mode": {
+            "type": "string"
+          },
+          "provider_location_id": {
+            "type": "string"
+          },
+          "provider_location_label": {
+            "type": "string"
+          },
+          "travel_fee_minor": {
+            "description": "Quoted exact minor-unit integer in the business currency.",
+            "pattern": "^-?[0-9]+$",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "EditableServicePricingConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "compare_price_amount_minor": {
+            "description": "Quoted exact minor-unit integer in the business currency.",
+            "pattern": "^-?[0-9]+$",
+            "type": "string"
+          },
+          "deposit_amount_minor": {
+            "description": "Quoted exact minor-unit integer in the business currency.",
+            "pattern": "^-?[0-9]+$",
+            "type": "string"
+          },
+          "deposit_percentage_bps": {
+            "type": "integer"
+          },
+          "deposit_required": {
+            "type": "boolean"
+          },
+          "deposit_type": {
+            "type": "string"
+          },
+          "price_amount_minor": {
+            "description": "Quoted exact minor-unit integer in the business currency.",
+            "pattern": "^-?[0-9]+$",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "EditableServiceVirtualDelivery": {
+        "additionalProperties": false,
+        "properties": {
+          "instructions": {
+            "type": "string"
+          },
+          "join_url": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ManagedServiceItem": {
+        "additionalProperties": false,
+        "properties": {
+          "agreement_confirmation_method": {
+            "type": "string"
+          },
+          "agreement_template_family_id": {
+            "type": "string"
+          },
+          "agreement_template_title": {
+            "type": "string"
+          },
+          "agreement_timing": {
+            "type": "string"
+          },
+          "availability": {
+            "$ref": "#/components/schemas/ServiceAvailabilityConfig"
+          },
+          "badge": {
+            "type": "string"
+          },
+          "cancellation_policy": {
+            "type": "string"
+          },
+          "currency_code": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "duration_label": {
+            "type": "string"
+          },
+          "duration_minutes": {
+            "type": "integer"
+          },
+          "fulfillment": {
+            "$ref": "#/components/schemas/ServiceFulfillmentConfig"
+          },
+          "id": {
+            "type": "string"
+          },
+          "image_url": {
+            "type": "string"
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "is_hidden": {
+            "type": "boolean"
+          },
+          "lateness_policy": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pricing": {
+            "$ref": "#/components/schemas/ServicePricingConfig"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "section_id": {
+            "type": "string"
+          },
+          "section_name": {
+            "type": "string"
+          },
+          "short_notice_rules": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceShortNoticeRule"
+            },
+            "type": "array"
+          },
+          "standalone_signature_required": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "string"
+          },
+          "virtual_delivery": {
+            "$ref": "#/components/schemas/ServiceVirtualDelivery"
+          }
+        },
+        "required": [
+          "revision",
+          "id",
+          "name",
+          "description",
+          "currency_code",
+          "duration_minutes",
+          "duration_label",
+          "status",
+          "is_hidden",
+          "pricing",
+          "fulfillment",
+          "availability",
+          "short_notice_rules",
+          "virtual_delivery",
+          "standalone_signature_required"
+        ],
+        "type": "object"
+      },
+      "ReorderItemsInput": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_revisions": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object"
+          },
+          "ordered_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ordered_ids",
+          "expected_revisions"
+        ],
+        "type": "object"
+      },
+      "SectionPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "cover_image_url": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ServiceAvailabilityConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "buffer_time_minutes": {
+            "type": "integer"
+          },
+          "custom_windows": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceAvailabilityWindow"
+            },
+            "type": "array"
+          },
+          "max_bookings_per_day": {
+            "type": "integer"
+          },
+          "minimum_notice_minutes": {
+            "type": "integer"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "prep_time_minutes": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mode",
+          "minimum_notice_minutes",
+          "max_bookings_per_day",
+          "prep_time_minutes",
+          "buffer_time_minutes",
+          "custom_windows"
+        ],
+        "type": "object"
+      },
+      "ServiceAvailabilityWindow": {
+        "additionalProperties": false,
+        "properties": {
+          "day_of_week": {
+            "type": "integer"
+          },
+          "end_time": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "slot_interval_minutes": {
+            "type": "integer"
+          },
+          "start_time": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "day_of_week",
+          "start_time",
+          "end_time",
+          "slot_interval_minutes"
+        ],
+        "type": "object"
+      },
+      "ServiceFulfillmentConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "max_travel_distance_meters": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mode": {
+            "type": "string"
+          },
+          "provider_location_id": {
+            "type": "string"
+          },
+          "provider_location_label": {
+            "type": "string"
+          },
+          "travel_fee_minor": {
+            "description": "Quoted exact minor-unit integer in the business currency.",
+            "pattern": "^-?[0-9]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "travel_fee_minor"
+        ],
+        "type": "object"
+      },
+      "ServicePatch": {
+        "additionalProperties": false,
+        "properties": {
+          "agreement_template_family_id": {
+            "type": "string"
+          },
+          "agreement_timing": {
+            "type": "string"
+          },
+          "availability": {
+            "$ref": "#/components/schemas/EditableServiceAvailabilityConfig"
+          },
+          "badge": {
+            "type": "string"
+          },
+          "cancellation_policy": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "duration_minutes": {
+            "type": "integer"
+          },
+          "fulfillment": {
+            "$ref": "#/components/schemas/EditableServiceFulfillmentConfig"
+          },
+          "image_url": {
+            "type": "string"
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "lateness_policy": {
+            "type": "string"
+          },
+          "pricing": {
+            "$ref": "#/components/schemas/EditableServicePricingConfig"
+          },
+          "section_id": {
+            "type": "string"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "short_notice_rules": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceShortNoticeRule"
+            },
+            "type": "array"
+          },
+          "standalone_signature_required": {
+            "type": "boolean"
+          },
+          "virtual_delivery": {
+            "$ref": "#/components/schemas/EditableServiceVirtualDelivery"
+          }
+        },
+        "type": "object"
+      },
+      "ServicePricingConfig": {
+        "additionalProperties": false,
+        "properties": {
+          "compare_price_amount_minor": {
+            "description": "Quoted exact minor-unit integer in the business currency.",
+            "pattern": "^-?[0-9]+$",
+            "type": "string"
+          },
+          "deposit_amount_minor": {
+            "description": "Quoted exact minor-unit integer in the business currency.",
+            "pattern": "^-?[0-9]+$",
+            "type": "string"
+          },
+          "deposit_percentage_bps": {
+            "type": "integer"
+          },
+          "deposit_required": {
+            "type": "boolean"
+          },
+          "deposit_type": {
+            "type": "string"
+          },
+          "price_amount_minor": {
+            "description": "Quoted exact minor-unit integer in the business currency.",
+            "pattern": "^-?[0-9]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "price_amount_minor",
+          "compare_price_amount_minor",
+          "deposit_required",
+          "deposit_type",
+          "deposit_amount_minor",
+          "deposit_percentage_bps"
+        ],
+        "type": "object"
+      },
+      "ServiceSectionDetailsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "section": {
+            "$ref": "#/components/schemas/ServiceSectionItem"
+          },
+          "services": {
+            "items": {
+              "$ref": "#/components/schemas/ManagedServiceItem"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "section",
+          "services"
+        ],
+        "type": "object"
+      },
+      "ServiceSectionItem": {
+        "additionalProperties": false,
+        "properties": {
+          "cover_image_url": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "service_count": {
+            "type": "integer"
+          },
+          "updated_label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "id",
+          "name",
+          "description",
+          "service_count",
+          "updated_label"
+        ],
+        "type": "object"
+      },
+      "ServiceShortNoticeRule": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "surcharge_amount_minor": {
+            "description": "Quoted exact minor-unit integer in the business currency.",
+            "pattern": "^-?[0-9]+$",
+            "type": "string"
+          },
+          "surcharge_percentage_bps": {
+            "type": "integer"
+          },
+          "surcharge_type": {
+            "type": "string"
+          },
+          "threshold_minutes": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "threshold_minutes",
+          "surcharge_type",
+          "surcharge_amount_minor",
+          "surcharge_percentage_bps"
+        ],
+        "type": "object"
+      },
+      "ServiceVirtualDelivery": {
+        "additionalProperties": false,
+        "properties": {
+          "instructions": {
+            "type": "string"
+          },
+          "join_url": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "join_url",
+          "instructions"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "ProviderSession": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Existing REST amounts remain minor-unit strings. MCP decimal amounts are converted exactly. Mutations require receipts and optimistic revision preconditions.",
+    "title": "Tellbook catalog and provider integrations",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/.well-known/oauth-authorization-server": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "summary": "OAuth discovery"
+      }
+    },
+    "/.well-known/oauth-protected-resource/mcp/chatgpt": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "summary": "OAuth discovery"
+      }
+    },
+    "/.well-known/oauth-protected-resource/mcp/claude": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "summary": "OAuth discovery"
+      }
+    },
+    "/oauth/authorize": {
+      "get": {
+        "parameters": [
+          {
+            "in": "query",
+            "name": "response_type",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "client_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "redirect_uri",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resource",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scope",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "code_challenge",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "code_challenge_method",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "Browser consent or validated callback error"
+          },
+          "400": {
+            "description": "Invalid platform/callback"
+          }
+        },
+        "summary": "Begin code + S256 PKCE + configured CIMD authorization"
+      }
+    },
+    "/oauth/revoke": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "client_id": {
+                    "type": "string"
+                  },
+                  "code": {
+                    "type": "string"
+                  },
+                  "code_verifier": {
+                    "type": "string"
+                  },
+                  "grant_type": {
+                    "type": "string"
+                  },
+                  "redirect_uri": {
+                    "type": "string"
+                  },
+                  "refresh_token": {
+                    "type": "string"
+                  },
+                  "resource": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "type": "string"
+                  },
+                  "token": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "summary": "Public-client form-encoded OAuth; no client secret"
+      }
+    },
+    "/oauth/token": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "client_id": {
+                    "type": "string"
+                  },
+                  "code": {
+                    "type": "string"
+                  },
+                  "code_verifier": {
+                    "type": "string"
+                  },
+                  "grant_type": {
+                    "type": "string"
+                  },
+                  "redirect_uri": {
+                    "type": "string"
+                  },
+                  "refresh_token": {
+                    "type": "string"
+                  },
+                  "resource": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "type": "string"
+                  },
+                  "token": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "summary": "Public-client form-encoded OAuth; no client secret"
+      }
+    },
+    "/v1/app/catalog-receipts/{id}": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "type": "object"
+                    },
+                    "operation": {
+                      "type": "string"
+                    },
+                    "receipt_id": {
+                      "format": "uuid",
+                      "type": "string"
+                    },
+                    "resource_id": {
+                      "type": "string"
+                    },
+                    "revision": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "receipt_id",
+                    "operation",
+                    "resource_id",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Read an owned mutation receipt"
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "format": "uuid",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/v1/app/integrations/authorization-requests/{id}": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsentRequest"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Bind pending consent to signed-in account"
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "format": "uuid",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsentDecision"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "redirect_uri": {
+                      "format": "uri",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "redirect_uri"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Approve selected scopes or deny; CSRF required"
+      }
+    },
+    "/v1/app/integrations/connections": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Connections"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "List account connections"
+      }
+    },
+    "/v1/app/integrations/connections/{id}": {
+      "delete": {
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Immediately revoke an owned connection"
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "format": "uuid",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/v1/app/service-sections": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "items": {
+                      "items": {
+                        "$ref": "#/components/schemas/ServiceSectionItem"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "items"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "List owned sections"
+      },
+      "post": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditableCreateServiceSectionInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceSectionItem"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Create section"
+      }
+    },
+    "/v1/app/service-sections/reorder": {
+      "put": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReorderItemsInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Reorder owned sections with a revision for every item"
+      }
+    },
+    "/v1/app/service-sections/{id}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Quoted revision returned by the last read.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "mode",
+            "required": true,
+            "schema": {
+              "enum": [
+                "move",
+                "uncategorized"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required for move; must be another owned section.",
+            "in": "query",
+            "name": "target_section_id",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Preserve services by moving or uncategorizing them"
+      },
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceSectionDetailsResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Read owned section"
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "format": "uuid",
+            "type": "string"
+          }
+        }
+      ],
+      "patch": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Quoted revision returned by the last read.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SectionPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceSectionItem"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Merge supplied section fields"
+      },
+      "put": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Quoted revision returned by the last read.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditableCreateServiceSectionInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceSectionItem"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Replace section fields"
+      }
+    },
+    "/v1/app/service-sections/{id}/services/reorder": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "format": "uuid",
+            "type": "string"
+          }
+        }
+      ],
+      "put": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Quoted revision returned by the last read.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReorderItemsInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Reorder section services with section and item revisions"
+      }
+    },
+    "/v1/app/services": {
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "items": {
+                      "items": {
+                        "$ref": "#/components/schemas/ManagedServiceItem"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "items"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "List owned services"
+      },
+      "post": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditableCreateManagedServiceInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedServiceItem"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Create draft service"
+      }
+    },
+    "/v1/app/services/uncategorized/reorder": {
+      "put": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReorderItemsInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Reorder uncategorized services with item revisions"
+      }
+    },
+    "/v1/app/services/{id}": {
+      "delete": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Quoted revision returned by the last read.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Delete service; booking dependencies may block deletion"
+      },
+      "get": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedServiceItem"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Read owned service"
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "format": "uuid",
+            "type": "string"
+          }
+        }
+      ],
+      "patch": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Quoted revision returned by the last read.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServicePatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedServiceItem"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Merge supplied fields; arrays replace"
+      },
+      "put": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Quoted revision returned by the last read.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditableCreateManagedServiceInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedServiceItem"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Replace service fields; publication is preserved"
+      }
+    },
+    "/v1/app/services/{id}/duplicate": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "format": "uuid",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Quoted revision returned by the last read.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedServiceItem"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Duplicate to draft"
+      }
+    },
+    "/v1/app/services/{id}/status": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "format": "uuid",
+            "type": "string"
+          }
+        }
+      ],
+      "patch": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Quoted revision returned by the last read.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "draft",
+                      "published",
+                      "paused"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "status"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedServiceItem"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Explicit publication action"
+      }
+    },
+    "/v1/app/services/{id}/visibility": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "format": "uuid",
+            "type": "string"
+          }
+        }
+      ],
+      "patch": {
+        "parameters": [
+          {
+            "description": "Reuse for an identical retry; changed input with the same key conflicts.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          {
+            "description": "Quoted revision returned by the last read.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "is_hidden": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "is_hidden"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedServiceItem"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Permission denied"
+          },
+          "404": {
+            "description": "Owned resource not found"
+          },
+          "409": {
+            "description": "Revision, idempotency, collection or dependency conflict"
+          }
+        },
+        "security": [
+          {
+            "ProviderSession": []
+          }
+        ],
+        "summary": "Set hidden visibility"
+      }
+    }
+  }
+}

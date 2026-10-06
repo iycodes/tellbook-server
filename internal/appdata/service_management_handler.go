@@ -27,72 +27,11 @@ func (h *Handler) listServiceSections(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) createServiceSection(w http.ResponseWriter, r *http.Request) {
-	authedClient, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "You must be signed in.")
-		return
-	}
-
-	input, err := decodeJSON[CreateServiceSectionInput](r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	if !h.validOptionalOwnedPublicImage(authedClient.ID, input.CoverImageURL, "sections") {
-		writeError(w, http.StatusBadRequest, "invalid_section_image", "Upload the section image before saving it.")
-		return
-	}
-
-	item, err := h.repo.CreateServiceSection(r.Context(), authedClient.ID, input)
-	if err != nil {
-		if errors.Is(err, ErrServiceSectionLimitReached) {
-			writeError(w, http.StatusConflict, "service_section_limit_reached", "You can create up to 25 service sections.")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "create_service_section_failed", err.Error())
-		return
-	}
-
-	item.CoverImageURL = h.signedMediaURL(r.Context(), item.CoverImageURL)
-	writeJSON(w, http.StatusCreated, item)
+	h.catalogREST(w, r, "create_service_section")
 }
 
 func (h *Handler) updateServiceSection(w http.ResponseWriter, r *http.Request) {
-	authedClient, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "You must be signed in.")
-		return
-	}
-
-	sectionID, err := uuidFromURLParam("sectionID", r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_section_id", "Section ID is invalid.")
-		return
-	}
-
-	input, err := decodeJSON[UpdateServiceSectionInput](r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	if !h.validOptionalOwnedPublicImage(authedClient.ID, input.CoverImageURL, "sections") {
-		writeError(w, http.StatusBadRequest, "invalid_section_image", "Upload the section image before saving it.")
-		return
-	}
-
-	item, err := h.repo.UpdateServiceSection(r.Context(), authedClient.ID, sectionID, input)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeError(w, http.StatusNotFound, "service_section_not_found", "Section was not found.")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "update_service_section_failed", err.Error())
-		return
-	}
-	h.deleteReplacedPublicImage(r.Context(), authedClient.ID, item.replacedImageURL, input.CoverImageURL, "sections")
-
-	item.CoverImageURL = h.signedMediaURL(r.Context(), item.CoverImageURL)
-	writeJSON(w, http.StatusOK, item)
+	h.catalogREST(w, r, "replace_service_section")
 }
 
 func (h *Handler) getServiceSectionDetails(w http.ResponseWriter, r *http.Request) {
@@ -108,7 +47,7 @@ func (h *Handler) getServiceSectionDetails(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	response, err := h.repo.GetServiceSectionDetails(r.Context(), authedClient.ID, sectionID)
+	response, err := h.readSectionForREST(r.Context(), authedClient.ID, sectionID)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "service_section_not_found", "Section was not found.")
@@ -123,66 +62,11 @@ func (h *Handler) getServiceSectionDetails(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *Handler) deleteServiceSection(w http.ResponseWriter, r *http.Request) {
-	authedClient, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "You must be signed in.")
-		return
-	}
-
-	sectionID, err := uuidFromURLParam("sectionID", r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_section_id", "Section ID is invalid.")
-		return
-	}
-
-	input := DeleteServiceSectionInput{
-		Mode:            r.URL.Query().Get("mode"),
-		TargetSectionID: r.URL.Query().Get("target_section_id"),
-	}
-
-	coverImageURL, err := h.repo.DeleteServiceSection(r.Context(), authedClient.ID, sectionID, input)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeError(w, http.StatusNotFound, "service_section_not_found", "Section was not found.")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "delete_service_section_failed", err.Error())
-		return
-	}
-	h.deleteReplacedPublicImage(r.Context(), authedClient.ID, coverImageURL, "", "sections")
-
-	w.WriteHeader(http.StatusNoContent)
+	h.catalogREST(w, r, "delete_service_section")
 }
 
 func (h *Handler) reorderServiceSections(w http.ResponseWriter, r *http.Request) {
-	authedClient, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "You must be signed in.")
-		return
-	}
-
-	input, err := decodeJSON[ReorderItemsInput](r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-
-	orderedIDs, err := parseOrderedUUIDs(input.OrderedIDs)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_ordered_ids", err.Error())
-		return
-	}
-
-	if err := h.repo.ReorderServiceSections(r.Context(), authedClient.ID, orderedIDs); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeError(w, http.StatusNotFound, "service_section_not_found", "A section was not found.")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "reorder_service_sections_failed", err.Error())
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
+	h.catalogREST(w, r, "reorder_service_sections")
 }
 
 func (h *Handler) listManagedServices(w http.ResponseWriter, r *http.Request) {
@@ -203,118 +87,15 @@ func (h *Handler) listManagedServices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) createManagedService(w http.ResponseWriter, r *http.Request) {
-	authedClient, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "You must be signed in.")
-		return
-	}
-	if !h.requireClientMarket(w, r, authedClient.ID) {
-		return
-	}
-
-	input, err := decodeJSON[CreateManagedServiceInput](r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	if !h.validOptionalOwnedPublicImage(authedClient.ID, input.ImageURL, "services") {
-		writeError(w, http.StatusBadRequest, "invalid_service_image", "Upload the service image before saving it.")
-		return
-	}
-
-	item, err := h.repo.CreateManagedService(r.Context(), authedClient.ID, input)
-	if err != nil {
-		if errors.Is(err, ErrServiceLimitReached) {
-			writeError(w, http.StatusConflict, "service_limit_reached", "You can create up to 100 services.")
-			return
-		}
-		if errors.Is(err, ErrNotFound) {
-			writeError(w, http.StatusNotFound, "service_section_not_found", "Selected section was not found.")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "create_service_failed", err.Error())
-		return
-	}
-
-	item.ImageURL = h.signedMediaURL(r.Context(), item.ImageURL)
-	writeJSON(w, http.StatusCreated, item)
+	h.catalogREST(w, r, "create_service")
 }
 
 func (h *Handler) updateManagedService(w http.ResponseWriter, r *http.Request) {
-	authedClient, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "You must be signed in.")
-		return
-	}
-	if !h.requireClientMarket(w, r, authedClient.ID) {
-		return
-	}
-
-	serviceID, err := uuidFromURLParam("serviceID", r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_service_id", "Service ID is invalid.")
-		return
-	}
-
-	input, err := decodeJSON[CreateManagedServiceInput](r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	if !h.validOptionalOwnedPublicImage(authedClient.ID, input.ImageURL, "services") {
-		writeError(w, http.StatusBadRequest, "invalid_service_image", "Upload the service image before saving it.")
-		return
-	}
-
-	item, err := h.repo.UpdateManagedService(r.Context(), authedClient.ID, serviceID, input)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeError(w, http.StatusNotFound, "service_not_found", "Service or section was not found.")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "update_service_failed", err.Error())
-		return
-	}
-	h.deleteReplacedPublicImage(r.Context(), authedClient.ID, item.replacedImageURL, input.ImageURL, "services")
-
-	item.ImageURL = h.signedMediaURL(r.Context(), item.ImageURL)
-	writeJSON(w, http.StatusOK, item)
+	h.catalogREST(w, r, "replace_service")
 }
 
 func (h *Handler) updateManagedServiceVisibility(w http.ResponseWriter, r *http.Request) {
-	authedClient, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "You must be signed in.")
-		return
-	}
-	if !h.requireClientMarket(w, r, authedClient.ID) {
-		return
-	}
-
-	serviceID, err := uuidFromURLParam("serviceID", r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_service_id", "Service ID is invalid.")
-		return
-	}
-
-	input, err := decodeJSON[UpdateManagedServiceVisibilityInput](r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-
-	item, err := h.repo.UpdateManagedServiceVisibility(r.Context(), authedClient.ID, serviceID, input.IsHidden)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeError(w, http.StatusNotFound, "service_not_found", "Service was not found.")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "update_service_visibility_failed", err.Error())
-		return
-	}
-
-	item.ImageURL = h.signedMediaURL(r.Context(), item.ImageURL)
-	writeJSON(w, http.StatusOK, item)
+	h.catalogREST(w, r, "set_service_visibility")
 }
 
 func (h *Handler) getManagedServiceDetails(w http.ResponseWriter, r *http.Request) {
@@ -330,7 +111,7 @@ func (h *Handler) getManagedServiceDetails(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	item, err := h.repo.GetManagedServiceDetails(r.Context(), authedClient.ID, serviceID)
+	item, err := h.readManagedServiceForREST(r.Context(), authedClient.ID, serviceID)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "service_not_found", "Service was not found.")
@@ -345,98 +126,15 @@ func (h *Handler) getManagedServiceDetails(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *Handler) deleteManagedService(w http.ResponseWriter, r *http.Request) {
-	authedClient, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "You must be signed in.")
-		return
-	}
-
-	serviceID, err := uuidFromURLParam("serviceID", r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_service_id", "Service ID is invalid.")
-		return
-	}
-
-	imageURL, err := h.repo.DeleteManagedService(r.Context(), authedClient.ID, serviceID)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeError(w, http.StatusNotFound, "service_not_found", "Service was not found.")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "delete_service_failed", "Could not delete service.")
-		return
-	}
-	h.deleteReplacedPublicImage(r.Context(), authedClient.ID, imageURL, "", "services")
-
-	w.WriteHeader(http.StatusNoContent)
+	h.catalogREST(w, r, "delete_service")
 }
 
 func (h *Handler) reorderSectionServices(w http.ResponseWriter, r *http.Request) {
-	authedClient, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "You must be signed in.")
-		return
-	}
-
-	sectionID, err := uuidFromURLParam("sectionID", r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_section_id", "Section ID is invalid.")
-		return
-	}
-
-	input, err := decodeJSON[ReorderItemsInput](r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-
-	orderedIDs, err := parseOrderedUUIDs(input.OrderedIDs)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_ordered_ids", err.Error())
-		return
-	}
-
-	if err := h.repo.ReorderSectionServices(r.Context(), authedClient.ID, sectionID, orderedIDs); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeError(w, http.StatusNotFound, "service_not_found", "A service was not found.")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "reorder_services_failed", err.Error())
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
+	h.catalogREST(w, r, "reorder_section_services")
 }
 
 func (h *Handler) reorderUncategorizedServices(w http.ResponseWriter, r *http.Request) {
-	authedClient, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "You must be signed in.")
-		return
-	}
-
-	input, err := decodeJSON[ReorderItemsInput](r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-
-	orderedIDs, err := parseOrderedUUIDs(input.OrderedIDs)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_ordered_ids", err.Error())
-		return
-	}
-
-	if err := h.repo.ReorderUncategorizedServices(r.Context(), authedClient.ID, orderedIDs); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeError(w, http.StatusNotFound, "service_not_found", "A service was not found.")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "reorder_uncategorized_services_failed", err.Error())
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
+	h.catalogREST(w, r, "reorder_uncategorized_services")
 }
 
 func parseOrderedUUIDs(values []string) ([]uuid.UUID, error) {
@@ -455,35 +153,5 @@ func parseOrderedUUIDs(values []string) ([]uuid.UUID, error) {
 }
 
 func (h *Handler) duplicateManagedService(w http.ResponseWriter, r *http.Request) {
-	authedClient, ok := auth.UserFromContext(r.Context())
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized", "You must be signed in.")
-		return
-	}
-	if !h.requireClientMarket(w, r, authedClient.ID) {
-		return
-	}
-
-	serviceID, err := uuidFromURLParam("serviceID", r)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_service_id", "Service ID is invalid.")
-		return
-	}
-
-	item, err := h.repo.DuplicateManagedService(r.Context(), authedClient.ID, serviceID)
-	if err != nil {
-		if errors.Is(err, ErrServiceLimitReached) {
-			writeError(w, http.StatusConflict, "service_limit_reached", "You can create up to 100 services.")
-			return
-		}
-		if errors.Is(err, ErrNotFound) {
-			writeError(w, http.StatusNotFound, "service_not_found", "Service was not found.")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "duplicate_service_failed", "Could not duplicate service.")
-		return
-	}
-
-	item.ImageURL = h.signedMediaURL(r.Context(), item.ImageURL)
-	writeJSON(w, http.StatusCreated, item)
+	h.catalogREST(w, r, "duplicate_service")
 }

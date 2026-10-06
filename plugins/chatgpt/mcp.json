@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "tellbook": {
+      "type": "streamable-http",
+      "url": "https://api.tellbook.app/mcp/chatgpt"
+    }
+  }
+}

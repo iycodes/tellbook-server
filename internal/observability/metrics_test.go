@@ -6,7 +6,25 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestIntegrationRetriesDoNotAddLatencySamples(t *testing.T) {
+	metrics := New()
+	metrics.ObserveIntegration("chatgpt", "update_service", "retry", 0)
+	metrics.ObserveIntegration("chatgpt", "update_service", "success", 200*time.Millisecond)
+	recorder := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/internal/metrics", nil))
+	for _, want := range []string{
+		`tellbook_integrations_outcomes_total{operation="update_service",outcome="retry",platform="chatgpt"} 1`,
+		`tellbook_integrations_duration_seconds_count{operation="update_service",platform="chatgpt"} 1`,
+		`tellbook_integrations_duration_seconds_sum{operation="update_service",platform="chatgpt"} 0.2`,
+	} {
+		if !strings.Contains(recorder.Body.String(), want) {
+			t.Fatalf("missing metric %s", want)
+		}
+	}
+}
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 

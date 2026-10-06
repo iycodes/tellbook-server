@@ -192,7 +192,8 @@ make tessa-local-capacity
 
 The conformance suite covers canonical tools, Nigerian English and Pidgin, date handling,
 clarification, out-of-scope prompts, prompt exfiltration, untrusted tool evidence, and empty results.
-The capacity gate defaults to six complete factual turns at concurrency two. Every measured turn
+The capacity gate defaults to the configured Tessa worker concurrency and three factual turns
+per concurrent worker (six turns at the default concurrency of two). Every measured turn
 includes planning and synthesis and uses the running API's model, sampling, input/output, request
 timeout, and total-turn settings. It fails above a 45-second p95. Set
 `TESSA_LOCAL_CAPACITY_CONCURRENCY` to `TESSA_AI_WORKER_CONCURRENCY`; increase the turn count for a

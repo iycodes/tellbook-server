@@ -1,0 +1,39 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "tellbook",
+  "version": "0.1.1",
+  "description": "Manage your Tellbook service catalog from a conversation: find services, edit drafts, organize sections, and explicitly publish or pause services.",
+  "author": {
+    "name": "Tellbook",
+    "url": "https://tellbook.app"
+  },
+  "license": "LicenseRef-Tellbook-Private-Beta",
+  "keywords": [
+    "tellbook",
+    "services",
+    "catalog"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Tellbook",
+        "shortDescription": "Manage your Tellbook services",
+        "longDescription": "Connect your Tellbook provider account to read services and sections, create and edit drafts, organize your catalog, and explicitly publish, pause, hide, or delete services. Choose read, edit, publication, and deletion permissions independently. Private beta.",
+        "developerName": "Tellbook",
+        "category": "Productivity",
+        "capabilities": [
+          "Read",
+          "Write"
+        ],
+        "websiteURL": "https://tellbook.app",
+        "logo": "./assets/logo.png",
+        "brandColor": "#047857",
+        "defaultPrompt": [
+          "List my Tellbook services.",
+          "Create a draft consultation service.",
+          "Pause my business consultation service."
+        ]
+      }
+    }
+  }
+}

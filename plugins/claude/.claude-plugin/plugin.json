@@ -1,0 +1,11 @@
+{
+  "name": "tellbook",
+  "displayName": "Tellbook",
+  "version": "0.1.1",
+  "description": "Manage a connected Tellbook service catalog: read services, edit drafts, organize sections, and explicitly publish, pause, hide, or delete services.",
+  "author": {
+    "name": "Tellbook",
+    "url": "https://tellbook.app"
+  },
+  "license": "LicenseRef-Tellbook-Private-Beta"
+}

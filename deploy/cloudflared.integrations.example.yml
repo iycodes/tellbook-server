@@ -1,0 +1,12 @@
+# Replace tunnel ID and credential path; keep the credential JSON outside the repo.
+tunnel: TUNNEL_ID
+credentials-file: /absolute/private/path/tunnel-credentials.json
+ingress:
+  - hostname: tellbook-beta-api.iycodes.com
+    service: http://127.0.0.1:18200
+  - hostname: tellbook-beta.iycodes.com
+    path: ^/v1(/.*)?$
+    service: http://127.0.0.1:18200
+  - hostname: tellbook-beta.iycodes.com
+    service: http://127.0.0.1:15275
+  - service: http_status:404

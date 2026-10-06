@@ -17,6 +17,7 @@ import (
 	"net/textproto"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type Config struct {
@@ -34,12 +35,14 @@ type Config struct {
 }
 
 type Message struct {
-	ToEmail   string
-	ToName    string
-	Subject   string
-	Text      string
-	HTML      string
-	MessageID string
+	ToEmail      string
+	ToName       string
+	Subject      string
+	Text         string
+	HTML         string
+	MessageID    string
+	ReplyToEmail string
+	ReplyToName  string
 }
 
 type TransportDisposition string
@@ -171,7 +174,9 @@ func (m *SMTPMailer) Send(ctx context.Context, message Message) error {
 		return permanentTransportError("content", errors.New("message subject is required"), false)
 	}
 	if !validHeaderValue(subject) || !validHeaderValue(message.ToName) ||
-		!validHeaderValue(toEmail) || !validHeaderValue(message.MessageID) {
+		!validHeaderValue(toEmail) || !validHeaderValue(message.MessageID) ||
+		!validHeaderValue(message.ReplyToName) ||
+		(message.ReplyToEmail != "" && !ValidMailbox(message.ReplyToEmail)) {
 		return permanentTransportError("content", errors.New("message headers contain invalid characters"), false)
 	}
 
@@ -290,6 +295,16 @@ func (m *SMTPMailer) connect(ctx context.Context) (*smtpSession, error) {
 			return nil, err
 		}
 	}
+	// SMTP greeting, STARTTLS and AUTH also need a deadline. A dial timeout alone
+	// does not bound these operations when a server accepts TCP then stops responding.
+	deadline := time.Now().Add(m.cfg.ConnectTimeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	client, err := smtp.NewClient(conn, m.cfg.Host)
 	if err != nil {
 		_ = conn.Close()
@@ -369,6 +384,10 @@ func buildMessage(cfg Config, message Message) []byte {
 	buffer.WriteString("MIME-Version: 1.0\r\n")
 	buffer.WriteString(fmt.Sprintf("From: %s\r\n", fromValue))
 	buffer.WriteString(fmt.Sprintf("To: %s\r\n", toValue))
+	if message.ReplyToEmail != "" {
+		replyTo := (&mail.Address{Name: strings.TrimSpace(message.ReplyToName), Address: message.ReplyToEmail}).String()
+		buffer.WriteString(fmt.Sprintf("Reply-To: %s\r\n", replyTo))
+	}
 	buffer.WriteString(fmt.Sprintf("Subject: %s\r\n", mime.QEncoding.Encode("UTF-8", strings.TrimSpace(message.Subject))))
 	if messageID := strings.TrimSpace(message.MessageID); messageID != "" {
 		buffer.WriteString(fmt.Sprintf("Message-ID: %s\r\n", messageID))
@@ -408,5 +427,5 @@ func writeQuotedPrintable(writer io.Writer, value string) {
 }
 
 func validHeaderValue(value string) bool {
-	return !strings.ContainsAny(value, "\r\n")
+	return strings.IndexFunc(value, unicode.IsControl) == -1
 }

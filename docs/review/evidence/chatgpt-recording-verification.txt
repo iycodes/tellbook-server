@@ -1,0 +1,48 @@
+BEGIN
+ receipts | unique_receipts | correct_provider_and_platform 
+----------+-----------------+-------------------------------
+       11 |              11 | t
+(1 row)
+
+                  id                  |       operation        |             resource_id              | revision |  status   | hidden | price_minor 
+--------------------------------------+------------------------+--------------------------------------+----------+-----------+--------+-------------
+ 109fcbbb-b55b-4fd8-8eab-a39f05455e31 | create_service         | 3f0fa4ea-2093-48cb-81fc-c59cec3b069c | 1        | draft     | false  | 250050
+ b0625b53-cdf8-4537-887b-97c17f15cc2f | update_service         | 3f0fa4ea-2093-48cb-81fc-c59cec3b069c | 2        | draft     | false  | 250050
+ 825b58e6-69ff-407b-bafe-ae6cdd98a47e | create_service_section | 67a65129-a768-4dbc-a80d-ff107ef2e20a | 1        |           |        | 
+ 6e6b3a72-a8fa-488f-bc6a-e339243c1ceb | update_service         | 3f0fa4ea-2093-48cb-81fc-c59cec3b069c | 3        | draft     | false  | 250050
+ c2d6efcd-4240-4cae-a78b-34a906b51b20 | set_service_visibility | 3f0fa4ea-2093-48cb-81fc-c59cec3b069c | 4        | draft     | true   | 250050
+ 33f77165-c4fb-4463-a243-aaccb6bbf894 | update_service_section | 67a65129-a768-4dbc-a80d-ff107ef2e20a | 3        |           |        | 
+ 033dc98b-5c32-40c5-a167-c0fba732d085 | set_service_status     | 3f0fa4ea-2093-48cb-81fc-c59cec3b069c | 6        | published | true   | 250050
+ ed9c4721-74b3-4a93-aca8-6f6da23215ac | set_service_status     | 3f0fa4ea-2093-48cb-81fc-c59cec3b069c | 7        | paused    | true   | 250050
+ d88c458b-a966-459a-9ce9-cd7c4a7518e0 | set_service_status     | 3f0fa4ea-2093-48cb-81fc-c59cec3b069c | 8        | draft     | true   | 250050
+ ce1e22c1-8c63-4263-9ebd-b982fa6f79bc | delete_service_section | 67a65129-a768-4dbc-a80d-ff107ef2e20a |          |           |        | 
+ 34fd1c98-7856-4daf-916b-c4df52e51744 | delete_service         | 3f0fa4ea-2093-48cb-81fc-c59cec3b069c |          |           |        | 
+(11 rows)
+
+              client_id               |                  id                  |         title         | revision |  status   | is_hidden | currency_code | price_amount_minor | duration_minutes |              section_id              
+--------------------------------------+--------------------------------------+-----------------------+----------+-----------+-----------+---------------+--------------------+------------------+--------------------------------------
+ 8d8ab3bf-07de-460e-8f68-bf7379cc700c | d6e644e4-2fa3-4c1b-b31a-dbe9190d9036 | Business consultation |        1 | published | f         | NGN           |             250000 |               45 | 58bc6f21-5780-48e2-a61a-947c60f13773
+ 8d8ab3bf-07de-460e-8f68-bf7379cc700c | 55edc874-44f5-4d08-b13a-837bea410ebb | Design consultation   |        1 | published | f         | NGN           |             250000 |               45 | 58bc6f21-5780-48e2-a61a-947c60f13773
+ 8d8ab3bf-07de-460e-8f68-bf7379cc700c | 64af7f74-bde4-455f-87c9-7689ffa25130 | Draft consultation    |        1 | draft     | f         | NGN           |             250000 |               45 | 58bc6f21-5780-48e2-a61a-947c60f13773
+ cd201675-6d44-4223-a15e-5beaa7789b40 | 3d1415f4-3906-4a4e-bebe-a840329746b7 | Business consultation |        1 | published | f         | NGN           |             250000 |               45 | 54fd94c8-a484-4531-af2a-d127488f39e7
+ cd201675-6d44-4223-a15e-5beaa7789b40 | 9578997d-a1bf-44d3-b18d-059c0408f682 | Design consultation   |        1 | published | f         | NGN           |             250000 |               45 | 54fd94c8-a484-4531-af2a-d127488f39e7
+ cd201675-6d44-4223-a15e-5beaa7789b40 | e22e4944-dc56-4e53-8c3b-69aacd1fc049 | Draft consultation    |        3 | draft     | f         | NGN           |             250000 |               45 | 54fd94c8-a484-4531-af2a-d127488f39e7
+(6 rows)
+
+              client_id               |                  id                  |     name      | revision 
+--------------------------------------+--------------------------------------+---------------+----------
+ 8d8ab3bf-07de-460e-8f68-bf7379cc700c | 58bc6f21-5780-48e2-a61a-947c60f13773 | Consultations |        4
+ cd201675-6d44-4223-a15e-5beaa7789b40 | 54fd94c8-a484-4531-af2a-d127488f39e7 | Consultations |       10
+(2 rows)
+
+ disposable_services_remaining | disposable_sections_remaining 
+-------------------------------+-------------------------------
+                             0 |                             0
+(1 row)
+
+              client_id               | currency_code 
+--------------------------------------+---------------
+ cd201675-6d44-4223-a15e-5beaa7789b40 | NGN
+(1 row)
+
+COMMIT

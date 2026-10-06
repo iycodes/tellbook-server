@@ -9,218 +9,207 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"booking/go-server/internal/mailer"
 	"booking/go-server/internal/secure"
 	"booking/go-server/internal/tessaconfig"
 	"github.com/google/uuid"
 )
 
 type Config struct {
-	AppEnv                                string
-	ProcessRole                           string
-	HTTPAddr                              string
-	SSEMaxConnections                     int
-	SSEMaxConnectionsPerIP                int
-	PaymentSSEMaxConnectionsPerToken      int
-	ClientPublicBaseURL                   string
-	MarketplacePublicBaseURL              string
-	DefaultAIProvider                     string
-	AgreementAIProvider                   string
-	InboxAIDraftsEnabled                  bool
-	InboxAIProviderAllowlist              []string
-	InboxAIAutomationEnabled              bool
-	InboxAIAutomationProviderAllowlist    []string
-	InboxAIMaxConcurrency                 int
-	InboxAISemiPilotReplyDelay            time.Duration
-	InboxAIAutopilotPaymentWindow         time.Duration
-	TessaAIEnabled                        bool
-	TessaWhatsAppLinkingEnabled           bool
-	TessaWhatsAppConversationsEnabled     bool
-	TessaAIPrimaryProvider                string
-	TessaAIFallbackProvider               string
-	TessaAIPrimaryRequestTimeout          time.Duration
-	TessaAIFallbackRequestTimeout         time.Duration
-	TessaAITurnTimeout                    time.Duration
-	TessaAIWorkerConcurrency              int
-	TessaAIMaxInputTokens                 int
-	TessaAIMaxOutputTokens                int
-	TessaAINoticeRevision                 string
-	TessaAIExternalProcessingApproved     bool
-	HostedAIProvider                      string
-	LLMBaseURL                            string
-	LLMChatCompletions                    string
-	LLMModel                              string
-	LLMAPIKey                             string
-	LLMTimeout                            time.Duration
-	LLMMaxOutputTokens                    int
-	LLMTemperature                        float64
-	LLMTopP                               float64
-	LLMTopK                               int
-	LLMMinP                               float64
-	LLMPresencePenalty                    float64
-	LLMRepetitionPenalty                  float64
-	SelfHostedThinking                    bool
-	OpenAIBaseURL                         string
-	OpenAIModel                           string
-	OpenAIAPIKey                          string
-	OpenAIReasoningEffort                 string
-	OpenAITimeout                         time.Duration
-	OpenAIMaxOutputTokens                 int64
-	OpenAIResponseLogFile                 string
-	OpenAICompatBaseURL                   string
-	OpenAICompatChatCompletions           string
-	OpenAICompatModel                     string
-	OpenAICompatAPIKey                    string
-	OpenAICompatTimeout                   time.Duration
-	OpenAICompatMaxOutputTokens           int
-	OpenAICompatTokenLimitField           string
-	OpenAICompatTemperature               *float64
-	OpenAICompatTopP                      *float64
-	HTTPRateLimitPerMinute                int
-	HTTPRateLimitBurst                    int
-	AIRateLimitPerMinute                  int
-	AIRateLimitBurst                      int
-	LocationRateLimitPerMinute            int
-	LocationRateLimitBurst                int
-	MarketplaceAuthRateLimitPerMinute     int
-	MarketplaceAuthRateLimitBurst         int
-	RedisURL                              string
-	RedisKeyPrefix                        string
-	RedisKeyHMACSecret                    string
-	RedisPoolSize                         int
-	RedisMinIdleConnections               int
-	RedisDialTimeout                      time.Duration
-	RedisReadTimeout                      time.Duration
-	RedisWriteTimeout                     time.Duration
-	RedisPoolTimeout                      time.Duration
-	RedisMaxPayloadBytes                  int
-	RedisFallbackMaxConcurrency           int
-	RateLimitIPCeilingMultiplier          int
-	MetricsAuthToken                      string
-	HTTPSuccessLogSampleRate              float64
-	HTTPSlowRequestThreshold              time.Duration
-	GoogleMapsServerAPIKey                string
-	DatabaseURL                           string
-	DatabaseDirectURL                     string
-	DatabaseMaxConnections                int32
-	DatabaseMinConnections                int32
-	DatabaseDirectMaxConnections          int32
-	DatabaseMaxConnectionLifetime         time.Duration
-	DatabaseMaxConnectionLifetimeJitter   time.Duration
-	DatabaseMaxConnectionIdleTime         time.Duration
-	DatabaseHealthCheckPeriod             time.Duration
-	DatabaseConnectTimeout                time.Duration
-	DatabaseStatementTimeout              time.Duration
-	DatabaseLockTimeout                   time.Duration
-	DatabaseIdleTransactionTimeout        time.Duration
-	CORSOrigins                           []string
-	TrustedProxyCIDRs                     []string
-	AuthIssuer                            string
-	AuthAccessTokenSecret                 string
-	AuthAccessTokenTTL                    time.Duration
-	AuthAccessCookieName                  string
-	AuthRefreshCookieName                 string
-	AuthCookieDomain                      string
-	AuthCookieSecure                      bool
-	AuthRefreshTokenTTL                   time.Duration
-	AuthBcryptCost                        int
-	AdminEnabled                          bool
-	AdminPublicURL                        string
-	AdminMFAEncryptionKeys                string
-	AdminMFAActiveKey                     string
-	AdditionalEmailsEnabled               bool
-	AuthEmailEnabled                      bool
-	AuthWhatsAppEnabled                   bool
-	AuthDeliveryEncryptionKeys            string
-	AuthDeliveryActiveKey                 string
-	AuthDestinationHMACKey                string
-	AuthDeliveryConcurrency               int
-	AuthDeliveryTimeout                   time.Duration
-	R2PrivateBucketName                   string
-	R2PublicBucketName                    string
-	R2AccountID                           string
-	R2Endpoint                            string
-	R2AccessKeyID                         string
-	R2SecretAccessKey                     string
-	R2PublicBucketBaseURL                 string
-	NotificationEmailEnabled              bool
-	NotificationEmailConcurrency          int
-	NotificationEmailTimeout              time.Duration
-	WelcomeEmailEnabled                   bool
-	WelcomeEmailConcurrency               int
-	WelcomeEmailTimeout                   time.Duration
-	NotificationWhatsAppEnabled           bool
-	WhatsAppWorkerConcurrency             int
-	NotificationPlannerConcurrency        int
-	NotificationDestinationHMACKey        string
-	MetaAppID                             string
-	MetaAppSecret                         string
-	MetaVerifyToken                       string
-	WABAToken                             string
-	WhatsAppBusinessAccountID             string
-	WABAPhoneNumberID                     string
-	WABABusinessPhoneE164                 string
-	WhatsAppGraphBaseURL                  string
-	WhatsAppGraphVersion                  string
-	WhatsAppHTTPTimeout                   time.Duration
-	WhatsAppEnabledTemplateKeys           []string
-	SMTPHost                              string
-	SMTPPort                              int
-	SMTPUsername                          string
-	SMTPPassword                          string
-	SMTPFromEmail                         string
-	SMTPFromName                          string
-	SMTPSecurity                          string
-	SMTPInsecureSkipVerify                bool
-	SMTPConnectTimeout                    time.Duration
-	PaystackSecretKey                     string
-	PaystackSecretKeyTest                 string
-	PaystackBaseURL                       string
-	PayazaPublicKey                       string
-	PayazaSecretKey                       string
-	PayazaPublicKeyTest                   string
-	PayazaSecretKeyTest                   string
-	PayazaBaseURL                         string
-	PayazaTransferPIN                     string
-	PayazaTransferPINTest                 string
-	PayazaSourceAccounts                  string
-	PayazaSourceAccountsTest              string
-	PayazaPayoutSenderName                string
-	PayazaPayoutSenderPhone               string
-	PayazaPayoutSenderAddress             string
-	PayazaNGNDVABankCode                  string
-	PayazaNGNDVAEnquiryBankCode           string
-	PayazaCardSandboxVerified             bool
-	PayazaCardProductionEnabled           bool
-	PayazaBankTransferSandboxVerified     bool
-	PayazaBankTransferProductionEnabled   bool
-	PayazaDestinationSandboxVerified      bool
-	PayazaDestinationProductionEnabled    bool
-	PayazaPayoutSandboxVerified           bool
-	PayazaPayoutProductionEnabled         bool
-	PaystackCardSandboxVerified           bool
-	PaystackCardProductionEnabled         bool
-	PaystackBankTransferSandboxVerified   bool
-	PaystackBankTransferProductionEnabled bool
-	PaystackDestinationSandboxVerified    bool
-	PaystackDestinationProductionEnabled  bool
-	PaystackPayoutSandboxVerified         bool
-	PaystackPayoutProductionEnabled       bool
-	PaystackPayoutOTPDisabled             bool
-	PaymentsEnvironment                   string
-	FinancialEncryptionKeys               string
-	FinancialActiveKey                    string
-	FinancialFingerprintKey               string
-	AgreementTokenEncryptionKeys          string
-	AgreementTokenActiveKey               string
-	ShutdownTimeout                       time.Duration
-	ReadTimeout                           time.Duration
-	ReadHeaderTimeout                     time.Duration
-	WriteTimeout                          time.Duration
-	IdleTimeout                           time.Duration
+	AppEnv                              string
+	ProcessRole                         string
+	HTTPAddr                            string
+	SSEMaxConnections                   int
+	SSEMaxConnectionsPerIP              int
+	PaymentSSEMaxConnectionsPerToken    int
+	ClientPublicBaseURL                 string
+	MarketplacePublicBaseURL            string
+	DefaultAIProvider                   string
+	AgreementAIProvider                 string
+	InboxAIDraftsEnabled                bool
+	InboxAIProviderAllowlist            []string
+	InboxAIAutomationEnabled            bool
+	InboxAIAutomationProviderAllowlist  []string
+	InboxAIMaxConcurrency               int
+	InboxAISemiPilotReplyDelay          time.Duration
+	InboxAIAutopilotPaymentWindow       time.Duration
+	TessaAIEnabled                      bool
+	TessaWhatsAppLinkingEnabled         bool
+	TessaWhatsAppConversationsEnabled   bool
+	TessaAIPrimaryProvider              string
+	TessaAIFallbackProvider             string
+	TessaAIPrimaryRequestTimeout        time.Duration
+	TessaAIFallbackRequestTimeout       time.Duration
+	TessaAITurnTimeout                  time.Duration
+	TessaAIWorkerConcurrency            int
+	TessaAIMaxInputTokens               int
+	TessaAIMaxOutputTokens              int
+	TessaAINoticeRevision               string
+	TessaAIExternalProcessingApproved   bool
+	HostedAIProvider                    string
+	LLMBaseURL                          string
+	LLMChatCompletions                  string
+	LLMModel                            string
+	LLMAPIKey                           string
+	LLMTimeout                          time.Duration
+	LLMMaxOutputTokens                  int
+	LLMTemperature                      float64
+	LLMTopP                             float64
+	LLMTopK                             int
+	LLMMinP                             float64
+	LLMPresencePenalty                  float64
+	LLMRepetitionPenalty                float64
+	SelfHostedThinking                  bool
+	OpenAIBaseURL                       string
+	OpenAIModel                         string
+	OpenAIAPIKey                        string
+	OpenAIReasoningEffort               string
+	OpenAITimeout                       time.Duration
+	OpenAIMaxOutputTokens               int64
+	OpenAIResponseLogFile               string
+	OpenAICompatBaseURL                 string
+	OpenAICompatChatCompletions         string
+	OpenAICompatModel                   string
+	OpenAICompatAPIKey                  string
+	OpenAICompatTimeout                 time.Duration
+	OpenAICompatMaxOutputTokens         int
+	OpenAICompatTokenLimitField         string
+	OpenAICompatTemperature             *float64
+	OpenAICompatTopP                    *float64
+	HTTPRateLimitPerMinute              int
+	HTTPRateLimitBurst                  int
+	AIRateLimitPerMinute                int
+	AIRateLimitBurst                    int
+	LocationRateLimitPerMinute          int
+	LocationRateLimitBurst              int
+	MarketplaceAuthRateLimitPerMinute   int
+	MarketplaceAuthRateLimitBurst       int
+	RedisURL                            string
+	RedisKeyPrefix                      string
+	RedisKeyHMACSecret                  string
+	RedisPoolSize                       int
+	RedisMinIdleConnections             int
+	RedisDialTimeout                    time.Duration
+	RedisReadTimeout                    time.Duration
+	RedisWriteTimeout                   time.Duration
+	RedisPoolTimeout                    time.Duration
+	RedisMaxPayloadBytes                int
+	RedisFallbackMaxConcurrency         int
+	RateLimitIPCeilingMultiplier        int
+	MetricsAuthToken                    string
+	HTTPSuccessLogSampleRate            float64
+	HTTPSlowRequestThreshold            time.Duration
+	GoogleMapsServerAPIKey              string
+	DatabaseURL                         string
+	DatabaseDirectURL                   string
+	DatabaseMaxConnections              int32
+	DatabaseMinConnections              int32
+	DatabaseDirectMaxConnections        int32
+	DatabaseMaxConnectionLifetime       time.Duration
+	DatabaseMaxConnectionLifetimeJitter time.Duration
+	DatabaseMaxConnectionIdleTime       time.Duration
+	DatabaseHealthCheckPeriod           time.Duration
+	DatabaseConnectTimeout              time.Duration
+	DatabaseStatementTimeout            time.Duration
+	DatabaseLockTimeout                 time.Duration
+	DatabaseIdleTransactionTimeout      time.Duration
+	CORSOrigins                         []string
+	TrustedProxyCIDRs                   []string
+	AuthIssuer                          string
+	AuthAccessTokenSecret               string
+	AuthAccessTokenTTL                  time.Duration
+	AuthAccessCookieName                string
+	AuthRefreshCookieName               string
+	AuthCookieDomain                    string
+	AuthCookieSecure                    bool
+	AuthRefreshTokenTTL                 time.Duration
+	AuthBcryptCost                      int
+	AdminEnabled                        bool
+	AdminPublicURL                      string
+	AdminMFAEncryptionKeys              string
+	AdminMFAActiveKey                   string
+	AdditionalEmailsEnabled             bool
+	AuthEmailEnabled                    bool
+	AuthWhatsAppEnabled                 bool
+	AuthDeliveryEncryptionKeys          string
+	AuthDeliveryActiveKey               string
+	AuthDestinationHMACKey              string
+	AuthDeliveryConcurrency             int
+	AuthDeliveryTimeout                 time.Duration
+	R2PrivateBucketName                 string
+	R2PublicBucketName                  string
+	R2AccountID                         string
+	R2Endpoint                          string
+	R2AccessKeyID                       string
+	R2SecretAccessKey                   string
+	R2PublicBucketBaseURL               string
+	NotificationEmailEnabled            bool
+	NotificationEmailConcurrency        int
+	NotificationEmailTimeout            time.Duration
+	WelcomeEmailEnabled                 bool
+	WelcomeEmailConcurrency             int
+	WelcomeEmailTimeout                 time.Duration
+	NotificationWhatsAppEnabled         bool
+	WhatsAppWorkerConcurrency           int
+	NotificationPlannerConcurrency      int
+	NotificationDestinationHMACKey      string
+	MetaAppID                           string
+	MetaAppSecret                       string
+	MetaVerifyToken                     string
+	WABAToken                           string
+	WhatsAppBusinessAccountID           string
+	WABAPhoneNumberID                   string
+	WABABusinessPhoneE164               string
+	WhatsAppGraphBaseURL                string
+	WhatsAppGraphVersion                string
+	WhatsAppHTTPTimeout                 time.Duration
+	WhatsAppEnabledTemplateKeys         []string
+	SMTPHost                            string
+	SupportEmail                        string
+	SMTPPort                            int
+	SMTPUsername                        string
+	SMTPPassword                        string
+	SMTPFromEmail                       string
+	SMTPFromName                        string
+	SMTPSecurity                        string
+	SMTPInsecureSkipVerify              bool
+	SMTPConnectTimeout                  time.Duration
+	PaystackSecretKey                   string
+	PaystackSecretKeyTest               string
+	PaystackBaseURL                     string
+	PayazaPublicKey                     string
+	PayazaSecretKey                     string
+	PayazaPublicKeyTest                 string
+	PayazaSecretKeyTest                 string
+	PayazaBaseURL                       string
+	PayazaTransferPIN                   string
+	PayazaTransferPINTest               string
+	PayazaSourceAccounts                string
+	PayazaSourceAccountsTest            string
+	PayazaPayoutSenderName              string
+	PayazaPayoutSenderPhone             string
+	PayazaPayoutSenderAddress           string
+	PayazaNGNDVABankCode                string
+	PayazaNGNDVAEnquiryBankCode         string
+	PayazaEnabledCapabilities           []string
+	PaystackEnabledCapabilities         []string
+	PaystackPayoutOTPDisabled           bool
+	PaymentsEnvironment                 string
+	FinancialEncryptionKeys             string
+	FinancialActiveKey                  string
+	FinancialFingerprintKey             string
+	AgreementTokenEncryptionKeys        string
+	AgreementTokenActiveKey             string
+	ShutdownTimeout                     time.Duration
+	ReadTimeout                         time.Duration
+	ReadHeaderTimeout                   time.Duration
+	WriteTimeout                        time.Duration
+	IdleTimeout                         time.Duration
 }
 
 const (
@@ -318,6 +307,14 @@ func (cfg Config) InboxAIModelConfigHash() string {
 }
 
 func Load() (Config, error) {
+	payazaCapabilities, err := loadPaymentCapabilities("PAYAZA")
+	if err != nil {
+		return Config{}, err
+	}
+	paystackCapabilities, err := loadPaymentCapabilities("PAYSTACK")
+	if err != nil {
+		return Config{}, err
+	}
 	defaultAIProvider := normalizeAIProvider(getEnv("DEFAULT_AI_PROVIDER", AIProviderSelfHosted))
 	agreementAIProvider := normalizeAIProvider(getEnv("AGREEMENT_AI_PROVIDER", AIProviderHosted))
 	usesOpenAICompatible := defaultAIProvider == AIProviderOpenAICompatible ||
@@ -354,208 +351,195 @@ func Load() (Config, error) {
 	processRole := strings.ToLower(strings.TrimSpace(getEnv("PROCESS_ROLE", ProcessRoleAll)))
 	tessaAIEnabled := getEnvBool("TESSA_AI_ENABLED", false)
 	cfg := Config{
-		AppEnv:                                appEnv,
-		ProcessRole:                           processRole,
-		HTTPAddr:                              getEnv("HTTP_ADDR", ":8200"),
-		SSEMaxConnections:                     getEnvInt("SSE_MAX_CONNECTIONS", 10000),
-		SSEMaxConnectionsPerIP:                getEnvInt("SSE_MAX_CONNECTIONS_PER_IP", 40),
-		PaymentSSEMaxConnectionsPerToken:      getEnvInt("PAYMENT_SSE_MAX_CONNECTIONS_PER_TOKEN", 6),
-		ClientPublicBaseURL:                   strings.TrimRight(getEnv("CLIENT_PUBLIC_BASE_URL", "http://localhost:5275"), "/"),
-		MarketplacePublicBaseURL:              strings.TrimRight(getEnv("MARKETPLACE_PUBLIC_BASE_URL", "http://localhost:5375"), "/"),
-		DefaultAIProvider:                     defaultAIProvider,
-		AgreementAIProvider:                   agreementAIProvider,
-		InboxAIDraftsEnabled:                  getEnvBool("INBOX_AI_DRAFTS_ENABLED", false),
-		InboxAIProviderAllowlist:              splitCSV(os.Getenv("INBOX_AI_PROVIDER_ALLOWLIST")),
-		InboxAIAutomationEnabled:              getEnvBool("INBOX_AI_AUTOMATION_ENABLED", false),
-		InboxAIAutomationProviderAllowlist:    splitCSV(os.Getenv("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST")),
-		InboxAIMaxConcurrency:                 getEnvInt("INBOX_AI_MAX_CONCURRENCY", 2),
-		InboxAISemiPilotReplyDelay:            getEnvDuration("INBOX_AI_SEMI_PILOT_REPLY_DELAY", 800*time.Millisecond),
-		InboxAIAutopilotPaymentWindow:         getEnvDuration("INBOX_AI_AUTOPILOT_PAYMENT_WINDOW", 30*time.Minute),
-		TessaAIEnabled:                        tessaAIEnabled,
-		TessaWhatsAppLinkingEnabled:           getEnvBool("TESSA_WHATSAPP_LINKING_ENABLED", false),
-		TessaWhatsAppConversationsEnabled:     getEnvBool("TESSA_WHATSAPP_CONVERSATIONS_ENABLED", false),
-		TessaAIPrimaryProvider:                normalizeAIProvider(getEnv("TESSA_AI_PRIMARY_PROVIDER", AIProviderSelfHosted)),
-		TessaAIFallbackProvider:               normalizeAIProvider(os.Getenv("TESSA_AI_FALLBACK_PROVIDER")),
-		TessaAIPrimaryRequestTimeout:          getEnvDuration("TESSA_AI_PRIMARY_REQUEST_TIMEOUT", 30*time.Second),
-		TessaAIFallbackRequestTimeout:         getEnvDuration("TESSA_AI_FALLBACK_REQUEST_TIMEOUT", 20*time.Second),
-		TessaAITurnTimeout:                    getEnvDuration("TESSA_AI_TURN_TIMEOUT", 75*time.Second),
-		TessaAIWorkerConcurrency:              getEnvInt("TESSA_AI_WORKER_CONCURRENCY", 2),
-		TessaAIMaxInputTokens:                 getEnvInt("TESSA_AI_MAX_INPUT_TOKENS", 12000),
-		TessaAIMaxOutputTokens:                getEnvInt("TESSA_AI_MAX_OUTPUT_TOKENS", 1600),
-		TessaAINoticeRevision:                 strings.TrimSpace(os.Getenv("TESSA_AI_NOTICE_REVISION")),
-		TessaAIExternalProcessingApproved:     getEnvBool("TESSA_AI_EXTERNAL_PROCESSING_APPROVED", false),
-		HostedAIProvider:                      strings.ToLower(strings.TrimSpace(getEnv("HOSTED_AI_PROVIDER", HostedProviderOpenAI))),
-		LLMBaseURL:                            strings.TrimRight(strings.TrimSpace(os.Getenv("LLM_BASE_URL")), "/"),
-		LLMChatCompletions:                    getEnv("LLM_CHAT_COMPLETIONS_PATH", "/v1/chat/completions"),
-		LLMModel:                              getEnv("LLM_MODEL", "local-model"),
-		LLMAPIKey:                             strings.TrimSpace(os.Getenv("LLM_API_KEY")),
-		LLMTimeout:                            getEnvDuration("LLM_TIMEOUT", 30*time.Second),
-		LLMMaxOutputTokens:                    getEnvInt("LLM_MAX_OUTPUT_TOKENS", 1200),
-		LLMTemperature:                        getEnvFloat("LLM_TEMPERATURE", 0.2),
-		LLMTopP:                               getEnvFloat("TOP_P", 0.9),
-		LLMTopK:                               getEnvInt("TOP_K", 40),
-		LLMMinP:                               getEnvFloat("MIN_P", 0.1),
-		LLMPresencePenalty:                    getEnvFloat("PRESENCE_PENALTY", 0),
-		LLMRepetitionPenalty:                  getEnvFloat("REPETITION_PENALTY", 1),
-		SelfHostedThinking:                    getEnvBool("SELF_HOSTED_THINKING", false),
-		OpenAIBaseURL:                         strings.TrimRight(strings.TrimSpace(getEnv("OPENAI_BASE_URL", "https://api.openai.com/v1")), "/"),
-		OpenAIModel:                           strings.TrimSpace(getEnv("OPENAI_MODEL", "gpt-5.6-luna")),
-		OpenAIAPIKey:                          strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
-		OpenAIReasoningEffort:                 strings.ToLower(strings.TrimSpace(getEnv("OPENAI_REASONING_EFFORT", "none"))),
-		OpenAITimeout:                         getEnvDuration("OPENAI_TIMEOUT", 120*time.Second),
-		OpenAIMaxOutputTokens:                 getEnvInt64("OPENAI_MAX_OUTPUT_TOKENS", 16000),
-		OpenAIResponseLogFile:                 strings.TrimSpace(os.Getenv("OPENAI_RESPONSE_LOG_FILE")),
-		OpenAICompatBaseURL:                   strings.TrimRight(strings.TrimSpace(os.Getenv("OPENAI_COMPAT_BASE_URL")), "/"),
-		OpenAICompatChatCompletions:           strings.TrimSpace(getEnv("OPENAI_COMPAT_CHAT_COMPLETIONS_PATH", "/v1/chat/completions")),
-		OpenAICompatModel:                     strings.TrimSpace(os.Getenv("OPENAI_COMPAT_MODEL")),
-		OpenAICompatAPIKey:                    strings.TrimSpace(os.Getenv("OPENAI_COMPAT_API_KEY")),
-		OpenAICompatTimeout:                   openAICompatTimeout,
-		OpenAICompatMaxOutputTokens:           openAICompatMaxOutputTokens,
-		OpenAICompatTokenLimitField:           strings.ToLower(strings.TrimSpace(getEnv("OPENAI_COMPAT_TOKEN_LIMIT_FIELD", OpenAICompatTokenFieldMaxTokens))),
-		OpenAICompatTemperature:               openAICompatTemperature,
-		OpenAICompatTopP:                      openAICompatTopP,
-		HTTPRateLimitPerMinute:                getEnvInt("HTTP_RATE_LIMIT_PER_MINUTE", 300),
-		HTTPRateLimitBurst:                    getEnvInt("HTTP_RATE_LIMIT_BURST", 100),
-		AIRateLimitPerMinute:                  getEnvInt("AI_RATE_LIMIT_PER_MINUTE", 12),
-		AIRateLimitBurst:                      getEnvInt("AI_RATE_LIMIT_BURST", 4),
-		LocationRateLimitPerMinute:            getEnvInt("LOCATION_RATE_LIMIT_PER_MINUTE", 20),
-		LocationRateLimitBurst:                getEnvInt("LOCATION_RATE_LIMIT_BURST", 5),
-		MarketplaceAuthRateLimitPerMinute:     getEnvInt("MARKETPLACE_AUTH_RATE_LIMIT_PER_MINUTE", 20),
-		MarketplaceAuthRateLimitBurst:         getEnvInt("MARKETPLACE_AUTH_RATE_LIMIT_BURST", 6),
-		RedisURL:                              strings.TrimSpace(os.Getenv("REDIS_URL")),
-		RedisKeyPrefix:                        strings.TrimSpace(getEnv("REDIS_KEY_PREFIX", "tellbook:"+appEnv+":v1")),
-		RedisKeyHMACSecret:                    os.Getenv("REDIS_KEY_HMAC_SECRET"),
-		RedisPoolSize:                         getEnvInt("REDIS_POOL_SIZE", 32),
-		RedisMinIdleConnections:               getEnvInt("REDIS_MIN_IDLE_CONNECTIONS", 4),
-		RedisDialTimeout:                      getEnvDuration("REDIS_DIAL_TIMEOUT", 750*time.Millisecond),
-		RedisReadTimeout:                      getEnvDuration("REDIS_READ_TIMEOUT", 250*time.Millisecond),
-		RedisWriteTimeout:                     getEnvDuration("REDIS_WRITE_TIMEOUT", 250*time.Millisecond),
-		RedisPoolTimeout:                      getEnvDuration("REDIS_POOL_TIMEOUT", 500*time.Millisecond),
-		RedisMaxPayloadBytes:                  getEnvInt("REDIS_MAX_PAYLOAD_BYTES", 64*1024),
-		RedisFallbackMaxConcurrency:           getEnvInt("REDIS_FALLBACK_MAX_CONCURRENCY", 32),
-		RateLimitIPCeilingMultiplier:          getEnvInt("RATE_LIMIT_IP_CEILING_MULTIPLIER", 8),
-		MetricsAuthToken:                      strings.TrimSpace(os.Getenv("METRICS_AUTH_TOKEN")),
-		HTTPSuccessLogSampleRate:              getEnvFloat("HTTP_SUCCESS_LOG_SAMPLE_RATE", 0.1),
-		HTTPSlowRequestThreshold:              getEnvDuration("HTTP_SLOW_REQUEST_THRESHOLD", 750*time.Millisecond),
-		GoogleMapsServerAPIKey:                strings.TrimSpace(os.Getenv("GOOGLE_MAPS_SERVER_API_KEY")),
-		DatabaseURL:                           strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		DatabaseDirectURL:                     strings.TrimSpace(os.Getenv("DATABASE_DIRECT_URL")),
-		DatabaseMaxConnections:                int32(getEnvInt("DATABASE_MAX_CONNECTIONS", 14)),
-		DatabaseMinConnections:                int32(getEnvInt("DATABASE_MIN_CONNECTIONS", 2)),
-		DatabaseDirectMaxConnections:          int32(getEnvInt("DATABASE_DIRECT_MAX_CONNECTIONS", requiredDirectDatabaseConnections(processRole, tessaAIEnabled))),
-		DatabaseMaxConnectionLifetime:         getEnvDuration("DATABASE_MAX_CONNECTION_LIFETIME", 30*time.Minute),
-		DatabaseMaxConnectionLifetimeJitter:   getEnvDuration("DATABASE_MAX_CONNECTION_LIFETIME_JITTER", 5*time.Minute),
-		DatabaseMaxConnectionIdleTime:         getEnvDuration("DATABASE_MAX_CONNECTION_IDLE_TIME", 5*time.Minute),
-		DatabaseHealthCheckPeriod:             getEnvDuration("DATABASE_HEALTH_CHECK_PERIOD", 30*time.Second),
-		DatabaseConnectTimeout:                getEnvDuration("DATABASE_CONNECT_TIMEOUT", 5*time.Second),
-		DatabaseStatementTimeout:              getEnvDuration("DATABASE_STATEMENT_TIMEOUT", 30*time.Second),
-		DatabaseLockTimeout:                   getEnvDuration("DATABASE_LOCK_TIMEOUT", 5*time.Second),
-		DatabaseIdleTransactionTimeout:        getEnvDuration("DATABASE_IDLE_TRANSACTION_TIMEOUT", 30*time.Second),
-		CORSOrigins:                           splitCSV(getEnv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")),
-		TrustedProxyCIDRs:                     splitCSV(getEnv("TRUSTED_PROXY_CIDRS", "127.0.0.1/32,::1/128")),
-		AuthIssuer:                            getEnv("AUTH_ISSUER", "booking-api"),
-		AuthAccessTokenSecret:                 strings.TrimSpace(os.Getenv("AUTH_ACCESS_TOKEN_SECRET")),
-		AuthAccessTokenTTL:                    getEnvDuration("AUTH_ACCESS_TOKEN_TTL", 15*time.Minute),
-		AuthAccessCookieName:                  getEnv("AUTH_ACCESS_COOKIE_NAME", "booking_access"),
-		AuthRefreshCookieName:                 getEnv("AUTH_REFRESH_COOKIE_NAME", "booking_refresh"),
-		AuthCookieDomain:                      strings.TrimSpace(os.Getenv("AUTH_COOKIE_DOMAIN")),
-		AuthCookieSecure:                      getEnvBool("AUTH_COOKIE_SECURE", false),
-		AuthRefreshTokenTTL:                   getEnvDuration("AUTH_REFRESH_TOKEN_TTL", 24*30*time.Hour),
-		AuthBcryptCost:                        getEnvInt("AUTH_BCRYPT_COST", 12),
-		AdminEnabled:                          getEnvBool("ADMIN_ENABLED", false),
-		AdminPublicURL:                        getEnv("ADMIN_PUBLIC_URL", ""),
-		AdminMFAEncryptionKeys:                getEnv("ADMIN_MFA_ENCRYPTION_KEYS", ""),
-		AdminMFAActiveKey:                     getEnv("ADMIN_MFA_ACTIVE_KEY", ""),
-		AdditionalEmailsEnabled:               getEnvBool("ADDITIONAL_EMAILS_ENABLED", false),
-		AuthEmailEnabled:                      getEnvBool("AUTH_EMAIL_ENABLED", false),
-		AuthWhatsAppEnabled:                   getEnvBool("AUTH_WHATSAPP_ENABLED", false),
-		AuthDeliveryEncryptionKeys:            strings.TrimSpace(os.Getenv("AUTH_DELIVERY_ENCRYPTION_KEYS")),
-		AuthDeliveryActiveKey:                 strings.TrimSpace(os.Getenv("AUTH_DELIVERY_ACTIVE_KEY")),
-		AuthDestinationHMACKey:                strings.TrimSpace(os.Getenv("AUTH_DESTINATION_HMAC_KEY")),
-		AuthDeliveryConcurrency:               getEnvInt("AUTH_DELIVERY_CONCURRENCY", 4),
-		AuthDeliveryTimeout:                   getEnvDuration("AUTH_DELIVERY_TIMEOUT", 30*time.Second),
-		R2PrivateBucketName:                   strings.TrimSpace(os.Getenv("R2_PRIVATE_BUCKET_NAME")),
-		R2PublicBucketName:                    strings.TrimSpace(os.Getenv("R2_PUBLIC_BUCKET_NAME")),
-		R2AccountID:                           strings.TrimSpace(os.Getenv("R2_ACCOUNT_ID")),
-		R2Endpoint:                            strings.TrimSpace(os.Getenv("R2_ENDPOINT")),
-		R2AccessKeyID:                         strings.TrimSpace(os.Getenv("R2_ACCESS_KEY_ID")),
-		R2SecretAccessKey:                     strings.TrimSpace(os.Getenv("R2_SECRET_ACCESS_KEY")),
-		R2PublicBucketBaseURL:                 strings.TrimSpace(os.Getenv("R2_PUBLIC_BUCKET_BASE_URL")),
-		NotificationEmailEnabled:              getEnvBool("NOTIFICATION_EMAIL_ENABLED", false),
-		NotificationEmailConcurrency:          getEnvInt("NOTIFICATION_EMAIL_CONCURRENCY", 4),
-		NotificationEmailTimeout:              getEnvDuration("NOTIFICATION_EMAIL_TIMEOUT", 30*time.Second),
-		WelcomeEmailEnabled:                   getEnvBool("WELCOME_EMAIL_ENABLED", false),
-		WelcomeEmailConcurrency:               getEnvInt("WELCOME_EMAIL_CONCURRENCY", 2),
-		WelcomeEmailTimeout:                   getEnvDuration("WELCOME_EMAIL_TIMEOUT", 30*time.Second),
-		NotificationWhatsAppEnabled:           getEnvBool("NOTIFICATION_WHATSAPP_ENABLED", false),
-		WhatsAppWorkerConcurrency:             getEnvInt("WHATSAPP_WORKER_CONCURRENCY", 4),
-		NotificationPlannerConcurrency:        getEnvInt("NOTIFICATION_PLANNER_CONCURRENCY", 4),
-		NotificationDestinationHMACKey:        strings.TrimSpace(os.Getenv("NOTIFICATION_DESTINATION_HMAC_KEY")),
-		MetaAppID:                             strings.TrimSpace(os.Getenv("META_APP_ID")),
-		MetaAppSecret:                         strings.TrimSpace(os.Getenv("META_APP_SECRET")),
-		MetaVerifyToken:                       strings.TrimSpace(os.Getenv("META_VERIFY_TOKEN")),
-		WABAToken:                             strings.TrimSpace(os.Getenv("WABA_TOKEN")),
-		WhatsAppBusinessAccountID:             strings.TrimSpace(os.Getenv("WHATSAPP_BUSINESS_ACCOUNT_ID")),
-		WABAPhoneNumberID:                     strings.TrimSpace(os.Getenv("WABA_PHONE_NUMBER_ID")),
-		WABABusinessPhoneE164:                 strings.TrimSpace(os.Getenv("WABA_BUSINESS_PHONE_E164")),
-		WhatsAppGraphBaseURL:                  strings.TrimRight(getEnv("WHATSAPP_GRAPH_BASE_URL", "https://graph.facebook.com"), "/"),
-		WhatsAppGraphVersion:                  strings.TrimSpace(getEnv("WHATSAPP_GRAPH_VERSION", "v24.0")),
-		WhatsAppHTTPTimeout:                   getEnvDuration("WHATSAPP_HTTP_TIMEOUT", 15*time.Second),
-		WhatsAppEnabledTemplateKeys:           splitCSV(os.Getenv("WHATSAPP_ENABLED_TEMPLATE_KEYS")),
-		SMTPHost:                              getEnv("SMTP_HOST", "smtp.zoho.com"),
-		SMTPPort:                              getEnvInt("SMTP_PORT", 465),
-		SMTPUsername:                          strings.TrimSpace(os.Getenv("SMTP_USERNAME")),
-		SMTPPassword:                          strings.TrimSpace(os.Getenv("SMTP_PASSWORD")),
-		SMTPFromEmail:                         strings.TrimSpace(os.Getenv("SMTP_FROM_EMAIL")),
-		SMTPFromName:                          getEnv("SMTP_FROM_NAME", "Booking"),
-		SMTPSecurity:                          getEnv("SMTP_SECURITY", "tls"),
-		SMTPInsecureSkipVerify:                getEnvBool("SMTP_INSECURE_SKIP_VERIFY", false),
-		SMTPConnectTimeout:                    getEnvDuration("SMTP_CONNECT_TIMEOUT", 10*time.Second),
-		PaystackSecretKey:                     strings.TrimSpace(os.Getenv("PAYSTACK_SECRET_KEY")),
-		PaystackSecretKeyTest:                 strings.TrimSpace(os.Getenv("PAYSTACK_SECRET_KEY_TEST")),
-		PaystackBaseURL:                       strings.TrimSpace(os.Getenv("PAYSTACK_BASE_URL")),
-		PayazaPublicKey:                       strings.TrimSpace(os.Getenv("PAYAZA_PUBLIC_KEY")),
-		PayazaSecretKey:                       strings.TrimSpace(os.Getenv("PAYAZA_SECRET_KEY")),
-		PayazaPublicKeyTest:                   strings.TrimSpace(os.Getenv("PAYAZA_PUBLIC_KEY_TEST")),
-		PayazaSecretKeyTest:                   strings.TrimSpace(os.Getenv("PAYAZA_SECRET_KEY_TEST")),
-		PayazaBaseURL:                         strings.TrimSpace(os.Getenv("PAYAZA_BASE_URL")),
-		PayazaTransferPIN:                     strings.TrimSpace(os.Getenv("PAYAZA_TRANSFER_PIN")),
-		PayazaTransferPINTest:                 strings.TrimSpace(os.Getenv("PAYAZA_TRANSFER_PIN_TEST")),
-		PayazaSourceAccounts:                  strings.TrimSpace(os.Getenv("PAYAZA_SOURCE_ACCOUNTS")),
-		PayazaSourceAccountsTest:              strings.TrimSpace(os.Getenv("PAYAZA_SOURCE_ACCOUNTS_TEST")),
-		PayazaPayoutSenderName:                strings.TrimSpace(os.Getenv("PAYAZA_PAYOUT_SENDER_NAME")),
-		PayazaPayoutSenderPhone:               strings.TrimSpace(os.Getenv("PAYAZA_PAYOUT_SENDER_PHONE")),
-		PayazaPayoutSenderAddress:             strings.TrimSpace(os.Getenv("PAYAZA_PAYOUT_SENDER_ADDRESS")),
-		PayazaNGNDVABankCode:                  strings.TrimSpace(os.Getenv("PAYAZA_NGN_DVA_BANK_CODE")),
-		PayazaNGNDVAEnquiryBankCode:           strings.TrimSpace(os.Getenv("PAYAZA_NGN_DVA_ENQUIRY_BANK_CODE")),
-		PayazaCardSandboxVerified:             getEnvBool("PAYAZA_CARD_SANDBOX_VERIFIED", false),
-		PayazaCardProductionEnabled:           getEnvBool("PAYAZA_CARD_PRODUCTION_ENABLED", false),
-		PayazaBankTransferSandboxVerified:     getEnvBool("PAYAZA_BANK_TRANSFER_SANDBOX_VERIFIED", false),
-		PayazaBankTransferProductionEnabled:   getEnvBool("PAYAZA_BANK_TRANSFER_PRODUCTION_ENABLED", false),
-		PayazaDestinationSandboxVerified:      getEnvBool("PAYAZA_DESTINATION_SANDBOX_VERIFIED", false),
-		PayazaDestinationProductionEnabled:    getEnvBool("PAYAZA_DESTINATION_PRODUCTION_ENABLED", false),
-		PayazaPayoutSandboxVerified:           getEnvBool("PAYAZA_PAYOUT_SANDBOX_VERIFIED", false),
-		PayazaPayoutProductionEnabled:         getEnvBool("PAYAZA_PAYOUT_PRODUCTION_ENABLED", false),
-		PaystackCardSandboxVerified:           getEnvBool("PAYSTACK_CARD_SANDBOX_VERIFIED", false),
-		PaystackCardProductionEnabled:         getEnvBool("PAYSTACK_CARD_PRODUCTION_ENABLED", false),
-		PaystackBankTransferSandboxVerified:   getEnvBool("PAYSTACK_BANK_TRANSFER_SANDBOX_VERIFIED", false),
-		PaystackBankTransferProductionEnabled: getEnvBool("PAYSTACK_BANK_TRANSFER_PRODUCTION_ENABLED", false),
-		PaystackDestinationSandboxVerified:    getEnvBool("PAYSTACK_DESTINATION_SANDBOX_VERIFIED", false),
-		PaystackDestinationProductionEnabled:  getEnvBool("PAYSTACK_DESTINATION_PRODUCTION_ENABLED", false),
-		PaystackPayoutSandboxVerified:         getEnvBool("PAYSTACK_PAYOUT_SANDBOX_VERIFIED", false),
-		PaystackPayoutProductionEnabled:       getEnvBool("PAYSTACK_PAYOUT_PRODUCTION_ENABLED", false),
-		PaystackPayoutOTPDisabled:             getEnvBool("PAYSTACK_PAYOUT_OTP_DISABLED", false),
-		PaymentsEnvironment:                   strings.ToLower(getEnv("PAYMENTS_ENVIRONMENT", "test")),
-		FinancialEncryptionKeys:               strings.TrimSpace(os.Getenv("FINANCIAL_DATA_ENCRYPTION_KEYS")),
-		FinancialActiveKey:                    strings.TrimSpace(os.Getenv("FINANCIAL_DATA_ACTIVE_KEY_VERSION")),
-		FinancialFingerprintKey:               strings.TrimSpace(os.Getenv("FINANCIAL_DATA_FINGERPRINT_KEY")),
-		AgreementTokenEncryptionKeys:          strings.TrimSpace(os.Getenv("AGREEMENT_TOKEN_ENCRYPTION_KEYS")),
-		AgreementTokenActiveKey:               strings.TrimSpace(os.Getenv("AGREEMENT_TOKEN_ACTIVE_KEY")),
-		ShutdownTimeout:                       getEnvDuration("HTTP_SHUTDOWN_TIMEOUT", 10*time.Second),
-		ReadTimeout:                           getEnvDuration("HTTP_READ_TIMEOUT", 15*time.Second),
-		ReadHeaderTimeout:                     getEnvDuration("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
-		WriteTimeout:                          getEnvDuration("HTTP_WRITE_TIMEOUT", 15*time.Second),
-		IdleTimeout:                           getEnvDuration("HTTP_IDLE_TIMEOUT", 60*time.Second),
+		AppEnv:                              appEnv,
+		ProcessRole:                         processRole,
+		HTTPAddr:                            getEnv("HTTP_ADDR", ":8200"),
+		SSEMaxConnections:                   getEnvInt("SSE_MAX_CONNECTIONS", 10000),
+		SSEMaxConnectionsPerIP:              getEnvInt("SSE_MAX_CONNECTIONS_PER_IP", 40),
+		PaymentSSEMaxConnectionsPerToken:    getEnvInt("PAYMENT_SSE_MAX_CONNECTIONS_PER_TOKEN", 6),
+		ClientPublicBaseURL:                 strings.TrimRight(getEnv("CLIENT_PUBLIC_BASE_URL", "http://localhost:5275"), "/"),
+		MarketplacePublicBaseURL:            strings.TrimRight(getEnv("MARKETPLACE_PUBLIC_BASE_URL", "http://localhost:5375"), "/"),
+		DefaultAIProvider:                   defaultAIProvider,
+		AgreementAIProvider:                 agreementAIProvider,
+		InboxAIDraftsEnabled:                getEnvBool("INBOX_AI_DRAFTS_ENABLED", false),
+		InboxAIProviderAllowlist:            splitCSV(os.Getenv("INBOX_AI_PROVIDER_ALLOWLIST")),
+		InboxAIAutomationEnabled:            getEnvBool("INBOX_AI_AUTOMATION_ENABLED", false),
+		InboxAIAutomationProviderAllowlist:  splitCSV(os.Getenv("INBOX_AI_AUTOMATION_PROVIDER_ALLOWLIST")),
+		InboxAIMaxConcurrency:               getEnvInt("INBOX_AI_MAX_CONCURRENCY", 2),
+		InboxAISemiPilotReplyDelay:          getEnvDuration("INBOX_AI_SEMI_PILOT_REPLY_DELAY", 800*time.Millisecond),
+		InboxAIAutopilotPaymentWindow:       getEnvDuration("INBOX_AI_AUTOPILOT_PAYMENT_WINDOW", 30*time.Minute),
+		TessaAIEnabled:                      tessaAIEnabled,
+		TessaWhatsAppLinkingEnabled:         getEnvBool("TESSA_WHATSAPP_LINKING_ENABLED", false),
+		TessaWhatsAppConversationsEnabled:   getEnvBool("TESSA_WHATSAPP_CONVERSATIONS_ENABLED", false),
+		TessaAIPrimaryProvider:              normalizeAIProvider(getEnv("TESSA_AI_PRIMARY_PROVIDER", AIProviderSelfHosted)),
+		TessaAIFallbackProvider:             normalizeAIProvider(os.Getenv("TESSA_AI_FALLBACK_PROVIDER")),
+		TessaAIPrimaryRequestTimeout:        getEnvDuration("TESSA_AI_PRIMARY_REQUEST_TIMEOUT", 30*time.Second),
+		TessaAIFallbackRequestTimeout:       getEnvDuration("TESSA_AI_FALLBACK_REQUEST_TIMEOUT", 20*time.Second),
+		TessaAITurnTimeout:                  getEnvDuration("TESSA_AI_TURN_TIMEOUT", 75*time.Second),
+		TessaAIWorkerConcurrency:            getEnvInt("TESSA_AI_WORKER_CONCURRENCY", 2),
+		TessaAIMaxInputTokens:               getEnvInt("TESSA_AI_MAX_INPUT_TOKENS", 12000),
+		TessaAIMaxOutputTokens:              getEnvInt("TESSA_AI_MAX_OUTPUT_TOKENS", 1600),
+		TessaAINoticeRevision:               strings.TrimSpace(os.Getenv("TESSA_AI_NOTICE_REVISION")),
+		TessaAIExternalProcessingApproved:   getEnvBool("TESSA_AI_EXTERNAL_PROCESSING_APPROVED", false),
+		HostedAIProvider:                    strings.ToLower(strings.TrimSpace(getEnv("HOSTED_AI_PROVIDER", HostedProviderOpenAI))),
+		LLMBaseURL:                          strings.TrimRight(strings.TrimSpace(os.Getenv("LLM_BASE_URL")), "/"),
+		LLMChatCompletions:                  getEnv("LLM_CHAT_COMPLETIONS_PATH", "/v1/chat/completions"),
+		LLMModel:                            getEnv("LLM_MODEL", "local-model"),
+		LLMAPIKey:                           strings.TrimSpace(os.Getenv("LLM_API_KEY")),
+		LLMTimeout:                          getEnvDuration("LLM_TIMEOUT", 30*time.Second),
+		LLMMaxOutputTokens:                  getEnvInt("LLM_MAX_OUTPUT_TOKENS", 1200),
+		LLMTemperature:                      getEnvFloat("LLM_TEMPERATURE", 0.2),
+		LLMTopP:                             getEnvFloat("TOP_P", 0.9),
+		LLMTopK:                             getEnvInt("TOP_K", 40),
+		LLMMinP:                             getEnvFloat("MIN_P", 0.1),
+		LLMPresencePenalty:                  getEnvFloat("PRESENCE_PENALTY", 0),
+		LLMRepetitionPenalty:                getEnvFloat("REPETITION_PENALTY", 1),
+		SelfHostedThinking:                  getEnvBool("SELF_HOSTED_THINKING", false),
+		OpenAIBaseURL:                       strings.TrimRight(strings.TrimSpace(getEnv("OPENAI_BASE_URL", "https://api.openai.com/v1")), "/"),
+		OpenAIModel:                         strings.TrimSpace(getEnv("OPENAI_MODEL", "gpt-5.6-luna")),
+		OpenAIAPIKey:                        strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		OpenAIReasoningEffort:               strings.ToLower(strings.TrimSpace(getEnv("OPENAI_REASONING_EFFORT", "none"))),
+		OpenAITimeout:                       getEnvDuration("OPENAI_TIMEOUT", 120*time.Second),
+		OpenAIMaxOutputTokens:               getEnvInt64("OPENAI_MAX_OUTPUT_TOKENS", 16000),
+		OpenAIResponseLogFile:               strings.TrimSpace(os.Getenv("OPENAI_RESPONSE_LOG_FILE")),
+		OpenAICompatBaseURL:                 strings.TrimRight(strings.TrimSpace(os.Getenv("OPENAI_COMPAT_BASE_URL")), "/"),
+		OpenAICompatChatCompletions:         strings.TrimSpace(getEnv("OPENAI_COMPAT_CHAT_COMPLETIONS_PATH", "/v1/chat/completions")),
+		OpenAICompatModel:                   strings.TrimSpace(os.Getenv("OPENAI_COMPAT_MODEL")),
+		OpenAICompatAPIKey:                  strings.TrimSpace(os.Getenv("OPENAI_COMPAT_API_KEY")),
+		OpenAICompatTimeout:                 openAICompatTimeout,
+		OpenAICompatMaxOutputTokens:         openAICompatMaxOutputTokens,
+		OpenAICompatTokenLimitField:         strings.ToLower(strings.TrimSpace(getEnv("OPENAI_COMPAT_TOKEN_LIMIT_FIELD", OpenAICompatTokenFieldMaxTokens))),
+		OpenAICompatTemperature:             openAICompatTemperature,
+		OpenAICompatTopP:                    openAICompatTopP,
+		HTTPRateLimitPerMinute:              getEnvInt("HTTP_RATE_LIMIT_PER_MINUTE", 300),
+		HTTPRateLimitBurst:                  getEnvInt("HTTP_RATE_LIMIT_BURST", 100),
+		AIRateLimitPerMinute:                getEnvInt("AI_RATE_LIMIT_PER_MINUTE", 12),
+		AIRateLimitBurst:                    getEnvInt("AI_RATE_LIMIT_BURST", 4),
+		LocationRateLimitPerMinute:          getEnvInt("LOCATION_RATE_LIMIT_PER_MINUTE", 20),
+		LocationRateLimitBurst:              getEnvInt("LOCATION_RATE_LIMIT_BURST", 5),
+		MarketplaceAuthRateLimitPerMinute:   getEnvInt("MARKETPLACE_AUTH_RATE_LIMIT_PER_MINUTE", 20),
+		MarketplaceAuthRateLimitBurst:       getEnvInt("MARKETPLACE_AUTH_RATE_LIMIT_BURST", 6),
+		RedisURL:                            strings.TrimSpace(os.Getenv("REDIS_URL")),
+		RedisKeyPrefix:                      strings.TrimSpace(getEnv("REDIS_KEY_PREFIX", "tellbook:"+appEnv+":v1")),
+		RedisKeyHMACSecret:                  os.Getenv("REDIS_KEY_HMAC_SECRET"),
+		RedisPoolSize:                       getEnvInt("REDIS_POOL_SIZE", 32),
+		RedisMinIdleConnections:             getEnvInt("REDIS_MIN_IDLE_CONNECTIONS", 4),
+		RedisDialTimeout:                    getEnvDuration("REDIS_DIAL_TIMEOUT", 750*time.Millisecond),
+		RedisReadTimeout:                    getEnvDuration("REDIS_READ_TIMEOUT", 250*time.Millisecond),
+		RedisWriteTimeout:                   getEnvDuration("REDIS_WRITE_TIMEOUT", 250*time.Millisecond),
+		RedisPoolTimeout:                    getEnvDuration("REDIS_POOL_TIMEOUT", 500*time.Millisecond),
+		RedisMaxPayloadBytes:                getEnvInt("REDIS_MAX_PAYLOAD_BYTES", 64*1024),
+		RedisFallbackMaxConcurrency:         getEnvInt("REDIS_FALLBACK_MAX_CONCURRENCY", 32),
+		RateLimitIPCeilingMultiplier:        getEnvInt("RATE_LIMIT_IP_CEILING_MULTIPLIER", 8),
+		MetricsAuthToken:                    strings.TrimSpace(os.Getenv("METRICS_AUTH_TOKEN")),
+		HTTPSuccessLogSampleRate:            getEnvFloat("HTTP_SUCCESS_LOG_SAMPLE_RATE", 0.1),
+		HTTPSlowRequestThreshold:            getEnvDuration("HTTP_SLOW_REQUEST_THRESHOLD", 750*time.Millisecond),
+		GoogleMapsServerAPIKey:              strings.TrimSpace(os.Getenv("GOOGLE_MAPS_SERVER_API_KEY")),
+		DatabaseURL:                         strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		DatabaseDirectURL:                   strings.TrimSpace(os.Getenv("DATABASE_DIRECT_URL")),
+		DatabaseMaxConnections:              int32(getEnvInt("DATABASE_MAX_CONNECTIONS", 14)),
+		DatabaseMinConnections:              int32(getEnvInt("DATABASE_MIN_CONNECTIONS", 2)),
+		DatabaseDirectMaxConnections:        int32(getEnvInt("DATABASE_DIRECT_MAX_CONNECTIONS", requiredDirectDatabaseConnections(processRole, tessaAIEnabled))),
+		DatabaseMaxConnectionLifetime:       getEnvDuration("DATABASE_MAX_CONNECTION_LIFETIME", 30*time.Minute),
+		DatabaseMaxConnectionLifetimeJitter: getEnvDuration("DATABASE_MAX_CONNECTION_LIFETIME_JITTER", 5*time.Minute),
+		DatabaseMaxConnectionIdleTime:       getEnvDuration("DATABASE_MAX_CONNECTION_IDLE_TIME", 5*time.Minute),
+		DatabaseHealthCheckPeriod:           getEnvDuration("DATABASE_HEALTH_CHECK_PERIOD", 30*time.Second),
+		DatabaseConnectTimeout:              getEnvDuration("DATABASE_CONNECT_TIMEOUT", 5*time.Second),
+		DatabaseStatementTimeout:            getEnvDuration("DATABASE_STATEMENT_TIMEOUT", 30*time.Second),
+		DatabaseLockTimeout:                 getEnvDuration("DATABASE_LOCK_TIMEOUT", 5*time.Second),
+		DatabaseIdleTransactionTimeout:      getEnvDuration("DATABASE_IDLE_TRANSACTION_TIMEOUT", 30*time.Second),
+		CORSOrigins:                         splitCSV(getEnv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")),
+		TrustedProxyCIDRs:                   splitCSV(getEnv("TRUSTED_PROXY_CIDRS", "127.0.0.1/32,::1/128")),
+		AuthIssuer:                          getEnv("AUTH_ISSUER", "booking-api"),
+		AuthAccessTokenSecret:               strings.TrimSpace(os.Getenv("AUTH_ACCESS_TOKEN_SECRET")),
+		AuthAccessTokenTTL:                  getEnvDuration("AUTH_ACCESS_TOKEN_TTL", 15*time.Minute),
+		AuthAccessCookieName:                getEnv("AUTH_ACCESS_COOKIE_NAME", "booking_access"),
+		AuthRefreshCookieName:               getEnv("AUTH_REFRESH_COOKIE_NAME", "booking_refresh"),
+		AuthCookieDomain:                    strings.TrimSpace(os.Getenv("AUTH_COOKIE_DOMAIN")),
+		AuthCookieSecure:                    getEnvBool("AUTH_COOKIE_SECURE", false),
+		AuthRefreshTokenTTL:                 getEnvDuration("AUTH_REFRESH_TOKEN_TTL", 24*30*time.Hour),
+		AuthBcryptCost:                      getEnvInt("AUTH_BCRYPT_COST", 12),
+		AdminEnabled:                        getEnvBool("ADMIN_ENABLED", false),
+		AdminPublicURL:                      getEnv("ADMIN_PUBLIC_URL", ""),
+		AdminMFAEncryptionKeys:              getEnv("ADMIN_MFA_ENCRYPTION_KEYS", ""),
+		AdminMFAActiveKey:                   getEnv("ADMIN_MFA_ACTIVE_KEY", ""),
+		AdditionalEmailsEnabled:             getEnvBool("ADDITIONAL_EMAILS_ENABLED", false),
+		AuthEmailEnabled:                    getEnvBool("AUTH_EMAIL_ENABLED", false),
+		AuthWhatsAppEnabled:                 getEnvBool("AUTH_WHATSAPP_ENABLED", false),
+		AuthDeliveryEncryptionKeys:          strings.TrimSpace(os.Getenv("AUTH_DELIVERY_ENCRYPTION_KEYS")),
+		AuthDeliveryActiveKey:               strings.TrimSpace(os.Getenv("AUTH_DELIVERY_ACTIVE_KEY")),
+		AuthDestinationHMACKey:              strings.TrimSpace(os.Getenv("AUTH_DESTINATION_HMAC_KEY")),
+		AuthDeliveryConcurrency:             getEnvInt("AUTH_DELIVERY_CONCURRENCY", 4),
+		AuthDeliveryTimeout:                 getEnvDuration("AUTH_DELIVERY_TIMEOUT", 30*time.Second),
+		R2PrivateBucketName:                 strings.TrimSpace(os.Getenv("R2_PRIVATE_BUCKET_NAME")),
+		R2PublicBucketName:                  strings.TrimSpace(os.Getenv("R2_PUBLIC_BUCKET_NAME")),
+		R2AccountID:                         strings.TrimSpace(os.Getenv("R2_ACCOUNT_ID")),
+		R2Endpoint:                          strings.TrimSpace(os.Getenv("R2_ENDPOINT")),
+		R2AccessKeyID:                       strings.TrimSpace(os.Getenv("R2_ACCESS_KEY_ID")),
+		R2SecretAccessKey:                   strings.TrimSpace(os.Getenv("R2_SECRET_ACCESS_KEY")),
+		R2PublicBucketBaseURL:               strings.TrimSpace(os.Getenv("R2_PUBLIC_BUCKET_BASE_URL")),
+		NotificationEmailEnabled:            getEnvBool("NOTIFICATION_EMAIL_ENABLED", false),
+		NotificationEmailConcurrency:        getEnvInt("NOTIFICATION_EMAIL_CONCURRENCY", 4),
+		NotificationEmailTimeout:            getEnvDuration("NOTIFICATION_EMAIL_TIMEOUT", 30*time.Second),
+		WelcomeEmailEnabled:                 getEnvBool("WELCOME_EMAIL_ENABLED", false),
+		WelcomeEmailConcurrency:             getEnvInt("WELCOME_EMAIL_CONCURRENCY", 2),
+		WelcomeEmailTimeout:                 getEnvDuration("WELCOME_EMAIL_TIMEOUT", 30*time.Second),
+		NotificationWhatsAppEnabled:         getEnvBool("NOTIFICATION_WHATSAPP_ENABLED", false),
+		WhatsAppWorkerConcurrency:           getEnvInt("WHATSAPP_WORKER_CONCURRENCY", 4),
+		NotificationPlannerConcurrency:      getEnvInt("NOTIFICATION_PLANNER_CONCURRENCY", 4),
+		NotificationDestinationHMACKey:      strings.TrimSpace(os.Getenv("NOTIFICATION_DESTINATION_HMAC_KEY")),
+		MetaAppID:                           strings.TrimSpace(os.Getenv("META_APP_ID")),
+		MetaAppSecret:                       strings.TrimSpace(os.Getenv("META_APP_SECRET")),
+		MetaVerifyToken:                     strings.TrimSpace(os.Getenv("META_VERIFY_TOKEN")),
+		WABAToken:                           strings.TrimSpace(os.Getenv("WABA_TOKEN")),
+		WhatsAppBusinessAccountID:           strings.TrimSpace(os.Getenv("WHATSAPP_BUSINESS_ACCOUNT_ID")),
+		WABAPhoneNumberID:                   strings.TrimSpace(os.Getenv("WABA_PHONE_NUMBER_ID")),
+		WABABusinessPhoneE164:               strings.TrimSpace(os.Getenv("WABA_BUSINESS_PHONE_E164")),
+		WhatsAppGraphBaseURL:                strings.TrimRight(getEnv("WHATSAPP_GRAPH_BASE_URL", "https://graph.facebook.com"), "/"),
+		WhatsAppGraphVersion:                strings.TrimSpace(getEnv("WHATSAPP_GRAPH_VERSION", "v24.0")),
+		WhatsAppHTTPTimeout:                 getEnvDuration("WHATSAPP_HTTP_TIMEOUT", 15*time.Second),
+		WhatsAppEnabledTemplateKeys:         splitCSV(os.Getenv("WHATSAPP_ENABLED_TEMPLATE_KEYS")),
+		SMTPHost:                            getEnv("SMTP_HOST", "smtp.zoho.com"),
+		SupportEmail:                        strings.TrimSpace(os.Getenv("SUPPORT_EMAIL")),
+		SMTPPort:                            getEnvInt("SMTP_PORT", 465),
+		SMTPUsername:                        strings.TrimSpace(os.Getenv("SMTP_USERNAME")),
+		SMTPPassword:                        strings.TrimSpace(os.Getenv("SMTP_PASSWORD")),
+		SMTPFromEmail:                       strings.TrimSpace(os.Getenv("SMTP_FROM_EMAIL")),
+		SMTPFromName:                        getEnv("SMTP_FROM_NAME", "Booking"),
+		SMTPSecurity:                        getEnv("SMTP_SECURITY", "tls"),
+		SMTPInsecureSkipVerify:              getEnvBool("SMTP_INSECURE_SKIP_VERIFY", false),
+		SMTPConnectTimeout:                  getEnvDuration("SMTP_CONNECT_TIMEOUT", 10*time.Second),
+		PaystackSecretKey:                   strings.TrimSpace(os.Getenv("PAYSTACK_SECRET_KEY")),
+		PaystackSecretKeyTest:               strings.TrimSpace(os.Getenv("PAYSTACK_SECRET_KEY_TEST")),
+		PaystackBaseURL:                     strings.TrimSpace(os.Getenv("PAYSTACK_BASE_URL")),
+		PayazaPublicKey:                     strings.TrimSpace(os.Getenv("PAYAZA_PUBLIC_KEY")),
+		PayazaSecretKey:                     strings.TrimSpace(os.Getenv("PAYAZA_SECRET_KEY")),
+		PayazaPublicKeyTest:                 strings.TrimSpace(os.Getenv("PAYAZA_PUBLIC_KEY_TEST")),
+		PayazaSecretKeyTest:                 strings.TrimSpace(os.Getenv("PAYAZA_SECRET_KEY_TEST")),
+		PayazaBaseURL:                       strings.TrimSpace(os.Getenv("PAYAZA_BASE_URL")),
+		PayazaTransferPIN:                   strings.TrimSpace(os.Getenv("PAYAZA_TRANSFER_PIN")),
+		PayazaTransferPINTest:               strings.TrimSpace(os.Getenv("PAYAZA_TRANSFER_PIN_TEST")),
+		PayazaSourceAccounts:                strings.TrimSpace(os.Getenv("PAYAZA_SOURCE_ACCOUNTS")),
+		PayazaSourceAccountsTest:            strings.TrimSpace(os.Getenv("PAYAZA_SOURCE_ACCOUNTS_TEST")),
+		PayazaPayoutSenderName:              strings.TrimSpace(os.Getenv("PAYAZA_PAYOUT_SENDER_NAME")),
+		PayazaPayoutSenderPhone:             strings.TrimSpace(os.Getenv("PAYAZA_PAYOUT_SENDER_PHONE")),
+		PayazaPayoutSenderAddress:           strings.TrimSpace(os.Getenv("PAYAZA_PAYOUT_SENDER_ADDRESS")),
+		PayazaNGNDVABankCode:                strings.TrimSpace(os.Getenv("PAYAZA_NGN_DVA_BANK_CODE")),
+		PayazaNGNDVAEnquiryBankCode:         strings.TrimSpace(os.Getenv("PAYAZA_NGN_DVA_ENQUIRY_BANK_CODE")),
+		PayazaEnabledCapabilities:           payazaCapabilities,
+		PaystackEnabledCapabilities:         paystackCapabilities,
+		PaystackPayoutOTPDisabled:           getEnvBool("PAYSTACK_PAYOUT_OTP_DISABLED", false),
+		PaymentsEnvironment:                 strings.ToLower(getEnv("PAYMENTS_ENVIRONMENT", "test")),
+		FinancialEncryptionKeys:             strings.TrimSpace(os.Getenv("FINANCIAL_DATA_ENCRYPTION_KEYS")),
+		FinancialActiveKey:                  strings.TrimSpace(os.Getenv("FINANCIAL_DATA_ACTIVE_KEY_VERSION")),
+		FinancialFingerprintKey:             strings.TrimSpace(os.Getenv("FINANCIAL_DATA_FINGERPRINT_KEY")),
+		AgreementTokenEncryptionKeys:        strings.TrimSpace(os.Getenv("AGREEMENT_TOKEN_ENCRYPTION_KEYS")),
+		AgreementTokenActiveKey:             strings.TrimSpace(os.Getenv("AGREEMENT_TOKEN_ACTIVE_KEY")),
+		ShutdownTimeout:                     getEnvDuration("HTTP_SHUTDOWN_TIMEOUT", 10*time.Second),
+		ReadTimeout:                         getEnvDuration("HTTP_READ_TIMEOUT", 15*time.Second),
+		ReadHeaderTimeout:                   getEnvDuration("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
+		WriteTimeout:                        getEnvDuration("HTTP_WRITE_TIMEOUT", 15*time.Second),
+		IdleTimeout:                         getEnvDuration("HTTP_IDLE_TIMEOUT", 60*time.Second),
 	}
 
 	if cfg.DatabaseURL == "" {
@@ -903,6 +887,9 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("TESSA_WHATSAPP_CONVERSATIONS_ENABLED requires an HTTPS CLIENT_PUBLIC_BASE_URL origin")
 		}
 	}
+	if cfg.SupportEmail != "" && !mailer.ValidMailbox(cfg.SupportEmail) {
+		return Config{}, fmt.Errorf("SUPPORT_EMAIL must be a single valid email address without a display name")
+	}
 	if runsNotificationWorkers && cfg.AuthEmailEnabled && !cfg.SMTPConfigured() {
 		return Config{}, fmt.Errorf("SMTP_USERNAME and SMTP_PASSWORD are required when email authentication is enabled")
 	}
@@ -1028,7 +1015,7 @@ func Load() (Config, error) {
 	}
 	providerFinancialFeaturesEnabled := cfg.AnyPaymentCapabilityEnabled()
 	if providerFinancialFeaturesEnabled && financialSecurityValues != 3 {
-		return Config{}, fmt.Errorf("financial data encryption must be configured before enabling verified payment providers")
+		return Config{}, fmt.Errorf("financial data encryption must be configured before enabling payment capabilities")
 	}
 	if (cfg.AgreementTokenEncryptionKeys == "") != (cfg.AgreementTokenActiveKey == "") {
 		return Config{}, fmt.Errorf("agreement token encryption keyring and active key must be configured together")
@@ -1052,15 +1039,46 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+// PaymentCapabilityEnabled reports the deployment's explicit capability selection.
+// Provider credentials and operation-specific prerequisites are checked separately.
+func (c Config) PaymentCapabilityEnabled(provider, capability string) bool {
+	switch provider {
+	case "payaza":
+		return slices.Contains(c.PayazaEnabledCapabilities, capability)
+	case "paystack":
+		return slices.Contains(c.PaystackEnabledCapabilities, capability)
+	default:
+		return false
+	}
+}
+
 func (c Config) AnyPaymentCapabilityEnabled() bool {
-	return c.PayazaCardSandboxVerified || c.PayazaCardProductionEnabled ||
-		c.PayazaBankTransferSandboxVerified || c.PayazaBankTransferProductionEnabled ||
-		c.PayazaDestinationSandboxVerified || c.PayazaDestinationProductionEnabled ||
-		c.PayazaPayoutSandboxVerified || c.PayazaPayoutProductionEnabled ||
-		c.PaystackCardSandboxVerified || c.PaystackCardProductionEnabled ||
-		c.PaystackBankTransferSandboxVerified || c.PaystackBankTransferProductionEnabled ||
-		c.PaystackDestinationSandboxVerified || c.PaystackDestinationProductionEnabled ||
-		c.PaystackPayoutSandboxVerified || c.PaystackPayoutProductionEnabled
+	return len(c.PayazaEnabledCapabilities) > 0 || len(c.PaystackEnabledCapabilities) > 0
+}
+
+func loadPaymentCapabilities(provider string) ([]string, error) {
+	key := provider + "_ENABLED_CAPABILITIES"
+	// Fail clearly on unmigrated deployments rather than silently disabling payments.
+	for _, capability := range []string{"CARD", "BANK_TRANSFER", "DESTINATION", "PAYOUT"} {
+		for _, suffix := range []string{"SANDBOX_VERIFIED", "PRODUCTION_ENABLED"} {
+			legacy := provider + "_" + capability + "_" + suffix
+			if strings.TrimSpace(os.Getenv(legacy)) != "" {
+				return nil, fmt.Errorf("%s is retired; migrate the active PAYMENTS_ENVIRONMENT values to %s and remove the old flags", legacy, key)
+			}
+		}
+	}
+	var enabled []string
+	for _, capability := range splitCSV(strings.ToLower(os.Getenv(key))) {
+		switch capability {
+		case "card", "bank_transfer", "destination", "payout":
+			if !slices.Contains(enabled, capability) {
+				enabled = append(enabled, capability)
+			}
+		default:
+			return nil, fmt.Errorf("%s accepts only card, bank_transfer, destination, payout", key)
+		}
+	}
+	return enabled, nil
 }
 
 func (c Config) MetaWebhookConfigured() bool {
@@ -1074,6 +1092,14 @@ func (c Config) WhatsAppSendConfigured() bool {
 
 func (c Config) SMTPConfigured() bool {
 	return strings.TrimSpace(c.SMTPUsername) != "" && strings.TrimSpace(c.SMTPPassword) != ""
+}
+
+// SMTPFromAddress retains the SMTP transport's existing From fallback.
+func (c Config) SMTPFromAddress() string {
+	if value := strings.TrimSpace(c.SMTPFromEmail); value != "" {
+		return value
+	}
+	return strings.TrimSpace(c.SMTPUsername)
 }
 
 func (c Config) NotificationContactFoundationConfigured() bool {

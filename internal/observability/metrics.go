@@ -16,6 +16,8 @@ import (
 
 type Metrics struct {
 	registry                         *prometheus.Registry
+	integrationOutcomes              *prometheus.CounterVec
+	integrationLatency               *prometheus.HistogramVec
 	httpRequests                     *prometheus.CounterVec
 	httpDuration                     *prometheus.HistogramVec
 	httpResponseBytes                *prometheus.HistogramVec
@@ -45,7 +47,9 @@ type Metrics struct {
 
 func New() *Metrics {
 	metrics := &Metrics{
-		registry: prometheus.NewRegistry(),
+		registry:            prometheus.NewRegistry(),
+		integrationOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "tellbook", Subsystem: "integrations", Name: "outcomes_total", Help: "Integration requests by platform, operation and bounded outcome."}, []string{"platform", "operation", "outcome"}),
+		integrationLatency:  prometheus.NewHistogramVec(prometheus.HistogramOpts{Namespace: "tellbook", Subsystem: "integrations", Name: "duration_seconds", Help: "Integration operation latency.", Buckets: prometheus.DefBuckets}, []string{"platform", "operation"}),
 		httpRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "tellbook",
 			Subsystem: "http",
@@ -172,6 +176,7 @@ func New() *Metrics {
 		}, []string{"stream"}),
 	}
 	metrics.registry.MustRegister(
+		metrics.integrationOutcomes, metrics.integrationLatency,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		metrics.httpRequests,
@@ -939,4 +944,16 @@ func (c *databasePoolCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.desc["canceled_acquires_total"], prometheus.CounterValue, float64(stats.CanceledAcquireCount()))
 	ch <- prometheus.MustNewConstMetric(c.desc["empty_acquires_total"], prometheus.CounterValue, float64(stats.EmptyAcquireCount()))
 	ch <- prometheus.MustNewConstMetric(c.desc["empty_acquire_wait_seconds_total"], prometheus.CounterValue, stats.EmptyAcquireWaitTime().Seconds())
+}
+
+func (m *Metrics) ObserveIntegration(platform, operation, outcome string, duration time.Duration) {
+	if m == nil {
+		return
+	}
+	m.integrationOutcomes.WithLabelValues(platform, operation, outcome).Inc()
+	// Counter-only events, such as an idempotent replay, have no independent
+	// latency sample. Recording zero would distort the tool's duration histogram.
+	if duration > 0 {
+		m.integrationLatency.WithLabelValues(platform, operation).Observe(duration.Seconds())
+	}
 }

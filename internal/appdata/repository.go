@@ -26,6 +26,7 @@ import (
 type Repository struct {
 	additionalEmails              bool
 	db                            *pgxpool.Pool
+	catalogTx                     pgx.Tx
 	httpClient                    *http.Client
 	googleMapsAPIKey              string
 	locationResolutionFlight      singleflight.Group

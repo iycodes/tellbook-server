@@ -1,0 +1,18 @@
+---
+name: manage-services
+description: Manage a connected Tellbook provider’s services and service sections. Use when the user asks to list, create, edit, duplicate, publish, pause, hide, move, or delete Tellbook services or sections.
+---
+
+Use the Tellbook connector for the user’s requested catalog work.
+
+1. Establish the connected business, currency, and timezone using `get_connected_profile` when they are unknown. Reuse profile and setup choices already returned for this connection; refresh after switching connections or when the user requests current setup. Use `get_service_setup_options` only when valid choices are needed. These choices are read-only.
+2. Find services and sections using their read tools when their IDs, revisions, or relevant fields are missing. List summaries first (25 per page). A uniquely identified summary with a revision is enough for a simple partial edit; read details when the requested change needs settings missing from the summary. Reuse returned resources and mutation receipts instead of repeating reads. Resolve ambiguous names before writing. Never guess IDs, locations, templates, images, or revisions.
+3. Create and duplicate services as drafts. Publishing, pausing, and returning to draft require `set_service_status` and explicit user intent. Hiding uses `set_service_visibility` separately.
+4. Combine ordinary changes to the same resource into one update. Send only fields the user wants changed to `update_service` or `update_service_section`. Omitted fields stay unchanged, nested fields merge, and supplied arrays replace that collection. Use an empty string to clear supported text fields, an empty array to clear a collection, and null only for optional maximum travel distance.
+5. Enter money as exact decimal strings in the business currency, such as "2500.50" in NGN or "1500" in XOF. Output amounts ending in `_minor` are quoted minor-unit integers; convert using the returned currency exponent for display.
+6. Generate a fresh idempotency key per intended mutation. Keep that key, arguments, and expected revision for identical retries after a lost response. Present the receipt ID on success. A changed request needs a new key.
+7. Submit the latest revision returned by a read or successful mutation for every existing resource. A section rename or membership change can advance related resource revisions; refresh affected resources when needed. On a conflict, read again and explain what changed before applying the user’s intended edit to the current state. Do not silently overwrite another edit.
+8. Delete only when the user has clearly requested deletion. A section deletion must explicitly preserve its services by moving to another owned section or making them uncategorized. A `service_in_use` response means historical quotes or proposals depend on it; offer pausing it.
+9. For a clear request, use the host’s approval flow without adding a separate conversational confirmation. Ask only for missing choices; publication and deletion still require explicit user intent. If a scope is missing, explain which permission is needed. The consent screen offers enabled permission groups together so the user can choose all intended permissions once; grant only their choices. Sufficient permissions do not require reconnecting, and access tokens refresh automatically. Respect denied consent and disconnected grants. Business setup, bookings, payments, and image uploads are outside this plugin’s scope.
+
+Report the business name, affected resource, resulting status, and receipt in plain language. Do not display credentials, raw authentication responses, or unrelated provider data.

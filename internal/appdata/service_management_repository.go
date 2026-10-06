@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -26,7 +27,7 @@ func (r *Repository) ListServiceSections(ctx context.Context, clientID uuid.UUID
 			ss.description,
 			COALESCE(ss.cover_image_url, ''),
 			COUNT(s.id),
-			ss.updated_at
+			ss.updated_at, ss.revision
 		FROM service_sections ss
 		LEFT JOIN services s
 			ON s.section_id = ss.id
@@ -36,7 +37,7 @@ func (r *Repository) ListServiceSections(ctx context.Context, clientID uuid.UUID
 		ORDER BY ss.sort_order ASC, ss.created_at ASC
 	`
 
-	rows, err := r.db.Query(ctx, query, clientID)
+	rows, err := r.catalogDB().Query(ctx, query, clientID)
 	if err != nil {
 		return nil, fmt.Errorf("list service sections: %w", err)
 	}
@@ -47,7 +48,7 @@ func (r *Repository) ListServiceSections(ctx context.Context, clientID uuid.UUID
 		var item ServiceSectionItem
 		var id uuid.UUID
 		var updatedAt time.Time
-		if err := rows.Scan(&id, &item.Name, &item.Description, &item.CoverImageURL, &item.ServiceCount, &updatedAt); err != nil {
+		if err := rows.Scan(&id, &item.Name, &item.Description, &item.CoverImageURL, &item.ServiceCount, &updatedAt, &item.Revision); err != nil {
 			return nil, fmt.Errorf("scan service section: %w", err)
 		}
 		item.ID = id.String()
@@ -71,7 +72,7 @@ func (r *Repository) CreateServiceSection(ctx context.Context, clientID uuid.UUI
 	slug := slugify(name)
 	id := uuid.New()
 
-	tx, err := r.db.Begin(ctx)
+	tx, err := r.catalogDB().Begin(ctx)
 	if err != nil {
 		return ServiceSectionItem{}, fmt.Errorf("begin create service section: %w", err)
 	}
@@ -129,7 +130,7 @@ func (r *Repository) UpdateServiceSection(ctx context.Context, clientID, section
 	var coverImageURL string
 	var previousCoverImageURL string
 	var updatedAt time.Time
-	if err := r.db.QueryRow(
+	if err := r.catalogDB().QueryRow(
 		ctx,
 		`WITH previous AS (
 			SELECT id, COALESCE(cover_image_url, '') AS cover_image_url
@@ -154,12 +155,12 @@ func (r *Repository) UpdateServiceSection(ctx context.Context, clientID, section
 		return ServiceSectionItem{}, fmt.Errorf("update service section: %w", err)
 	}
 
-	if _, err := r.db.Exec(ctx, `UPDATE services SET category = $3, updated_at = NOW() WHERE client_id = $1 AND section_id = $2`, clientID, sectionID, name); err != nil {
+	if _, err := r.catalogDB().Exec(ctx, `UPDATE services SET category = $3, updated_at = NOW() WHERE client_id = $1 AND section_id = $2 AND category IS DISTINCT FROM $3`, clientID, sectionID, name); err != nil {
 		return ServiceSectionItem{}, fmt.Errorf("sync service section category: %w", err)
 	}
 
 	var serviceCount int
-	if err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM services WHERE client_id = $1 AND section_id = $2`, clientID, sectionID).Scan(&serviceCount); err != nil {
+	if err := r.catalogDB().QueryRow(ctx, `SELECT COUNT(*) FROM services WHERE client_id = $1 AND section_id = $2`, clientID, sectionID).Scan(&serviceCount); err != nil {
 		return ServiceSectionItem{}, fmt.Errorf("count service section items: %w", err)
 	}
 
@@ -175,7 +176,7 @@ func (r *Repository) UpdateServiceSection(ctx context.Context, clientID, section
 }
 
 func (r *Repository) DeleteServiceSection(ctx context.Context, clientID, sectionID uuid.UUID, input DeleteServiceSectionInput) (string, error) {
-	tx, err := r.db.Begin(ctx)
+	tx, err := r.catalogDB().Begin(ctx)
 	if err != nil {
 		return "", fmt.Errorf("begin delete service section: %w", err)
 	}
@@ -190,6 +191,16 @@ func (r *Repository) DeleteServiceSection(ctx context.Context, clientID, section
 		targetID, err := uuid.Parse(strings.TrimSpace(input.TargetSectionID))
 		if err != nil {
 			return "", fmt.Errorf("target section is required when move mode is used")
+		}
+		if targetID == sectionID {
+			return "", fmt.Errorf("target section must differ from source")
+		}
+		var owned bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM service_sections WHERE id=$1 AND client_id=$2)`, targetID, clientID).Scan(&owned); err != nil {
+			return "", err
+		}
+		if !owned {
+			return "", ErrNotFound
 		}
 		if _, err := tx.Exec(ctx, `UPDATE services SET section_id = $3, category = COALESCE((SELECT name FROM service_sections WHERE id = $3 AND client_id = $1), category) WHERE client_id = $1 AND section_id = $2`, clientID, sectionID, targetID); err != nil {
 			return "", fmt.Errorf("move services to section: %w", err)
@@ -226,7 +237,7 @@ func (r *Repository) GetServiceSectionDetails(ctx context.Context, clientID, sec
 			ss.description,
 			COALESCE(ss.cover_image_url, ''),
 			COUNT(s.id),
-			ss.updated_at
+			ss.updated_at, ss.revision
 		FROM service_sections ss
 		LEFT JOIN services s
 			ON s.section_id = ss.id
@@ -238,13 +249,14 @@ func (r *Repository) GetServiceSectionDetails(ctx context.Context, clientID, sec
 	var section ServiceSectionItem
 	var sectionUUID uuid.UUID
 	var updatedAt time.Time
-	if err := r.db.QueryRow(ctx, sectionQuery, clientID, sectionID).Scan(
+	if err := r.catalogDB().QueryRow(ctx, sectionQuery, clientID, sectionID).Scan(
 		&sectionUUID,
 		&section.Name,
 		&section.Description,
 		&section.CoverImageURL,
 		&section.ServiceCount,
 		&updatedAt,
+		&section.Revision,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ServiceSectionDetailsResponse{}, ErrNotFound
@@ -266,7 +278,7 @@ func (r *Repository) GetServiceSectionDetails(ctx context.Context, clientID, sec
 }
 
 func (r *Repository) ReorderServiceSections(ctx context.Context, clientID uuid.UUID, orderedIDs []uuid.UUID) error {
-	tx, err := r.db.Begin(ctx)
+	tx, err := r.catalogDB().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin reorder service sections: %w", err)
 	}
@@ -289,7 +301,7 @@ func (r *Repository) ReorderServiceSections(ctx context.Context, clientID uuid.U
 }
 
 func (r *Repository) ReorderSectionServices(ctx context.Context, clientID, sectionID uuid.UUID, orderedIDs []uuid.UUID) error {
-	tx, err := r.db.Begin(ctx)
+	tx, err := r.catalogDB().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin reorder services: %w", err)
 	}
@@ -312,7 +324,7 @@ func (r *Repository) ReorderSectionServices(ctx context.Context, clientID, secti
 }
 
 func (r *Repository) ReorderUncategorizedServices(ctx context.Context, clientID uuid.UUID, orderedIDs []uuid.UUID) error {
-	tx, err := r.db.Begin(ctx)
+	tx, err := r.catalogDB().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin reorder uncategorized services: %w", err)
 	}
@@ -355,7 +367,7 @@ func (r *Repository) listManagedServicesWithWhere(ctx context.Context, clientID 
 			s.lateness_policy, COALESCE(s.agreement_template_family_id::text, ''),
 			COALESCE(atf.title, ''), COALESCE(atf.confirmation_method, ''),
 			COALESCE(s.agreement_timing, ''), s.standalone_signature_required,
-			s.prep_aftercare_instructions
+			s.prep_aftercare_instructions, s.revision
 		FROM services s
 		LEFT JOIN service_sections ss ON ss.id = s.section_id AND ss.client_id = s.client_id
 		LEFT JOIN business_locations bl
@@ -375,9 +387,9 @@ func (r *Repository) listManagedServicesWithWhere(ctx context.Context, clientID 
 	var rows pgx.Rows
 	var err error
 	if whereClause == "" {
-		rows, err = r.db.Query(ctx, renderedQuery, clientID)
+		rows, err = r.catalogDB().Query(ctx, renderedQuery, clientID)
 	} else {
-		rows, err = r.db.Query(ctx, renderedQuery, clientID, arg)
+		rows, err = r.catalogDB().Query(ctx, renderedQuery, clientID, arg)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("list managed services: %w", err)
@@ -417,7 +429,7 @@ func (r *Repository) GetManagedServiceDetails(ctx context.Context, clientID, ser
 			s.lateness_policy, COALESCE(s.agreement_template_family_id::text, ''),
 			COALESCE(atf.title, ''), COALESCE(atf.confirmation_method, ''),
 			COALESCE(s.agreement_timing, ''), s.standalone_signature_required,
-			s.prep_aftercare_instructions
+			s.prep_aftercare_instructions, s.revision
 		FROM services s
 		LEFT JOIN service_sections ss ON ss.id = s.section_id AND ss.client_id = s.client_id
 		LEFT JOIN business_locations bl
@@ -426,7 +438,7 @@ func (r *Repository) GetManagedServiceDetails(ctx context.Context, clientID, ser
 			ON atf.id = s.agreement_template_family_id AND atf.client_id = s.client_id
 		WHERE s.client_id = $1 AND s.id = $2
 	`
-	item, err := scanManagedService(r.db.QueryRow(ctx, query, clientID, serviceID))
+	item, err := scanManagedService(r.catalogDB().QueryRow(ctx, query, clientID, serviceID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ManagedServiceItem{}, ErrNotFound
@@ -440,12 +452,12 @@ func (r *Repository) GetManagedServiceDetails(ctx context.Context, clientID, ser
 }
 
 func (r *Repository) UpdateManagedService(ctx context.Context, clientID, serviceID uuid.UUID, input CreateManagedServiceInput) (ManagedServiceItem, error) {
-	return r.saveManagedService(ctx, clientID, serviceID, input, false)
+	return r.saveManagedService(ctx, clientID, serviceID, input, false, nil)
 }
 
 func (r *Repository) DuplicateManagedService(ctx context.Context, clientID, serviceID uuid.UUID) (ManagedServiceItem, error) {
 	var newServiceID uuid.UUID
-	tx, err := r.db.Begin(ctx)
+	tx, err := r.catalogDB().Begin(ctx)
 	if err != nil {
 		return ManagedServiceItem{}, fmt.Errorf("begin duplicate managed service: %w", err)
 	}
@@ -463,7 +475,7 @@ func (r *Repository) DuplicateManagedService(ctx context.Context, clientID, serv
 
 	var sourceName string
 	var sourceSlug string
-	if err := tx.QueryRow(ctx, `SELECT title, slug FROM services WHERE client_id = $1 AND id = $2`, clientID, serviceID).Scan(&sourceName, &sourceSlug); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT title, slug FROM services WHERE client_id = $1 AND id = $2 FOR UPDATE`, clientID, serviceID).Scan(&sourceName, &sourceSlug); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ManagedServiceItem{}, ErrNotFound
 		}
@@ -547,7 +559,7 @@ func (r *Repository) DuplicateManagedService(ctx context.Context, clientID, serv
 }
 
 func (r *Repository) CreateManagedService(ctx context.Context, clientID uuid.UUID, input CreateManagedServiceInput) (ManagedServiceItem, error) {
-	return r.saveManagedService(ctx, clientID, uuid.New(), input, true)
+	return r.saveManagedService(ctx, clientID, uuid.New(), input, true, nil)
 }
 
 type managedServiceScanner interface {
@@ -573,7 +585,7 @@ func scanManagedService(row managedServiceScanner) (ManagedServiceItem, error) {
 		&item.CancellationPolicy, &item.LatenessPolicy,
 		&item.AgreementTemplateFamilyID, &item.AgreementTemplateTitle,
 		&item.AgreementConfirmationMethod, &item.AgreementTiming,
-		&item.StandaloneSignatureRequired, &item.Instructions,
+		&item.StandaloneSignatureRequired, &item.Instructions, &item.Revision,
 	); err != nil {
 		return ManagedServiceItem{}, fmt.Errorf("scan managed service: %w", err)
 	}
@@ -586,7 +598,7 @@ func scanManagedService(row managedServiceScanner) (ManagedServiceItem, error) {
 }
 
 func (r *Repository) loadManagedServiceChildren(ctx context.Context, serviceID uuid.UUID, item *ManagedServiceItem) error {
-	windowRows, err := r.db.Query(ctx, `
+	windowRows, err := r.catalogDB().Query(ctx, `
 		SELECT id, day_of_week, TO_CHAR(start_time, 'HH24:MI'),
 			TO_CHAR(end_time, 'HH24:MI'), slot_interval_minutes
 		FROM service_availability_windows
@@ -610,7 +622,7 @@ func (r *Repository) loadManagedServiceChildren(ctx context.Context, serviceID u
 		return fmt.Errorf("iterate service availability windows: %w", err)
 	}
 
-	ruleRows, err := r.db.Query(ctx, `
+	ruleRows, err := r.catalogDB().Query(ctx, `
 		SELECT id, threshold_minutes, surcharge_type,
 			surcharge_amount_minor, surcharge_percentage_bps
 		FROM service_short_notice_rules
@@ -636,13 +648,13 @@ func (r *Repository) loadManagedServiceChildren(ctx context.Context, serviceID u
 	return nil
 }
 
-func (r *Repository) saveManagedService(ctx context.Context, clientID, serviceID uuid.UUID, input CreateManagedServiceInput, create bool) (ManagedServiceItem, error) {
+func (r *Repository) saveManagedService(ctx context.Context, clientID, serviceID uuid.UUID, input CreateManagedServiceInput, create bool, previous *ManagedServiceItem) (ManagedServiceItem, error) {
 	normalized, err := validateManagedServiceInput(input)
 	if err != nil {
 		return ManagedServiceItem{}, err
 	}
 
-	tx, err := r.db.Begin(ctx)
+	tx, err := r.catalogDB().Begin(ctx)
 	if err != nil {
 		return ManagedServiceItem{}, fmt.Errorf("begin save managed service: %w", err)
 	}
@@ -779,7 +791,7 @@ func (r *Repository) saveManagedService(ctx context.Context, clientID, serviceID
 		return ManagedServiceItem{}, fmt.Errorf("save managed service: %w", err)
 	}
 
-	if err := replaceServiceChildren(ctx, tx, serviceID, input.Availability.CustomWindows, input.ShortNoticeRules); err != nil {
+	if err := replaceServiceChildren(ctx, tx, serviceID, input.Availability.CustomWindows, input.ShortNoticeRules, previous); err != nil {
 		return ManagedServiceItem{}, err
 	}
 	if err := consumeServiceWizardDraft(ctx, tx, clientID, serviceID, input.WizardDraftID, create); err != nil {
@@ -1031,33 +1043,53 @@ func resolveServiceProviderLocation(ctx context.Context, tx pgx.Tx, clientID uui
 	return &locationID, nil
 }
 
-func replaceServiceChildren(ctx context.Context, tx pgx.Tx, serviceID uuid.UUID, windows []ServiceAvailabilityWindow, rules []ServiceShortNoticeRule) error {
-	if _, err := tx.Exec(ctx, `DELETE FROM service_availability_windows WHERE service_id = $1`, serviceID); err != nil {
-		return fmt.Errorf("replace service availability windows: %w", err)
+func replaceServiceChildren(ctx context.Context, tx pgx.Tx, serviceID uuid.UUID, windows []ServiceAvailabilityWindow, rules []ServiceShortNoticeRule, previous *ManagedServiceItem) error {
+	replaceWindows, replaceRules := true, true
+	if previous != nil {
+		// These collections have a server-defined order. Compare their values,
+		// ignoring caller IDs, so omitted or unchanged settings retain their IDs.
+		canonicalWindows := slices.Clone(windows)
+		slices.SortFunc(canonicalWindows, func(a, b ServiceAvailabilityWindow) int {
+			if a.DayOfWeek != b.DayOfWeek {
+				return a.DayOfWeek - b.DayOfWeek
+			}
+			return strings.Compare(a.StartTime, b.StartTime)
+		})
+		canonicalRules := slices.Clone(rules)
+		slices.SortFunc(canonicalRules, func(a, b ServiceShortNoticeRule) int { return a.ThresholdMinutes - b.ThresholdMinutes })
+		replaceWindows = !slices.EqualFunc(canonicalWindows, previous.Availability.CustomWindows, func(a, b ServiceAvailabilityWindow) bool { a.ID, b.ID = "", ""; return a == b })
+		replaceRules = !slices.EqualFunc(canonicalRules, previous.ShortNoticeRules, func(a, b ServiceShortNoticeRule) bool { a.ID, b.ID = "", ""; return a == b })
 	}
-	for _, window := range windows {
-		if _, err := tx.Exec(ctx, `
+	if replaceWindows {
+		if _, err := tx.Exec(ctx, `DELETE FROM service_availability_windows WHERE service_id = $1`, serviceID); err != nil {
+			return fmt.Errorf("replace service availability windows: %w", err)
+		}
+		for _, window := range windows {
+			if _, err := tx.Exec(ctx, `
 			INSERT INTO service_availability_windows (
 				id, service_id, day_of_week, start_time, end_time,
 				slot_interval_minutes, created_at, updated_at
 			) VALUES ($1,$2,$3,$4::time,$5::time,$6,NOW(),NOW())
 		`, uuid.New(), serviceID, window.DayOfWeek, window.StartTime, window.EndTime, window.SlotIntervalMinutes); err != nil {
-			return fmt.Errorf("insert service availability window: %w", err)
+				return fmt.Errorf("insert service availability window: %w", err)
+			}
 		}
 	}
 
-	if _, err := tx.Exec(ctx, `DELETE FROM service_short_notice_rules WHERE service_id = $1`, serviceID); err != nil {
-		return fmt.Errorf("replace service short-notice rules: %w", err)
-	}
-	for _, rule := range rules {
-		if _, err := tx.Exec(ctx, `
+	if replaceRules {
+		if _, err := tx.Exec(ctx, `DELETE FROM service_short_notice_rules WHERE service_id = $1`, serviceID); err != nil {
+			return fmt.Errorf("replace service short-notice rules: %w", err)
+		}
+		for _, rule := range rules {
+			if _, err := tx.Exec(ctx, `
 			INSERT INTO service_short_notice_rules (
 				id, service_id, threshold_minutes, surcharge_type,
 				surcharge_amount_minor, surcharge_percentage_bps, created_at, updated_at
 			) VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW())
 		`, uuid.New(), serviceID, rule.ThresholdMinutes, rule.SurchargeType,
-			rule.SurchargeAmountMinor, rule.SurchargePercentageBPS); err != nil {
-			return fmt.Errorf("insert service short-notice rule: %w", err)
+				rule.SurchargeAmountMinor, rule.SurchargePercentageBPS); err != nil {
+				return fmt.Errorf("insert service short-notice rule: %w", err)
+			}
 		}
 	}
 	return nil
@@ -1065,7 +1097,7 @@ func replaceServiceChildren(ctx context.Context, tx pgx.Tx, serviceID uuid.UUID,
 
 func (r *Repository) DeleteManagedService(ctx context.Context, clientID, serviceID uuid.UUID) (string, error) {
 	var imageURL string
-	if err := r.db.QueryRow(
+	if err := r.catalogDB().QueryRow(
 		ctx,
 		`DELETE FROM services WHERE client_id = $1 AND id = $2 RETURNING COALESCE(image_url, '')`,
 		clientID,
@@ -1080,7 +1112,7 @@ func (r *Repository) DeleteManagedService(ctx context.Context, clientID, service
 }
 
 func (r *Repository) UpdateManagedServiceVisibility(ctx context.Context, clientID, serviceID uuid.UUID, isHidden bool) (ManagedServiceItem, error) {
-	commandTag, err := r.db.Exec(
+	commandTag, err := r.catalogDB().Exec(
 		ctx,
 		`UPDATE services SET is_hidden = $3, updated_at = NOW() WHERE client_id = $1 AND id = $2`,
 		clientID,

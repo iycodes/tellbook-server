@@ -21,6 +21,7 @@ import (
 	"booking/go-server/internal/authchallenge"
 	"booking/go-server/internal/config"
 	"booking/go-server/internal/database"
+	"booking/go-server/internal/integrations"
 	"booking/go-server/internal/llm"
 	"booking/go-server/internal/mailer"
 	"booking/go-server/internal/marketplaceauth"
@@ -30,6 +31,7 @@ import (
 	"booking/go-server/internal/payments/capabilities"
 	payaza "booking/go-server/internal/payments/payaza"
 	paystack "booking/go-server/internal/payments/paystack"
+	"booking/go-server/internal/publicsupport"
 	"booking/go-server/internal/redisstore"
 	"booking/go-server/internal/secure"
 	"booking/go-server/internal/server"
@@ -413,10 +415,8 @@ func main() {
 		logger.Info("paystack payments disabled", "reason", "missing PAYSTACK_SECRET_KEY")
 	}
 
-	ready := func(configured, sandboxVerified, productionEnabled bool) capabilities.CapabilityReadiness {
-		return capabilities.CapabilityReadiness{
-			Configured: configured, SandboxVerified: sandboxVerified, ProductionEnabled: productionEnabled,
-		}
+	ready := func(configured bool, provider, capability string) capabilities.CapabilityReadiness {
+		return paymentCapabilityReadiness(cfg, configured, provider, capability)
 	}
 	payazaConfigured := cfg.PayazaEnabled()
 	paystackConfigured := cfg.PaystackEnabled()
@@ -425,53 +425,42 @@ func main() {
 		PayazaConfigured: payazaConfigured,
 		PayazaCard: ready(
 			payazaConfigured,
-			cfg.PayazaCardSandboxVerified,
-			cfg.PayazaCardProductionEnabled,
+			"payaza", "card",
 		),
 		PayazaBankTransfer: ready(
 			payazaConfigured && cfg.PayazaNGNDVABankCode != "" && cfg.PayazaNGNDVAEnquiryBankCode != "",
-			cfg.PayazaBankTransferSandboxVerified,
-			cfg.PayazaBankTransferProductionEnabled,
+			"payaza", "bank_transfer",
 		),
 		PayazaDestination: ready(
-			payazaDestinationConfigured, cfg.PayazaDestinationSandboxVerified, cfg.PayazaDestinationProductionEnabled,
+			payazaDestinationConfigured, "payaza", "destination",
 		),
 		PayazaPayout: ready(
 			payazaConfigured && cfg.PayazaActiveTransferPIN() != "" && payazaHasNGNSource && cfg.PayazaPayoutSenderConfigured(),
-			cfg.PayazaPayoutSandboxVerified,
-			cfg.PayazaPayoutProductionEnabled,
+			"payaza", "payout",
 		),
 		PaystackConfigured: paystackConfigured,
 		PaystackCard: ready(
 			paystackConfigured,
-			cfg.PaystackCardSandboxVerified,
-			cfg.PaystackCardProductionEnabled,
+			"paystack", "card",
 		),
 		PaystackBankTransfer: ready(
 			paystackConfigured,
-			cfg.PaystackBankTransferSandboxVerified,
-			cfg.PaystackBankTransferProductionEnabled,
+			"paystack", "bank_transfer",
 		),
 		PaystackDestination: ready(
 			paystackConfigured,
-			cfg.PaystackDestinationSandboxVerified,
-			cfg.PaystackDestinationProductionEnabled,
+			"paystack", "destination",
 		),
 		PaystackPayout: ready(
 			paystackConfigured && cfg.PaystackPayoutOTPDisabled,
-			cfg.PaystackPayoutSandboxVerified,
-			cfg.PaystackPayoutProductionEnabled,
+			"paystack", "payout",
 		),
 	}))
 	if err != nil {
 		logger.Error("configure payment capabilities", "error", err)
 		os.Exit(1)
 	}
-	paystackSettlementEnabled := cfg.PaymentsEnvironment == string(capabilities.EnvironmentTest) &&
-		(cfg.PaystackCardSandboxVerified || cfg.PaystackBankTransferSandboxVerified)
-	if cfg.PaymentsEnvironment == string(capabilities.EnvironmentLive) {
-		paystackSettlementEnabled = cfg.PaystackCardProductionEnabled || cfg.PaystackBankTransferProductionEnabled
-	}
+	paystackSettlementEnabled := cfg.PaymentCapabilityEnabled("paystack", "card") || cfg.PaymentCapabilityEnabled("paystack", "bank_transfer")
 	if paystackClient != nil && paystackSettlementEnabled {
 		settlementProviders["paystack"] = paystackClient
 	}
@@ -872,6 +861,27 @@ func main() {
 		ConfigurationReady: true, WorkersReady: true,
 		MaintenanceOwnership: maintenanceOwnership,
 		MetaWhatsAppWebhook:  metaWhatsAppWebhook,
+	}
+	if runsAPI {
+		// Public support needs SMTP on the API role even when delivery workers run
+		// separately. An absent destination leaves the endpoint visibly unavailable.
+		if cfg.SupportEmail != "" && cfg.SMTPConfigured() && mailer.ValidMailbox(cfg.SMTPFromAddress()) {
+			supportSMTPConfig := transactionalSMTPConfig
+			supportSMTPConfig.SendTimeout = publicsupport.SendTimeout
+			supportSMTPConfig.MaxConnections = 2
+			supportSMTPMailer, supportErr := mailer.NewSMTPMailer(supportSMTPConfig)
+			if supportErr != nil {
+				logger.Error("configure support SMTP mailer", "error", supportErr)
+				os.Exit(1)
+			}
+			operational.SupportSender = supportSMTPMailer
+		}
+		integrationConfig, integrationErr := integrations.LoadConfig(cfg.ClientPublicBaseURL)
+		if integrationErr != nil {
+			logger.Error("configure provider integrations", "error", integrationErr)
+			os.Exit(1)
+		}
+		operational.IntegrationRoutes = integrations.New(dbPool, appdataHandler, authHandler, integrationConfig).SetMetrics(metrics).Routes
 	}
 	if runsAPI && cfg.AdminEnabled {
 		adminService, adminErr := admin.New(dbPool, admin.Config{PublicURL: cfg.AdminPublicURL, EncryptionKeys: cfg.AdminMFAEncryptionKeys, ActiveKey: cfg.AdminMFAActiveKey, BcryptCost: cfg.AuthBcryptCost}, authSMTPMailer)
