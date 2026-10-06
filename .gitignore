@@ -1,9 +1,22 @@
 # Local environment files
 .env
 .env.*
-!.env.example
 server.env
 server.env.*
+*.env
+*.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local tunnel configuration and synthetic reviewer credentials
+.cloudflared/
+tellbook-beta-reviewers.json
+tellbook-beta-tunnel.json
+tellbook-beta-cloudflared.yml
+tunnel-credentials.json
 
 # Go dependencies and workspace caches
 /vendor/
@@ -15,6 +28,8 @@ server.env.*
 /bin/
 /build/
 /dist/
+/integration-beta
+/integration-contracts
 *.exe
 *.exe~
 *.dll
@@ -56,6 +71,28 @@ openai-response-output*.jsonl
 # Local uploads / generated files
 /uploads/
 /artifacts/performance/
+/plugins/dist/
+/.tellbook-beta-stage-*/
+/tellbook-beta-client-*/
+/cmd/.support-browser-fixture-*/
+
+# Python packaging tools
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Local browser, scraping, and diagnostic output
+.playwright-cli/
+.playwright-mcp/
+.firecrawl/
+*.har
+
+# Operator videos are hosted separately; keep recording reports trackable
+/docs/review/recordings/**/*.mp4
+/docs/review/recordings/**/*.mov
+/docs/review/recordings/**/*.webm
+/docs/review/recordings/**/*.m4v
 
 # Editors and IDEs
 /.idea/
